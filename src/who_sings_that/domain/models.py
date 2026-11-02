@@ -91,6 +91,7 @@ class GameMember:
     display_name: str
     name_uniqueness_key: str
     committed_score: int = 0
+    connected: bool = True
 
 
 @dataclass(slots=True)
