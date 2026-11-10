@@ -8,7 +8,7 @@ from typing import Final
 from unicodedata import category, normalize
 from uuid import UUID
 
-from .deck import Deck
+from .deck import Deck, TrackReference
 
 MAX_PLAYER_NAME_LENGTH: Final = 24
 _ALLOWED_PLAYER_NAME_PUNCTUATION: Final = frozenset(" -_'.")
@@ -25,6 +25,18 @@ class GameState(Enum):
     AWAITING_REVEAL = "awaiting_reveal"
     SCORING = "scoring"
     FINISHED = "finished"
+
+
+class DeckSkipReason(Enum):
+    """Permanent reasons that a structural deck entry was not played."""
+
+    DURATION_INELIGIBLE = "duration_ineligible"
+
+
+class GameEndReason(Enum):
+    """Authoritative reasons a game entered ``FINISHED``."""
+
+    DECK_EXHAUSTED = "deck_exhausted"
 
 
 class InvalidPlayerNameError(ValueError):
@@ -106,24 +118,63 @@ class SelectedPlaylistSnapshot:
     playlist_song_count: int
 
 
+@dataclass(frozen=True, slots=True)
+class ResolvedPlaylist:
+    """A selected playlist's immutable metadata and resolved valid tracks.
+
+    Catalog lookup, filesystem checks, and structural media validation happen
+    outside the domain engine. Start Game accepts their already-resolved result
+    through this value object.
+    """
+
+    snapshot: SelectedPlaylistSnapshot
+    tracks: tuple[TrackReference, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class SkippedDeckEntry:
+    """A permanent record of one skipped entry at its original deck position."""
+
+    original_position: int
+    track_id: str
+    reason: DeckSkipReason
+
+
+@dataclass(frozen=True, slots=True)
+class FinalStanding:
+    """One immutable competitive result frozen when a game finishes."""
+
+    rank: int
+    browser_token: str
+    display_name: str
+    score: int
+
+
 @dataclass(slots=True)
 class GameSession:
-    """The minimal live game aggregate needed while in the lobby."""
+    """The live in-memory aggregate for the currently implemented states."""
 
     game_session_id: UUID
     created_at: datetime
     settings: GameSettings
     members: dict[str, GameMember]
     songmaster_browser_token: str
-    selected_playlist_ids: set[str] = field(default_factory=set)
+    selected_playlist_ids: set[str] | frozenset[str] = field(default_factory=set)
     playlist_selection_editable: bool = True
     selected_playlist_snapshots: tuple[SelectedPlaylistSnapshot, ...] = ()
     deck: Deck | None = None
     deck_pointer: int = 0
     original_deck_size: int = 0
     deck_exhausted: bool = False
+    skipped_deck_entries: tuple[SkippedDeckEntry, ...] = ()
     started_at: datetime | None = None
+    ended_at: datetime | None = None
+    end_reason: GameEndReason | None = None
+    final_standings: tuple[FinalStanding, ...] = ()
     active_round: object | None = None
+    displayed_deck_position: int | None = None
+    displayed_artist: str | None = None
+    displayed_title: str | None = None
 
     @property
     def songmaster(self) -> GameMember:

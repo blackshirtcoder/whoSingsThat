@@ -99,6 +99,9 @@ def test_create_game_enters_lobby_and_establishes_lobby_invariants() -> None:
     assert game.original_deck_size == 0
     assert game.deck_exhausted is False
     assert game.started_at is None
+    assert game.ended_at is None
+    assert game.end_reason is None
+    assert game.final_standings == ()
     assert game.selected_playlist_snapshots == ()
     assert game.active_round is None
     assert game.playlist_selection_editable is True
