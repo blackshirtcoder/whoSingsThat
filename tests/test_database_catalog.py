@@ -51,7 +51,7 @@ def complete_track(
     )
 
 
-def test_initial_alembic_migration_creates_versioned_track_schema(
+def test_alembic_head_creates_versioned_catalog_schema(
     tmp_path: Path,
 ) -> None:
     database_path = tmp_path / "nested name.sqlite3"
@@ -60,7 +60,12 @@ def test_initial_alembic_migration_creates_versioned_track_schema(
     engine = create_sqlite_engine(database_path)
     database_inspector = inspect(engine)
 
-    assert set(database_inspector.get_table_names()) == {"alembic_version", "tracks"}
+    assert set(database_inspector.get_table_names()) == {
+        "alembic_version",
+        "playlist_tracks",
+        "playlists",
+        "tracks",
+    }
     assert {column["name"] for column in database_inspector.get_columns("tracks")} == {
         "track_id",
         "created_at",
@@ -89,7 +94,7 @@ def test_initial_alembic_migration_creates_versioned_track_schema(
     )} == {"uq_tracks_relative_path"}
     with engine.connect() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0001_create_tracks"
+            "0002_create_playlists"
         )
         create_statement = connection.scalar(
             text("SELECT sql FROM sqlite_master WHERE name = 'tracks'")

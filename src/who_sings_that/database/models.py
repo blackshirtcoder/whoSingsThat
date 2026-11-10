@@ -9,6 +9,8 @@ from sqlalchemy import (
     Boolean,
     CheckConstraint,
     Float,
+    ForeignKey,
+    Index,
     Integer,
     String,
     Text,
@@ -70,4 +72,53 @@ class TrackRow(Base):
         Boolean,
         nullable=False,
         server_default=text("0"),
+    )
+
+
+class PlaylistRow(Base):
+    """One persistent named set of catalog track references."""
+
+    __tablename__ = "playlists"
+    __table_args__ = (
+        UniqueConstraint("name_key", name="uq_playlists_name_key"),
+        CheckConstraint(
+            "length(playlist_id) = 36",
+            name="ck_playlists_id_uuid_length",
+        ),
+        CheckConstraint(
+            "length(name) BETWEEN 1 AND 32",
+            name="ck_playlists_name_length",
+        ),
+    )
+
+    playlist_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    name: Mapped[str] = mapped_column(String(32), nullable=False)
+    name_key: Mapped[str] = mapped_column(Text, nullable=False)
+    description: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTimeText(), nullable=False)
+
+
+class PlaylistTrackRow(Base):
+    """An unordered, unique association between one playlist and one track."""
+
+    __tablename__ = "playlist_tracks"
+    __table_args__ = (Index("ix_playlist_tracks_track_id", "track_id"),)
+
+    playlist_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey(
+            "playlists.playlist_id",
+            name="fk_playlist_tracks_playlist_id_playlists",
+            ondelete="CASCADE",
+        ),
+        primary_key=True,
+    )
+    track_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey(
+            "tracks.track_id",
+            name="fk_playlist_tracks_track_id_tracks",
+            ondelete="RESTRICT",
+        ),
+        primary_key=True,
     )
