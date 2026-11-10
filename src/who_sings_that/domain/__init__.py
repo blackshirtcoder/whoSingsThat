@@ -25,11 +25,18 @@ from .models import (
     normalize_player_name,
     player_name_uniqueness_key,
 )
+from .playback import (
+    DeckCandidateSelection,
+    calculate_effective_playback_offset,
+    is_duration_eligible,
+    select_deck_candidate,
+)
 from .scoring import ScoringChoice, calculate_points, speed_multiplier
 
 __all__ = [
     "ActiveGameExistsError",
     "Deck",
+    "DeckCandidateSelection",
     "DeckEntry",
     "DomainInvariantError",
     "DuplicatePlayerNameError",
@@ -52,8 +59,11 @@ __all__ = [
     "TrackReference",
     "UnknownGameMemberError",
     "build_deck",
+    "calculate_effective_playback_offset",
     "calculate_points",
+    "is_duration_eligible",
     "normalize_player_name",
     "player_name_uniqueness_key",
+    "select_deck_candidate",
     "speed_multiplier",
 ]

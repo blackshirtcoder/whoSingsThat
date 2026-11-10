@@ -2,6 +2,7 @@
 
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
+from decimal import Decimal
 from random import shuffle as random_shuffle
 
 
@@ -14,6 +15,7 @@ class TrackReference:
     """A resolved catalog track identified by its stable catalog identity."""
 
     track_id: str
+    duration_seconds: float | Decimal
 
 
 @dataclass(frozen=True, slots=True)

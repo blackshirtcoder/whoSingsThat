@@ -16,10 +16,10 @@ def unchanged(tracks: list[TrackReference]) -> None:
 
 def test_tracks_are_deduplicated_by_stable_identity_within_and_across_playlists(
 ) -> None:
-    first_a = TrackReference("track-a")
-    repeated_a = TrackReference("track-a")
-    track_b = TrackReference("track-b")
-    track_c = TrackReference("track-c")
+    first_a = TrackReference("track-a", 180)
+    repeated_a = TrackReference("track-a", 180)
+    track_b = TrackReference("track-b", 180)
+    track_c = TrackReference("track-c", 180)
 
     deck = build_deck(
         [
@@ -46,8 +46,8 @@ def test_shuffle_is_called_exactly_once_with_only_unique_tracks() -> None:
 
     deck = build_deck(
         [
-            [TrackReference("track-a"), TrackReference("track-a")],
-            [TrackReference("track-b"), TrackReference("track-c")],
+            [TrackReference("track-a", 180), TrackReference("track-a", 180)],
+            [TrackReference("track-b", 180), TrackReference("track-c", 180)],
         ],
         shuffle=recording_shuffle,
     )
@@ -62,7 +62,7 @@ def test_shuffle_is_called_exactly_once_with_only_unique_tracks() -> None:
 
 def test_original_positions_are_one_based_and_immutable() -> None:
     deck = build_deck(
-        [[TrackReference("track-b"), TrackReference("track-a")]],
+        [[TrackReference("track-b", 180), TrackReference("track-a", 180)]],
         shuffle=unchanged,
     )
 
@@ -96,14 +96,14 @@ def test_injected_shuffle_produces_deterministic_order_and_positions() -> None:
 
     deck = build_deck(
         [
-            [TrackReference("track-a"), TrackReference("track-b")],
-            [TrackReference("track-c")],
+            [TrackReference("track-a", 180), TrackReference("track-b", 180)],
+            [TrackReference("track-c", 180)],
         ],
         shuffle=deterministic_shuffle,
     )
 
     assert deck == (
-        DeckEntry(1, TrackReference("track-c")),
-        DeckEntry(2, TrackReference("track-a")),
-        DeckEntry(3, TrackReference("track-b")),
+        DeckEntry(1, TrackReference("track-c", 180)),
+        DeckEntry(2, TrackReference("track-a", 180)),
+        DeckEntry(3, TrackReference("track-b", 180)),
     )
