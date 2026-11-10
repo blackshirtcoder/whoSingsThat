@@ -1,5 +1,6 @@
 """Pure domain logic for Who Sings That?"""
 
+from .deck import Deck, DeckEntry, EmptyDeckError, TrackReference, build_deck
 from .engine import (
     ActiveGameExistsError,
     DomainInvariantError,
@@ -27,8 +28,11 @@ from .scoring import ScoringChoice, calculate_points, speed_multiplier
 
 __all__ = [
     "ActiveGameExistsError",
+    "Deck",
+    "DeckEntry",
     "DomainInvariantError",
     "DuplicatePlayerNameError",
+    "EmptyDeckError",
     "GameEngine",
     "GameEngineError",
     "GameMember",
@@ -43,7 +47,9 @@ __all__ = [
     "NoActiveGameError",
     "ScoringChoice",
     "SongmasterDisconnectRequiresFailoverError",
+    "TrackReference",
     "UnknownGameMemberError",
+    "build_deck",
     "calculate_points",
     "normalize_player_name",
     "player_name_uniqueness_key",
