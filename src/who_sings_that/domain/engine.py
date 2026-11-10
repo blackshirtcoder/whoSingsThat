@@ -223,28 +223,13 @@ class GameEngine:
         entry runs to completion as one serialized authoritative event.
         """
 
-        if self._state is not GameState.LOBBY:
-            raise StartGameNotAllowedError("Start Game is only allowed in LOBBY")
+        self.validate_start_game_request(requesting_browser_token)
         game = self._active_game
-        if game is None:
+        if game is None:  # pragma: no cover - established by the validation above
             raise DomainInvariantError("LOBBY requires an active game")
-
-        token = self._validate_browser_token(
-            requesting_browser_token,
-            error_type=UnauthorizedStartGameError,
-        )
-        if token != game.songmaster_browser_token:
-            raise UnauthorizedStartGameError(
-                "only the current Songmaster may start the game"
-            )
-        if not game.selected_playlist_ids:
-            raise NoPlaylistSelectedError(
-                "at least one playlist must be selected before Start Game"
-            )
 
         # Validate and prepare every expected failure point before committing any
         # Start Game fact to the authoritative session.
-        self._validate_state_invariants(GameState.LOBBY)
         playlists = self._validate_resolved_playlists(game, resolved_playlists)
         locked_playlist_ids = frozenset(game.selected_playlist_ids)
         playlist_snapshots = tuple(playlist.snapshot for playlist in playlists)
@@ -276,6 +261,40 @@ class GameEngine:
         self._transition_to(GameState.ROUND_COMPLETE)
 
         return game
+
+    def validate_start_game_request(
+        self,
+        requesting_browser_token: str,
+    ) -> tuple[str, ...]:
+        """Validate Start Game preconditions without mutating live game state.
+
+        The application layer uses this narrow preflight before filesystem and
+        media inspection. ``start_game`` repeats it when committing transition B
+        so the domain engine remains authoritative if established facts changed.
+        Selected IDs are returned in deterministic order for resolution only.
+        """
+
+        if self._state is not GameState.LOBBY:
+            raise StartGameNotAllowedError("Start Game is only allowed in LOBBY")
+        game = self._active_game
+        if game is None:
+            raise DomainInvariantError("LOBBY requires an active game")
+
+        token = self._validate_browser_token(
+            requesting_browser_token,
+            error_type=UnauthorizedStartGameError,
+        )
+        if token != game.songmaster_browser_token:
+            raise UnauthorizedStartGameError(
+                "only the current Songmaster may start the game"
+            )
+        if not game.selected_playlist_ids:
+            raise NoPlaylistSelectedError(
+                "at least one playlist must be selected before Start Game"
+            )
+
+        self._validate_state_invariants(GameState.LOBBY)
+        return tuple(sorted(game.selected_playlist_ids))
 
     def join_game(
         self, browser_token: str, display_name: str | None = None
