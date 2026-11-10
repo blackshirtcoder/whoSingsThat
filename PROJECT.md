@@ -79,6 +79,37 @@ The game engine should follow these rules consistently:
 - Do not duplicate target-state entry behavior in incoming transitions as defensive cleanup; doing so can mask state-machine errors.
 - A transition is complete only after its transition-specific actions and the target state's entry actions have established the target-state invariants.
 
+### 4.4 Authoritative event execution
+
+An application-level `GameController` owns the one authoritative `GameEngine`,
+one global FIFO message queue, the single queue consumer, message dispatch, and
+application dependencies such as persistent-playlist resolution. The consumer
+handles each authoritative message synchronously and completely before it takes
+the next message. The dispatcher only routes work; the game engine remains the
+owner of state-machine legality and is independently testable without asyncio or
+transport infrastructure.
+
+Client requests have a completion response carrying either their result or an
+expected operational rejection. Unsolicited system events represent independent
+facts and do not have response futures. Either category may eventually cause
+outbound notifications, but notifications are separate from request responses.
+
+An internal component may post a future unsolicited event to the tail of the
+same queue while the current message is being handled, but it must not wait for
+that event to be processed. The queue consumer must never submit a client request
+to its own queue and await the response. Circular synchronous dependencies among
+queued messages are prohibited.
+
+Immediate deterministic state-machine work, including automatic transition K
+after `ROUND_COMPLETE` entry discovers deck exhaustion, completes within the
+current message. A future independent occurrence, such as a timer expiry or
+browser response, enters the global FIFO queue as a new message.
+
+For the current increment, persistent-playlist lookup and media inspection run
+synchronously inside the serialized handler. This preserves message atomicity
+but can block other asyncio loop work until that handler completes; no thread
+pool or generalized asynchronous job system is introduced yet.
+
 ## 5. Music Storage
 
 ### 5.1 Configured music root

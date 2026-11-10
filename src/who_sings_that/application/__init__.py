@@ -1,5 +1,30 @@
 """Application operations connecting persistence and the game domain."""
 
+from .controller import (
+    ConsumerAlreadyRunningError,
+    ConsumerSelfRequestError,
+    ControllerFailedError,
+    ControllerNotRunningError,
+    GameController,
+    GameControllerError,
+    StaleGameSessionError,
+    SystemEventRejection,
+    UnsupportedMessageError,
+)
+from .messages import (
+    AuthoritativeMessage,
+    BrowserAudioCapabilityChangedEvent,
+    ClientRequest,
+    CreateGameRequest,
+    DeselectPlaylistRequest,
+    JoinGameRequest,
+    MemberDisconnectedEvent,
+    PlaySongRequest,
+    SelectPlaylistRequest,
+    SetAudioPreferenceRequest,
+    StartGameRequest,
+    SystemEvent,
+)
 from .start_game import (
     InvalidMusicRootError,
     InvalidSelectedPlaylistIdsError,
@@ -14,14 +39,35 @@ from .start_game import (
 )
 
 __all__ = [
+    "AuthoritativeMessage",
+    "BrowserAudioCapabilityChangedEvent",
+    "ClientRequest",
+    "ConsumerAlreadyRunningError",
+    "ConsumerSelfRequestError",
+    "ControllerFailedError",
+    "ControllerNotRunningError",
+    "CreateGameRequest",
+    "DeselectPlaylistRequest",
+    "GameController",
+    "GameControllerError",
     "InvalidMusicRootError",
     "InvalidSelectedPlaylistIdsError",
+    "JoinGameRequest",
+    "MemberDisconnectedEvent",
     "NoStructurallyEligibleTracksError",
+    "PlaySongRequest",
     "PlaylistResolution",
+    "SelectPlaylistRequest",
     "SelectedPlaylistNotFoundError",
+    "SetAudioPreferenceRequest",
+    "StaleGameSessionError",
+    "StartGameRequest",
     "StartGameResult",
+    "SystemEvent",
+    "SystemEventRejection",
     "TrackExclusion",
     "TrackExclusionReason",
+    "UnsupportedMessageError",
     "resolve_selected_playlists",
     "start_game_from_persistent_playlists",
 ]

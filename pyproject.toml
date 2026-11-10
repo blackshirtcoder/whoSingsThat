@@ -25,3 +25,6 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 "who_sings_that.database.migrations" = ["script.py.mako"]
+
+[tool.pytest.ini_options]
+asyncio_default_fixture_loop_scope = "function"
