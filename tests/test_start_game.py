@@ -89,7 +89,9 @@ def create_selected_lobby(
     engine: GameEngine, *playlist_ids: str
 ) -> GameSession:
     game = engine.create_game("songmaster-token", "Songmaster")
-    game.selected_playlist_ids.update(playlist_ids)
+    for playlist_id in playlist_ids:
+        returned = engine.select_playlist("songmaster-token", playlist_id)
+        assert returned is game
     engine.validate_invariants()
     return game
 

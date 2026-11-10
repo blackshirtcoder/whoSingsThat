@@ -69,6 +69,18 @@ class DomainInvariantError(GameEngineError):
     """Raised when established domain facts do not satisfy the current state."""
 
 
+class PlaylistSelectionNotAllowedError(GameEngineError):
+    """Raised when playlist selection is requested outside ``LOBBY``."""
+
+
+class UnauthorizedPlaylistSelectionError(GameEngineError):
+    """Raised when someone other than the Songmaster changes playlist selection."""
+
+
+class InvalidPlaylistIdError(GameEngineError, ValueError):
+    """Raised when playlist selection is requested without a usable ID."""
+
+
 class StartGameNotAllowedError(GameEngineError):
     """Raised when Start Game is requested outside ``LOBBY``."""
 
@@ -161,6 +173,39 @@ class GameEngine:
             self._validate_state_invariants(previous_state)
             raise
 
+        return game
+
+    def select_playlist(
+        self, requesting_browser_token: str, playlist_id: str
+    ) -> GameSession:
+        """Select a playlist during ``LOBBY`` without changing state.
+
+        Playlist IDs are opaque to the domain engine. An outer layer is
+        responsible for confirming that the ID identifies a persistent playlist.
+        Repeated selection is intentionally idempotent.
+        """
+
+        game = self._lobby_game_for_playlist_selection(requesting_browser_token)
+        validated_playlist_id = self._validate_playlist_id(playlist_id)
+        assert isinstance(game.selected_playlist_ids, set)
+        game.selected_playlist_ids.add(validated_playlist_id)
+        self._validate_state_invariants(self._state)
+        return game
+
+    def deselect_playlist(
+        self, requesting_browser_token: str, playlist_id: str
+    ) -> GameSession:
+        """Deselect a playlist during ``LOBBY`` without changing state.
+
+        Playlist IDs are opaque to the domain engine. Deselecting an ID that is
+        not currently selected is intentionally idempotent.
+        """
+
+        game = self._lobby_game_for_playlist_selection(requesting_browser_token)
+        validated_playlist_id = self._validate_playlist_id(playlist_id)
+        assert isinstance(game.selected_playlist_ids, set)
+        game.selected_playlist_ids.discard(validated_playlist_id)
+        self._validate_state_invariants(self._state)
         return game
 
     def start_game(
@@ -339,6 +384,14 @@ class GameEngine:
         return browser_token
 
     @staticmethod
+    def _validate_playlist_id(playlist_id: str) -> str:
+        if not isinstance(playlist_id, str):
+            raise InvalidPlaylistIdError("playlist_id must be a string")
+        if not playlist_id.strip():
+            raise InvalidPlaylistIdError("playlist_id must not be blank")
+        return playlist_id
+
+    @staticmethod
     def _validate_resolved_playlists(
         game: GameSession,
         resolved_playlists: Iterable[ResolvedPlaylist],
@@ -361,7 +414,10 @@ class GameEngine:
                 raise InvalidResolvedPlaylistError(
                     "resolved playlist metadata must be a SelectedPlaylistSnapshot"
                 )
-            if not isinstance(snapshot.playlist_id, str) or not snapshot.playlist_id:
+            if (
+                not isinstance(snapshot.playlist_id, str)
+                or not snapshot.playlist_id.strip()
+            ):
                 raise InvalidResolvedPlaylistError(
                     "playlist snapshot IDs must be non-empty strings"
                 )
@@ -466,6 +522,27 @@ class GameEngine:
                 "membership operation is only implemented in LOBBY"
             )
         self._validate_state_invariants(self._state)
+        return game
+
+    def _lobby_game_for_playlist_selection(
+        self, requesting_browser_token: str
+    ) -> GameSession:
+        if self._state is not GameState.LOBBY:
+            raise PlaylistSelectionNotAllowedError(
+                "playlist selection is only allowed in LOBBY"
+            )
+        game = self._active_game
+        if game is None:
+            raise DomainInvariantError("LOBBY requires an active game")
+        self._validate_state_invariants(self._state)
+        token = self._validate_browser_token(
+            requesting_browser_token,
+            error_type=UnauthorizedPlaylistSelectionError,
+        )
+        if token != game.songmaster_browser_token:
+            raise UnauthorizedPlaylistSelectionError(
+                "only the current Songmaster may change playlist selection"
+            )
         return game
 
     def _transition_to(self, target: GameState) -> None:
@@ -601,7 +678,7 @@ class GameEngine:
             raise DomainInvariantError("LOBBY requires an active game")
         self._validate_active_game_members(game, state_name="LOBBY")
         if not isinstance(game.selected_playlist_ids, set) or any(
-            not isinstance(playlist_id, str) or not playlist_id
+            not isinstance(playlist_id, str) or not playlist_id.strip()
             for playlist_id in game.selected_playlist_ids
         ):
             raise DomainInvariantError(
@@ -736,7 +813,7 @@ class GameEngine:
                 f"{state_name} requires a non-empty locked playlist selection"
             )
         if any(
-            not isinstance(playlist_id, str) or not playlist_id
+            not isinstance(playlist_id, str) or not playlist_id.strip()
             for playlist_id in game.selected_playlist_ids
         ):
             raise DomainInvariantError("selected playlist IDs must be non-empty strings")
