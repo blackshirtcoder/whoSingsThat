@@ -8,7 +8,7 @@ from typing import Final
 from unicodedata import category, normalize
 from uuid import UUID
 
-from .deck import Deck, TrackReference
+from .deck import Deck, DeckEntry, TrackReference
 
 MAX_PLAYER_NAME_LENGTH: Final = 24
 _ALLOWED_PLAYER_NAME_PUNCTUATION: Final = frozenset(" -_'.")
@@ -106,6 +106,32 @@ class GameMember:
     name_uniqueness_key: str
     committed_score: int = 0
     connected: bool = True
+    audio_enabled: bool = False
+    browser_audio_usable: bool = False
+
+    @property
+    def is_valid_audio_target(self) -> bool:
+        """Return whether this connection can receive audio preparation work."""
+
+        return self.connected and self.audio_enabled and self.browser_audio_usable
+
+
+@dataclass(frozen=True, slots=True)
+class PendingAudioPreparation:
+    """Internal snapshot for one prospective round's preparation attempt.
+
+    This object is authoritative domain data, not a client-facing payload. In
+    particular, transports must not serialize the bound deck entry to clients.
+    """
+
+    preparation_id: UUID
+    deck_entry: DeckEntry
+    configured_playback_offset_seconds: int
+    effective_playback_offset_seconds: Decimal
+    playback_duration_seconds: int
+    speed_bonus_plateau_percent: Decimal
+    buzz_eligible_browser_tokens: frozenset[str]
+    audio_target_browser_tokens: frozenset[str]
 
 
 @dataclass(frozen=True, slots=True)
@@ -172,6 +198,8 @@ class GameSession:
     end_reason: GameEndReason | None = None
     final_standings: tuple[FinalStanding, ...] = ()
     active_round: object | None = None
+    pending_audio_preparation: PendingAudioPreparation | None = None
+    buzzing_enabled: bool = False
     displayed_deck_position: int | None = None
     displayed_artist: str | None = None
     displayed_title: str | None = None

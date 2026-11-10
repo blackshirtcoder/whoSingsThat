@@ -16,13 +16,18 @@ from .models import (
     GameSettings,
     GameState,
     InvalidPlayerNameError,
+    PendingAudioPreparation,
     ResolvedPlaylist,
     SelectedPlaylistSnapshot,
     SkippedDeckEntry,
     normalize_player_name,
     player_name_uniqueness_key,
 )
-from .playback import is_duration_eligible, select_deck_candidate
+from .playback import (
+    calculate_effective_playback_offset,
+    is_duration_eligible,
+    select_deck_candidate,
+)
 
 
 class GameEngineError(RuntimeError):
@@ -97,6 +102,38 @@ class InvalidResolvedPlaylistError(GameEngineError, ValueError):
     """Raised when resolved playlist data is inconsistent with lobby selection."""
 
 
+class AudioPreferenceNotAllowedError(GameEngineError):
+    """Raised when audio preference changes are not legal in the current state."""
+
+
+class InvalidAudioPreferenceRequestError(GameEngineError, ValueError):
+    """Raised when a member supplies an invalid audio preference."""
+
+
+class UnauthorizedAudioPreferenceError(GameEngineError):
+    """Raised when a browser tries to change a preference it does not own."""
+
+
+class AudioCapabilityNotAllowedError(GameEngineError):
+    """Raised when browser audio capability cannot be updated in this phase."""
+
+
+class InvalidAudioCapabilityRequestError(GameEngineError, ValueError):
+    """Raised when a trusted browser-audio capability update is invalid."""
+
+
+class PlaySongNotAllowedError(GameEngineError):
+    """Raised when Play Song is requested outside ``ROUND_COMPLETE``."""
+
+
+class UnauthorizedPlaySongError(GameEngineError):
+    """Raised when Play Song is not requested by the connected Songmaster."""
+
+
+class NoValidAudioTargetError(GameEngineError):
+    """Expected rejection when no connected, enabled, usable target exists."""
+
+
 class GameEngine:
     """Own the single authoritative live game and its normal-flow state."""
 
@@ -106,6 +143,7 @@ class GameEngine:
         *,
         clock: Callable[[], datetime] | None = None,
         game_id_factory: Callable[[], UUID] | None = None,
+        preparation_id_factory: Callable[[], UUID] | None = None,
         shuffle: Shuffle | None = None,
     ) -> None:
         self._installation_defaults = deepcopy(
@@ -116,6 +154,11 @@ class GameEngine:
         self._clock = clock if clock is not None else lambda: datetime.now(UTC)
         self._game_id_factory = (
             game_id_factory if game_id_factory is not None else uuid4
+        )
+        self._preparation_id_factory = (
+            preparation_id_factory
+            if preparation_id_factory is not None
+            else uuid4
         )
         self._shuffle = shuffle if shuffle is not None else random_shuffle
         self._state = GameState.NO_GAME
@@ -151,6 +194,7 @@ class GameEngine:
             browser_token=token,
             display_name=normalized_name,
             name_uniqueness_key=player_name_uniqueness_key(normalized_name),
+            audio_enabled=True,
         )
         game = GameSession(
             game_session_id=self._game_id_factory(),
@@ -296,6 +340,184 @@ class GameEngine:
         self._validate_state_invariants(GameState.LOBBY)
         return tuple(sorted(game.selected_playlist_ids))
 
+    def set_audio_preference(
+        self, requesting_browser_token: str, audio_enabled: bool
+    ) -> GameMember:
+        """Set the requesting member's own per-device audio preference.
+
+        This is an internal action in ``LOBBY`` or ``ROUND_COMPLETE``. Browser
+        audio usability is an independent connection fact and is deliberately
+        not inferred from this preference.
+        """
+
+        if self._state not in {GameState.LOBBY, GameState.ROUND_COMPLETE}:
+            raise AudioPreferenceNotAllowedError(
+                "audio preference may only change in LOBBY or ROUND_COMPLETE"
+            )
+        game = self._active_game
+        if game is None:
+            raise DomainInvariantError(
+                f"{self._state.name} requires an active game"
+            )
+        token = self._validate_browser_token(
+            requesting_browser_token,
+            error_type=InvalidAudioPreferenceRequestError,
+        )
+        member = game.members.get(token)
+        if member is None:
+            raise UnauthorizedAudioPreferenceError(
+                "a member may change only their own audio preference"
+            )
+        if not isinstance(audio_enabled, bool):
+            raise InvalidAudioPreferenceRequestError(
+                "audio_enabled must be a boolean"
+            )
+
+        previous_value = member.audio_enabled
+        member.audio_enabled = audio_enabled
+        try:
+            self._validate_state_invariants(self._state)
+        except Exception:
+            member.audio_enabled = previous_value
+            raise
+        return member
+
+    def set_browser_audio_capability(
+        self, browser_token: str, browser_audio_usable: bool
+    ) -> GameMember:
+        """Record a trusted connection's initialized/unlocked audio condition.
+
+        Capability updates are currently accepted only in the two implemented
+        no-round states. Later preparation/playback phases will own capability
+        loss and readiness-result processing.
+        """
+
+        if self._state not in {GameState.LOBBY, GameState.ROUND_COMPLETE}:
+            raise AudioCapabilityNotAllowedError(
+                "browser audio capability updates are only implemented in "
+                "LOBBY or ROUND_COMPLETE"
+            )
+        game = self._active_game
+        if game is None:
+            raise DomainInvariantError(
+                f"{self._state.name} requires an active game"
+            )
+        token = self._validate_browser_token(
+            browser_token,
+            error_type=InvalidAudioCapabilityRequestError,
+        )
+        member = game.members.get(token)
+        if member is None:
+            raise UnknownGameMemberError(
+                "browser_token does not belong to the active game"
+            )
+        if not isinstance(browser_audio_usable, bool):
+            raise InvalidAudioCapabilityRequestError(
+                "browser_audio_usable must be a boolean"
+            )
+        if browser_audio_usable and not member.connected:
+            raise InvalidAudioCapabilityRequestError(
+                "a disconnected browser cannot have usable audio capability"
+            )
+
+        previous_value = member.browser_audio_usable
+        member.browser_audio_usable = browser_audio_usable
+        try:
+            self._validate_state_invariants(self._state)
+        except Exception:
+            member.browser_audio_usable = previous_value
+            raise
+        return member
+
+    def play_song(self, requesting_browser_token: str) -> PendingAudioPreparation:
+        """Apply transition C (``ROUND_COMPLETE`` to ``AUDIO_PREPARING``)."""
+
+        if self._state is not GameState.ROUND_COMPLETE:
+            raise PlaySongNotAllowedError(
+                "Play Song is only allowed in ROUND_COMPLETE"
+            )
+        game = self._active_game
+        if game is None:
+            raise DomainInvariantError("ROUND_COMPLETE requires an active game")
+
+        token = self._validate_browser_token(
+            requesting_browser_token,
+            error_type=UnauthorizedPlaySongError,
+        )
+        if (
+            token != game.songmaster_browser_token
+            or not game.songmaster.connected
+        ):
+            raise UnauthorizedPlaySongError(
+                "only the current connected Songmaster may request Play Song"
+            )
+
+        # ROUND_COMPLETE entry already performed candidate scanning. Inspect
+        # only the established entry under the pointer; transition C never
+        # searches ahead for another candidate.
+        deck = game.deck
+        if deck is None or game.deck_exhausted or game.deck_pointer >= len(deck):
+            raise DomainInvariantError(
+                "Play Song requires an established non-exhausted deck candidate"
+            )
+        deck_entry = deck[game.deck_pointer]
+        if not is_duration_eligible(
+            deck_entry.track, game.settings.playback_duration_seconds
+        ):
+            raise DomainInvariantError(
+                "ROUND_COMPLETE candidate must be duration eligible"
+            )
+
+        audio_targets = frozenset(
+            member.browser_token
+            for member in game.members.values()
+            if member.is_valid_audio_target
+        )
+        if not audio_targets:
+            raise NoValidAudioTargetError(
+                "Play Song requires at least one connected, enabled browser "
+                "with usable audio"
+            )
+
+        try:
+            effective_offset = calculate_effective_playback_offset(
+                deck_entry.track,
+                game.settings.playback_offset_seconds,
+                game.settings.playback_duration_seconds,
+            )
+        except (TypeError, ValueError) as error:
+            raise DomainInvariantError(
+                "established candidate and game settings must produce a valid offset"
+            ) from error
+        preparation_id = self._preparation_id_factory()
+        if not isinstance(preparation_id, UUID):
+            raise DomainInvariantError(
+                "the preparation ID factory must return a UUID"
+            )
+
+        pending = PendingAudioPreparation(
+            preparation_id=preparation_id,
+            deck_entry=deck_entry,
+            configured_playback_offset_seconds=(
+                game.settings.playback_offset_seconds
+            ),
+            effective_playback_offset_seconds=effective_offset,
+            playback_duration_seconds=game.settings.playback_duration_seconds,
+            speed_bonus_plateau_percent=(
+                game.settings.speed_bonus_plateau_percent
+            ),
+            buzz_eligible_browser_tokens=frozenset(
+                member.browser_token
+                for member in game.members.values()
+                if member.connected
+            ),
+            audio_target_browser_tokens=audio_targets,
+        )
+
+        game.pending_audio_preparation = pending
+        self._transition_to(GameState.AUDIO_PREPARING)
+        return pending
+
     def join_game(
         self, browser_token: str, display_name: str | None = None
     ) -> GameMember:
@@ -317,11 +539,16 @@ class GameEngine:
         existing_member = game.members.get(token)
         if existing_member is not None:
             was_connected = existing_member.connected
+            was_audio_usable = existing_member.browser_audio_usable
             existing_member.connected = True
+            # A new connection must initialize/unlock audio for itself; a prior
+            # connection's capability assertion is never inherited.
+            existing_member.browser_audio_usable = False
             try:
                 self._validate_state_invariants(self._state)
             except Exception:
                 existing_member.connected = was_connected
+                existing_member.browser_audio_usable = was_audio_usable
                 raise
             return existing_member
 
@@ -377,11 +604,14 @@ class GameEngine:
             )
 
         was_connected = member.connected
+        was_audio_usable = member.browser_audio_usable
         member.connected = False
+        member.browser_audio_usable = False
         try:
             self._validate_state_invariants(self._state)
         except Exception:
             member.connected = was_connected
+            member.browser_audio_usable = was_audio_usable
             raise
         return member
 
@@ -586,6 +816,8 @@ class GameEngine:
                 return
             case GameState.ROUND_COMPLETE:
                 self._enter_round_complete()
+            case GameState.AUDIO_PREPARING:
+                self._enter_audio_preparing()
             case GameState.FINISHED:
                 self._enter_finished()
             case _:
@@ -618,6 +850,20 @@ class GameEngine:
         game.deck_exhausted = selection.exhausted
         # Player-facing display fields are intentionally untouched here.
 
+    def _enter_audio_preparing(self) -> None:
+        """Enter preparation without playing audio or creating a real round.
+
+        A future application/transport layer will translate the already-built
+        pending context into opaque client preload commands. There is no domain
+        effect or response collector in this increment.
+        """
+
+        game = self._active_game
+        if game is None or game.pending_audio_preparation is None:
+            raise DomainInvariantError(
+                "AUDIO_PREPARING entry requires a pending preparation"
+            )
+
     def _take_transition_k(self) -> None:
         """Apply transition K after established deck exhaustion."""
 
@@ -649,6 +895,8 @@ class GameEngine:
         game.ended_at = ended_at
         game.final_standings = self._calculate_final_standings(game)
         game.active_round = None
+        game.pending_audio_preparation = None
+        game.buzzing_enabled = False
 
     @staticmethod
     def _calculate_final_standings(game: GameSession) -> tuple[FinalStanding, ...]:
@@ -684,6 +932,8 @@ class GameEngine:
                 self._validate_lobby_invariants()
             case GameState.ROUND_COMPLETE:
                 self._validate_round_complete_invariants()
+            case GameState.AUDIO_PREPARING:
+                self._validate_audio_preparing_invariants()
             case GameState.FINISHED:
                 self._validate_finished_invariants()
             case _:
@@ -727,6 +977,10 @@ class GameEngine:
             raise DomainInvariantError("LOBBY cannot have selected-playlist snapshots")
         if game.active_round is not None:
             raise DomainInvariantError("LOBBY cannot have an active round")
+        if game.pending_audio_preparation is not None:
+            raise DomainInvariantError("LOBBY cannot have a pending preparation")
+        if game.buzzing_enabled is not False:
+            raise DomainInvariantError("buzzing must be disabled in LOBBY")
         if game.playlist_selection_editable is not True:
             raise DomainInvariantError("playlist selection must be editable in LOBBY")
         if any(
@@ -768,6 +1022,18 @@ class GameEngine:
             if not isinstance(member.connected, bool):
                 raise DomainInvariantError(
                     "game member connection state must be boolean"
+                )
+            if not isinstance(member.audio_enabled, bool):
+                raise DomainInvariantError(
+                    "game member audio preference must be boolean"
+                )
+            if not isinstance(member.browser_audio_usable, bool):
+                raise DomainInvariantError(
+                    "game member browser audio capability must be boolean"
+                )
+            if member.browser_audio_usable and not member.connected:
+                raise DomainInvariantError(
+                    "a disconnected member cannot retain usable browser audio"
                 )
             if (
                 isinstance(member.committed_score, bool)
@@ -912,6 +1178,14 @@ class GameEngine:
         )
         if game.active_round is not None:
             raise DomainInvariantError("ROUND_COMPLETE cannot have an active round")
+        if game.pending_audio_preparation is not None:
+            raise DomainInvariantError(
+                "ROUND_COMPLETE cannot have a pending preparation"
+            )
+        if game.buzzing_enabled is not False:
+            raise DomainInvariantError(
+                "buzzing must be disabled in ROUND_COMPLETE"
+            )
         if game.ended_at is not None or game.end_reason is not None:
             raise DomainInvariantError(
                 "ROUND_COMPLETE cannot have game finalization facts"
@@ -935,6 +1209,104 @@ class GameEngine:
                 "deck exhaustion must agree with the established candidate selection"
             )
 
+    def _validate_audio_preparing_invariants(self) -> None:
+        game = self._active_game
+        if game is None:
+            raise DomainInvariantError("AUDIO_PREPARING requires an active game")
+        deck = self._validate_started_game_facts(
+            game, state_name="AUDIO_PREPARING"
+        )
+        if game.deck_exhausted is not False or game.deck_pointer >= len(deck):
+            raise DomainInvariantError(
+                "AUDIO_PREPARING requires a non-exhausted candidate under the pointer"
+            )
+        if game.active_round is not None:
+            raise DomainInvariantError(
+                "AUDIO_PREPARING cannot have an active played round"
+            )
+        if game.buzzing_enabled is not False:
+            raise DomainInvariantError(
+                "buzzing must be disabled in AUDIO_PREPARING"
+            )
+        if game.ended_at is not None or game.end_reason is not None:
+            raise DomainInvariantError(
+                "AUDIO_PREPARING cannot have game finalization facts"
+            )
+        if game.final_standings != ():
+            raise DomainInvariantError(
+                "AUDIO_PREPARING cannot have final standings"
+            )
+
+        pending = game.pending_audio_preparation
+        if not isinstance(pending, PendingAudioPreparation):
+            raise DomainInvariantError(
+                "AUDIO_PREPARING requires an immutable pending preparation"
+            )
+        if not isinstance(pending.preparation_id, UUID):
+            raise DomainInvariantError("preparation identity must be a UUID")
+        if pending.deck_entry is not deck[game.deck_pointer]:
+            raise DomainInvariantError(
+                "pending preparation must bind the exact deck entry under the pointer"
+            )
+        if not is_duration_eligible(
+            pending.deck_entry.track, pending.playback_duration_seconds
+        ):
+            raise DomainInvariantError(
+                "pending preparation deck entry must be duration eligible"
+            )
+        if (
+            pending.configured_playback_offset_seconds
+            != game.settings.playback_offset_seconds
+            or pending.playback_duration_seconds
+            != game.settings.playback_duration_seconds
+            or pending.speed_bonus_plateau_percent
+            != game.settings.speed_bonus_plateau_percent
+        ):
+            raise DomainInvariantError(
+                "pending preparation settings must snapshot the prospective round"
+            )
+        expected_effective_offset = calculate_effective_playback_offset(
+            pending.deck_entry.track,
+            pending.configured_playback_offset_seconds,
+            pending.playback_duration_seconds,
+        )
+        if pending.effective_playback_offset_seconds != expected_effective_offset:
+            raise DomainInvariantError(
+                "pending preparation effective offset is inconsistent"
+            )
+        if not isinstance(pending.buzz_eligible_browser_tokens, frozenset):
+            raise DomainInvariantError("buzz eligibility snapshot must be immutable")
+        if not isinstance(pending.audio_target_browser_tokens, frozenset) or not (
+            pending.audio_target_browser_tokens
+        ):
+            raise DomainInvariantError(
+                "audio target snapshot must be immutable and non-empty"
+            )
+        member_tokens = frozenset(game.members)
+        if not pending.buzz_eligible_browser_tokens <= member_tokens:
+            raise DomainInvariantError(
+                "buzz eligibility must contain only game members"
+            )
+        if game.songmaster_browser_token not in (
+            pending.buzz_eligible_browser_tokens
+        ):
+            raise DomainInvariantError(
+                "the connected Songmaster must be prospectively buzz eligible"
+            )
+        if not pending.audio_target_browser_tokens <= (
+            pending.buzz_eligible_browser_tokens
+        ):
+            raise DomainInvariantError(
+                "audio targets must be connected prospective players"
+            )
+        if any(
+            not game.members[token].is_valid_audio_target
+            for token in pending.audio_target_browser_tokens
+        ):
+            raise DomainInvariantError(
+                "audio target snapshot must contain only valid audio targets"
+            )
+
     def _validate_finished_invariants(self) -> None:
         game = self._active_game
         if game is None:
@@ -942,6 +1314,10 @@ class GameEngine:
         deck = self._validate_started_game_facts(game, state_name="FINISHED")
         if game.active_round is not None:
             raise DomainInvariantError("FINISHED cannot have an active round")
+        if game.pending_audio_preparation is not None:
+            raise DomainInvariantError("FINISHED cannot have a pending preparation")
+        if game.buzzing_enabled is not False:
+            raise DomainInvariantError("buzzing must be disabled in FINISHED")
         if game.deck_pointer != len(deck) or game.deck_exhausted is not True:
             raise DomainInvariantError(
                 "deck-exhausted FINISHED requires the pointer at deck end"
