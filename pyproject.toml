@@ -5,6 +5,7 @@ requires-python = ">=3.14"
 dependencies = [
     "alembic>=1.20.1",
     "fastapi[standard-no-fastapi-cloud-cli]>=0.162.0",
+    "mutagen>=1.48.1",
     "sqlalchemy>=2.1.6",
 ]
 
@@ -15,5 +16,9 @@ dev = [
     "ruff>=0.17.3",
 ]
 
-[tool.pytest.ini_options]
-pythonpath = ["src"]
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
