@@ -139,6 +139,7 @@ Suggested track fields:
 
 ```text
 track_id
+created_at
 relative_path
 artist
 title
@@ -151,9 +152,19 @@ enabled
 
 Parsed metadata is stored in SQLite and is not re-parsed during every game.
 
+`created_at` records when the track was first inserted into the catalog. It is
+stored in UTC, is not a filesystem or release timestamp, and is shared by all
+new tracks inserted by the same import operation.
+
 ## 7. Stable Track Identity and Reconciliation
 
 Track IDs should remain stable across file moves where practical.
+
+New catalog records receive database-generated integer `track_id` values. The
+SQLite implementation uses non-reusing autoincrement semantics: an ID belonging
+to a previously committed record is not assigned to a later record after the
+original is deleted. Track identity is independent of relative paths, metadata,
+and the reconciliation fingerprint below.
 
 Reconciliation strategy:
 
@@ -167,6 +178,10 @@ Reconciliation strategy:
 Artist/title normalization should include Unicode normalization, trimmed/collapsed whitespace, and case-insensitive comparison.
 
 No whole-file cryptographic hash is required for V1.
+
+Reconciliation, including metadata correction or a filesystem move, preserves
+both the existing `track_id` and the track's original UTC `created_at` catalog
+insertion timestamp.
 
 ## 8. `/admin`
 

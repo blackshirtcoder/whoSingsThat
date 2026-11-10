@@ -18,9 +18,7 @@ def make_deck(*durations: float | Decimal) -> Deck:
     return tuple(
         DeckEntry(
             original_position=position,
-            track=TrackReference(
-                track_id=f"track-{position}", duration_seconds=duration
-            ),
+            track=TrackReference(track_id=position, duration_seconds=duration),
         )
         for position, duration in enumerate(durations, start=1)
     )
@@ -37,7 +35,7 @@ def make_deck(*durations: float | Decimal) -> Deck:
 def test_duration_eligibility_includes_exact_boundary(
     track_duration: float | Decimal, expected: bool
 ) -> None:
-    track = TrackReference("track", track_duration)
+    track = TrackReference(1, track_duration)
 
     assert is_duration_eligible(track, 30) is expected
 
@@ -53,7 +51,7 @@ def test_duration_eligibility_includes_exact_boundary(
 def test_effective_offset_is_clamped_to_latest_valid_start(
     track_duration: int, configured_offset: int, expected_offset: Decimal
 ) -> None:
-    track = TrackReference("track", track_duration)
+    track = TrackReference(1, track_duration)
 
     assert (
         calculate_effective_playback_offset(track, configured_offset, 30)
@@ -152,7 +150,7 @@ def test_duration_boundaries_are_validated(
     error: type[Exception],
     message: str,
 ) -> None:
-    track = TrackReference("track", track_duration)  # type: ignore[arg-type]
+    track = TrackReference(1, track_duration)  # type: ignore[arg-type]
 
     with pytest.raises(error, match=message):
         is_duration_eligible(
@@ -173,7 +171,7 @@ def test_effective_offset_boundaries_are_validated(
 ) -> None:
     with pytest.raises(error, match=message):
         calculate_effective_playback_offset(
-            TrackReference("track", 60),
+            TrackReference(1, 60),
             configured_offset,  # type: ignore[arg-type]
             30,
         )
@@ -183,7 +181,7 @@ def test_effective_offset_rejects_ineligible_track() -> None:
     with pytest.raises(
         ValueError, match="track duration must be at least playback duration"
     ):
-        calculate_effective_playback_offset(TrackReference("track", 29), 0, 30)
+        calculate_effective_playback_offset(TrackReference(1, 29), 0, 30)
 
 
 @pytest.mark.parametrize(

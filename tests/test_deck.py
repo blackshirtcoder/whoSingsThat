@@ -16,10 +16,10 @@ def unchanged(tracks: list[TrackReference]) -> None:
 
 def test_tracks_are_deduplicated_by_stable_identity_within_and_across_playlists(
 ) -> None:
-    first_a = TrackReference("track-a", 180)
-    repeated_a = TrackReference("track-a", 180)
-    track_b = TrackReference("track-b", 180)
-    track_c = TrackReference("track-c", 180)
+    first_a = TrackReference(1, 180)
+    repeated_a = TrackReference(1, 180)
+    track_b = TrackReference(2, 180)
+    track_c = TrackReference(3, 180)
 
     deck = build_deck(
         [
@@ -30,15 +30,15 @@ def test_tracks_are_deduplicated_by_stable_identity_within_and_across_playlists(
     )
 
     assert [entry.track.track_id for entry in deck] == [
-        "track-a",
-        "track-b",
-        "track-c",
+        1,
+        2,
+        3,
     ]
     assert deck[0].track is first_a
 
 
 def test_shuffle_is_called_exactly_once_with_only_unique_tracks() -> None:
-    shuffle_calls: list[list[str]] = []
+    shuffle_calls: list[list[int]] = []
 
     def recording_shuffle(tracks: list[TrackReference]) -> None:
         shuffle_calls.append([track.track_id for track in tracks])
@@ -46,23 +46,23 @@ def test_shuffle_is_called_exactly_once_with_only_unique_tracks() -> None:
 
     deck = build_deck(
         [
-            [TrackReference("track-a", 180), TrackReference("track-a", 180)],
-            [TrackReference("track-b", 180), TrackReference("track-c", 180)],
+            [TrackReference(1, 180), TrackReference(1, 180)],
+            [TrackReference(2, 180), TrackReference(3, 180)],
         ],
         shuffle=recording_shuffle,
     )
 
-    assert shuffle_calls == [["track-a", "track-b", "track-c"]]
+    assert shuffle_calls == [[1, 2, 3]]
     assert [entry.track.track_id for entry in deck] == [
-        "track-c",
-        "track-b",
-        "track-a",
+        3,
+        2,
+        1,
     ]
 
 
 def test_original_positions_are_one_based_and_immutable() -> None:
     deck = build_deck(
-        [[TrackReference("track-b", 180), TrackReference("track-a", 180)]],
+        [[TrackReference(2, 180), TrackReference(1, 180)]],
         shuffle=unchanged,
     )
 
@@ -89,21 +89,21 @@ def test_empty_resulting_deck_is_rejected(
 
 
 def test_injected_shuffle_produces_deterministic_order_and_positions() -> None:
-    desired_order = {"track-c": 0, "track-a": 1, "track-b": 2}
+    desired_order = {3: 0, 1: 1, 2: 2}
 
     def deterministic_shuffle(tracks: list[TrackReference]) -> None:
         tracks.sort(key=lambda track: desired_order[track.track_id])
 
     deck = build_deck(
         [
-            [TrackReference("track-a", 180), TrackReference("track-b", 180)],
-            [TrackReference("track-c", 180)],
+            [TrackReference(1, 180), TrackReference(2, 180)],
+            [TrackReference(3, 180)],
         ],
         shuffle=deterministic_shuffle,
     )
 
     assert deck == (
-        DeckEntry(1, TrackReference("track-c", 180)),
-        DeckEntry(2, TrackReference("track-a", 180)),
-        DeckEntry(3, TrackReference("track-b", 180)),
+        DeckEntry(1, TrackReference(3, 180)),
+        DeckEntry(2, TrackReference(1, 180)),
+        DeckEntry(3, TrackReference(2, 180)),
     )

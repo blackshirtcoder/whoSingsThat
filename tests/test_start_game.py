@@ -103,8 +103,8 @@ def test_songmaster_start_game_establishes_transition_b_facts() -> None:
     player = engine.join_game("player-token", "Player")
     metadata = resolved_playlist(
         "rock",
-        TrackReference("track-1", 180),
-        TrackReference("track-2", 200),
+        TrackReference(1, 180),
+        TrackReference(2, 200),
         name="Road Trip",
     )
 
@@ -142,7 +142,7 @@ def test_start_game_rejects_non_songmaster_without_touching_lobby() -> None:
     with pytest.raises(UnauthorizedStartGameError, match="current Songmaster"):
         engine.start_game(
             "player-token",
-            [resolved_playlist("rock", TrackReference("track-1", 180))],
+            [resolved_playlist("rock", TrackReference(1, 180))],
         )
 
     assert engine.state is GameState.LOBBY
@@ -158,7 +158,7 @@ def test_start_game_rejects_request_outside_lobby() -> None:
         engine.start_game("songmaster-token", [])
 
     create_selected_lobby(engine, "rock")
-    payload = [resolved_playlist("rock", TrackReference("track-1", 180))]
+    payload = [resolved_playlist("rock", TrackReference(1, 180))]
     engine.start_game("songmaster-token", payload)
 
     with pytest.raises(StartGameNotAllowedError, match="only allowed in LOBBY"):
@@ -199,7 +199,7 @@ def test_selected_playlist_payload_must_match_lobby_selection_exactly() -> None:
     with pytest.raises(InvalidResolvedPlaylistError, match="exactly match"):
         engine.start_game(
             "songmaster-token",
-            [resolved_playlist("rock", TrackReference("track-1", 180))],
+            [resolved_playlist("rock", TrackReference(1, 180))],
         )
 
     assert engine.active_game is lobby
@@ -210,7 +210,7 @@ def test_selected_playlist_payload_must_match_lobby_selection_exactly() -> None:
 def test_resolved_playlist_metadata_rejects_duplicate_and_impossible_counts() -> None:
     duplicate_engine = make_engine()
     duplicate_lobby = create_selected_lobby(duplicate_engine, "rock")
-    track = TrackReference("track-1", 180)
+    track = TrackReference(1, 180)
 
     with pytest.raises(InvalidResolvedPlaylistError, match="exactly once"):
         duplicate_engine.start_game(
@@ -233,8 +233,32 @@ def test_resolved_playlist_metadata_rejects_duplicate_and_impossible_counts() ->
     count_engine.validate_invariants()
 
 
+@pytest.mark.parametrize("track_id", ["1", 0, -1, True])
+def test_resolved_tracks_require_positive_integer_catalog_ids(
+    track_id: object,
+) -> None:
+    engine = make_engine()
+    lobby = create_selected_lobby(engine, "rock")
+    before = deepcopy(lobby)
+
+    with pytest.raises(InvalidResolvedPlaylistError, match="positive integers"):
+        engine.start_game(
+            "songmaster-token",
+            [
+                resolved_playlist(
+                    "rock",
+                    TrackReference(track_id, 180),  # type: ignore[arg-type]
+                )
+            ],
+        )
+
+    assert engine.active_game is lobby
+    assert lobby == before
+    engine.validate_invariants()
+
+
 def test_start_game_deduplicates_then_shuffles_exactly_once() -> None:
-    shuffle_calls: list[list[str]] = []
+    shuffle_calls: list[list[int]] = []
 
     def recording_shuffle(tracks: list[TrackReference]) -> None:
         shuffle_calls.append([track.track_id for track in tracks])
@@ -242,7 +266,7 @@ def test_start_game_deduplicates_then_shuffles_exactly_once() -> None:
 
     engine = make_engine(shuffle=recording_shuffle)
     create_selected_lobby(engine, "rock", "favorites")
-    shared_first = TrackReference("shared", 180)
+    shared_first = TrackReference(1, 180)
 
     game = engine.start_game(
         "songmaster-token",
@@ -250,22 +274,22 @@ def test_start_game_deduplicates_then_shuffles_exactly_once() -> None:
             resolved_playlist(
                 "rock",
                 shared_first,
-                TrackReference("rock-only", 190),
+                TrackReference(2, 190),
             ),
             resolved_playlist(
                 "favorites",
-                TrackReference("shared", 999),
-                TrackReference("favorite-only", 200),
+                TrackReference(1, 999),
+                TrackReference(3, 200),
             ),
         ],
     )
 
-    assert shuffle_calls == [["shared", "rock-only", "favorite-only"]]
+    assert shuffle_calls == [[1, 2, 3]]
     assert game.deck is not None
     assert [entry.track.track_id for entry in game.deck] == [
-        "favorite-only",
-        "rock-only",
-        "shared",
+        3,
+        2,
+        1,
     ]
     assert game.deck[2].track is shared_first
 
@@ -278,8 +302,8 @@ def test_started_deck_and_permanent_positions_are_immutable() -> None:
         [
             resolved_playlist(
                 "rock",
-                TrackReference("track-1", 180),
-                TrackReference("track-2", 180),
+                TrackReference(1, 180),
+                TrackReference(2, 180),
             )
         ],
     )
@@ -301,10 +325,10 @@ def test_round_complete_entry_skips_consecutive_short_tracks_and_advances_pointe
         [
             resolved_playlist(
                 "mixed",
-                TrackReference("short-1", 10),
-                TrackReference("short-2", 29),
-                TrackReference("candidate", 30),
-                TrackReference("later", 180),
+                TrackReference(1, 10),
+                TrackReference(2, 29),
+                TrackReference(3, 30),
+                TrackReference(4, 180),
             )
         ],
     )
@@ -312,10 +336,10 @@ def test_round_complete_entry_skips_consecutive_short_tracks_and_advances_pointe
     assert game.deck_pointer == 2
     assert game.deck_exhausted is False
     assert game.deck is not None
-    assert game.deck[game.deck_pointer].track.track_id == "candidate"
+    assert game.deck[game.deck_pointer].track.track_id == 3
     assert game.skipped_deck_entries == (
-        SkippedDeckEntry(1, "short-1", DeckSkipReason.DURATION_INELIGIBLE),
-        SkippedDeckEntry(2, "short-2", DeckSkipReason.DURATION_INELIGIBLE),
+        SkippedDeckEntry(1, 1, DeckSkipReason.DURATION_INELIGIBLE),
+        SkippedDeckEntry(2, 2, DeckSkipReason.DURATION_INELIGIBLE),
     )
     engine.validate_invariants()
 
@@ -328,9 +352,9 @@ def test_round_complete_entry_preserves_player_facing_display_on_every_entry() -
         [
             resolved_playlist(
                 "rock",
-                TrackReference("played", 180),
-                TrackReference("short", 10),
-                TrackReference("next", 180),
+                TrackReference(1, 180),
+                TrackReference(2, 10),
+                TrackReference(3, 180),
             )
         ],
     )
@@ -343,7 +367,7 @@ def test_round_complete_entry_preserves_player_facing_display_on_every_entry() -
 
     assert game.deck_pointer == 2
     assert game.skipped_deck_entries == (
-        SkippedDeckEntry(2, "short", DeckSkipReason.DURATION_INELIGIBLE),
+        SkippedDeckEntry(2, 2, DeckSkipReason.DURATION_INELIGIBLE),
     )
     assert game.displayed_deck_position == 1
     assert game.displayed_artist == "The Police"
@@ -360,8 +384,8 @@ def test_all_short_tracks_finish_with_zero_played_rounds_and_zero_score() -> Non
         [
             resolved_playlist(
                 "short",
-                TrackReference("short-1", 10),
-                TrackReference("short-2", 20),
+                TrackReference(1, 10),
+                TrackReference(2, 20),
             )
         ],
     )
@@ -397,8 +421,8 @@ def test_finished_standings_are_frozen_sorted_and_preserve_ties() -> None:
         [
             resolved_playlist(
                 "short",
-                TrackReference("short-1", 10),
-                TrackReference("short-2", 20),
+                TrackReference(1, 10),
+                TrackReference(2, 20),
             )
         ],
     )
@@ -411,8 +435,8 @@ def test_finished_standings_are_frozen_sorted_and_preserve_ties() -> None:
     assert game.deck_pointer == len(game.deck)
     assert game.deck_exhausted is True
     assert game.skipped_deck_entries == (
-        SkippedDeckEntry(1, "short-1", DeckSkipReason.DURATION_INELIGIBLE),
-        SkippedDeckEntry(2, "short-2", DeckSkipReason.DURATION_INELIGIBLE),
+        SkippedDeckEntry(1, 1, DeckSkipReason.DURATION_INELIGIBLE),
+        SkippedDeckEntry(2, 2, DeckSkipReason.DURATION_INELIGIBLE),
     )
     assert game.active_round is None
     assert game.displayed_deck_position is None
@@ -474,7 +498,7 @@ def test_dependency_preparation_failures_leave_authoritative_lobby_untouched(
     with pytest.raises(error_type, match=message):
         engine.start_game(
             "songmaster-token",
-            [resolved_playlist("rock", TrackReference("track-1", 180))],
+            [resolved_playlist("rock", TrackReference(1, 180))],
         )
 
     assert engine.state is GameState.LOBBY
@@ -496,7 +520,7 @@ def test_unexpected_committed_invariant_violation_is_raised_without_copy_rollbac
     with pytest.raises(DomainInvariantError, match="original deck size"):
         engine.start_game(
             "songmaster-token",
-            [resolved_playlist("rock", TrackReference("track-1", 180))],
+            [resolved_playlist("rock", TrackReference(1, 180))],
         )
 
     assert engine.state is GameState.ROUND_COMPLETE
@@ -512,7 +536,7 @@ def test_resolver_iteration_failure_leaves_authoritative_lobby_untouched() -> No
     before = deepcopy(lobby)
 
     def failing_result():
-        yield resolved_playlist("rock", TrackReference("track-1", 180))
+        yield resolved_playlist("rock", TrackReference(1, 180))
         raise RuntimeError("resolver result failed")
 
     with pytest.raises(RuntimeError, match="resolver result failed"):
@@ -532,8 +556,8 @@ def test_round_complete_invariant_rejects_unscanned_pointer() -> None:
         [
             resolved_playlist(
                 "mixed",
-                TrackReference("short", 10),
-                TrackReference("candidate", 60),
+                TrackReference(1, 10),
+                TrackReference(2, 60),
             )
         ],
     )

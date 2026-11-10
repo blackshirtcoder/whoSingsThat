@@ -450,9 +450,13 @@ class GameEngine:
                     raise InvalidResolvedPlaylistError(
                         "resolved playlist tracks must be TrackReference values"
                     )
-                if not isinstance(track.track_id, str) or not track.track_id:
+                if (
+                    isinstance(track.track_id, bool)
+                    or not isinstance(track.track_id, int)
+                    or track.track_id <= 0
+                ):
                     raise InvalidResolvedPlaylistError(
-                        "resolved track IDs must be non-empty strings"
+                        "resolved track IDs must be positive integers"
                     )
                 try:
                     # This validates the duration without using eligibility as a

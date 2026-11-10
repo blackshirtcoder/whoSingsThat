@@ -136,7 +136,7 @@ class SkippedDeckEntry:
     """A permanent record of one skipped entry at its original deck position."""
 
     original_position: int
-    track_id: str
+    track_id: int
     reason: DeckSkipReason
 
 

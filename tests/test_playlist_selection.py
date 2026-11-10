@@ -51,7 +51,7 @@ def resolved_playlist(playlist_id: str) -> ResolvedPlaylist:
             playlist_created_at=PLAYLIST_CREATED_AT,
             playlist_song_count=1,
         ),
-        tracks=(TrackReference(f"track-{playlist_id}", 180),),
+        tracks=(TrackReference(1, 180),),
     )
 
 

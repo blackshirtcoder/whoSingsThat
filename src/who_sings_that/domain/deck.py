@@ -14,7 +14,7 @@ class EmptyDeckError(ValueError):
 class TrackReference:
     """A resolved catalog track identified by its stable catalog identity."""
 
-    track_id: str
+    track_id: int
     duration_seconds: float | Decimal
 
 
@@ -43,7 +43,7 @@ def build_deck(
     exactly once before permanent positions are assigned.
     """
 
-    unique_tracks: dict[str, TrackReference] = {}
+    unique_tracks: dict[int, TrackReference] = {}
     for playlist_tracks in selected_playlist_tracks:
         for track in playlist_tracks:
             unique_tracks.setdefault(track.track_id, track)
