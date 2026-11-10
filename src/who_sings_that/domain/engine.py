@@ -337,6 +337,16 @@ class GameEngine:
             )
         if game.deck is not None:
             raise DomainInvariantError("LOBBY cannot have an immutable deck")
+        if isinstance(game.deck_pointer, bool) or game.deck_pointer != 0:
+            raise DomainInvariantError("LOBBY deck pointer must be zero")
+        if isinstance(game.original_deck_size, bool) or game.original_deck_size != 0:
+            raise DomainInvariantError("LOBBY original deck size must be zero")
+        if game.deck_exhausted is not False:
+            raise DomainInvariantError("LOBBY deck cannot be exhausted")
+        if game.started_at is not None:
+            raise DomainInvariantError("LOBBY cannot have a game start timestamp")
+        if game.selected_playlist_snapshots != ():
+            raise DomainInvariantError("LOBBY cannot have selected-playlist snapshots")
         if game.active_round is not None:
             raise DomainInvariantError("LOBBY cannot have an active round")
         if not game.playlist_selection_editable:

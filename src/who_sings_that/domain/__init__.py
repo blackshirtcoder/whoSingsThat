@@ -21,6 +21,7 @@ from .models import (
     GameSettings,
     GameState,
     InvalidPlayerNameError,
+    SelectedPlaylistSnapshot,
     normalize_player_name,
     player_name_uniqueness_key,
 )
@@ -46,6 +47,7 @@ __all__ = [
     "MembershipOperationNotAllowedError",
     "NoActiveGameError",
     "ScoringChoice",
+    "SelectedPlaylistSnapshot",
     "SongmasterDisconnectRequiresFailoverError",
     "TrackReference",
     "UnknownGameMemberError",

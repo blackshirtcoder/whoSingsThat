@@ -1,4 +1,5 @@
 from collections.abc import Callable
+from dataclasses import FrozenInstanceError
 from datetime import UTC, datetime
 from decimal import Decimal
 from uuid import UUID
@@ -21,6 +22,7 @@ from who_sings_that.domain.models import (
     GameSettings,
     GameState,
     InvalidPlayerNameError,
+    SelectedPlaylistSnapshot,
     normalize_player_name,
     player_name_uniqueness_key,
 )
@@ -93,6 +95,11 @@ def test_create_game_enters_lobby_and_establishes_lobby_invariants() -> None:
     assert engine.state is GameState.LOBBY
     assert engine.active_game is game
     assert game.deck is None
+    assert game.deck_pointer == 0
+    assert game.original_deck_size == 0
+    assert game.deck_exhausted is False
+    assert game.started_at is None
+    assert game.selected_playlist_snapshots == ()
     assert game.active_round is None
     assert game.playlist_selection_editable is True
     engine.validate_invariants()
@@ -114,6 +121,22 @@ def test_create_game_starts_with_no_selected_playlists() -> None:
     game = make_engine().create_game("creator-token", "Grace")
 
     assert game.selected_playlist_ids == set()
+
+
+def test_selected_playlist_snapshot_is_immutable() -> None:
+    snapshot = SelectedPlaylistSnapshot(
+        playlist_id="playlist-1",
+        playlist_name="Road Trip",
+        playlist_created_at=FIXED_CREATED_AT,
+        playlist_song_count=42,
+    )
+
+    assert snapshot.playlist_id == "playlist-1"
+    assert snapshot.playlist_name == "Road Trip"
+    assert snapshot.playlist_created_at == FIXED_CREATED_AT
+    assert snapshot.playlist_song_count == 42
+    with pytest.raises(FrozenInstanceError):
+        snapshot.playlist_name = "Changed"  # type: ignore[misc]
 
 
 def test_installation_defaults_are_copied_not_shared() -> None:
@@ -481,4 +504,41 @@ def test_lobby_invariant_rejects_disconnected_songmaster_without_overlay() -> No
     game.songmaster.connected = False
 
     with pytest.raises(DomainInvariantError, match="connected Songmaster"):
+        engine.validate_invariants()
+
+
+@pytest.mark.parametrize(
+    ("field_name", "invalid_value", "error_message"),
+    [
+        ("deck", (), "cannot have an immutable deck"),
+        ("deck_pointer", 1, "deck pointer must be zero"),
+        ("deck_pointer", False, "deck pointer must be zero"),
+        ("original_deck_size", 1, "original deck size must be zero"),
+        ("original_deck_size", False, "original deck size must be zero"),
+        ("deck_exhausted", True, "deck cannot be exhausted"),
+        ("deck_exhausted", 0, "deck cannot be exhausted"),
+        ("started_at", FIXED_CREATED_AT, "cannot have a game start timestamp"),
+        (
+            "selected_playlist_snapshots",
+            (
+                SelectedPlaylistSnapshot(
+                    playlist_id="playlist-1",
+                    playlist_name="Road Trip",
+                    playlist_created_at=FIXED_CREATED_AT,
+                    playlist_song_count=42,
+                ),
+            ),
+            "cannot have selected-playlist snapshots",
+        ),
+    ],
+)
+def test_lobby_invariants_reject_started_deck_lifecycle_values(
+    field_name: str, invalid_value: object, error_message: str
+) -> None:
+    engine = make_engine()
+    game = engine.create_game("creator-token", "Creator")
+
+    setattr(game, field_name, invalid_value)
+
+    with pytest.raises(DomainInvariantError, match=error_message):
         engine.validate_invariants()

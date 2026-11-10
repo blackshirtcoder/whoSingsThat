@@ -8,6 +8,8 @@ from typing import Final
 from unicodedata import category, normalize
 from uuid import UUID
 
+from .deck import Deck
+
 MAX_PLAYER_NAME_LENGTH: Final = 24
 _ALLOWED_PLAYER_NAME_PUNCTUATION: Final = frozenset(" -_'.")
 
@@ -94,6 +96,16 @@ class GameMember:
     connected: bool = True
 
 
+@dataclass(frozen=True, slots=True)
+class SelectedPlaylistSnapshot:
+    """Immutable playlist metadata captured when a game starts."""
+
+    playlist_id: str
+    playlist_name: str
+    playlist_created_at: datetime
+    playlist_song_count: int
+
+
 @dataclass(slots=True)
 class GameSession:
     """The minimal live game aggregate needed while in the lobby."""
@@ -105,7 +117,12 @@ class GameSession:
     songmaster_browser_token: str
     selected_playlist_ids: set[str] = field(default_factory=set)
     playlist_selection_editable: bool = True
-    deck: object | None = None
+    selected_playlist_snapshots: tuple[SelectedPlaylistSnapshot, ...] = ()
+    deck: Deck | None = None
+    deck_pointer: int = 0
+    original_deck_size: int = 0
+    deck_exhausted: bool = False
+    started_at: datetime | None = None
     active_round: object | None = None
 
     @property
