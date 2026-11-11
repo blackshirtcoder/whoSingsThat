@@ -1,5 +1,11 @@
 """Application operations connecting persistence and the game domain."""
 
+from .connections import (
+    ConnectionRegistration,
+    ConnectionRegistrationStatus,
+    ConnectionRegistry,
+    InvalidConnectionIdError,
+)
 from .controller import (
     DEFAULT_PREPARATION_TIMEOUT_SECONDS,
     ConsumerAlreadyRunningError,
@@ -8,6 +14,7 @@ from .controller import (
     ControllerNotRunningError,
     GameController,
     GameControllerError,
+    StaleConnectionError,
     StaleGameSessionError,
     SystemEventRejection,
     UnsupportedMessageError,
@@ -32,6 +39,7 @@ from .messages import (
     MemberDisconnectedEvent,
     PlaybackTimeoutEvent,
     PlaySongRequest,
+    RegisterConnectionRequest,
     RevealRequest,
     SelectPlaylistRequest,
     SetAudioPreferenceRequest,
@@ -64,6 +72,9 @@ __all__ = [
     "CancelGameRequest",
     "ClientRequest",
     "CloseGameRequest",
+    "ConnectionRegistration",
+    "ConnectionRegistrationStatus",
+    "ConnectionRegistry",
     "ConsumerAlreadyRunningError",
     "ConsumerSelfRequestError",
     "ControllerFailedError",
@@ -74,6 +85,7 @@ __all__ = [
     "EndGameRequest",
     "GameController",
     "GameControllerError",
+    "InvalidConnectionIdError",
     "InvalidMusicRootError",
     "InvalidSelectedPlaylistIdsError",
     "JoinGameRequest",
@@ -82,10 +94,12 @@ __all__ = [
     "PlaySongRequest",
     "PlaybackTimeoutEvent",
     "PlaylistResolution",
+    "RegisterConnectionRequest",
     "RevealRequest",
     "SelectPlaylistRequest",
     "SelectedPlaylistNotFoundError",
     "SetAudioPreferenceRequest",
+    "StaleConnectionError",
     "StaleGameSessionError",
     "StartGameRequest",
     "StartGameResult",

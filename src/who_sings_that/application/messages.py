@@ -20,6 +20,7 @@ class CreateGameRequest(ClientRequest):
 
     browser_token: str
     display_name: str
+    source_connection_id: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,7 +37,22 @@ class JoinGameRequest(ClientRequest):
 
     game_session_id: UUID
     browser_token: str
+    source_connection_id: str
     display_name: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class RegisterConnectionRequest(ClientRequest):
+    """Trusted transport request to establish or replace a member connection.
+
+    Future WebSocket code must generate and authenticate ``connection_id``;
+    browsers must never be trusted to assert arbitrary connection identities.
+    This request cannot create game membership.
+    """
+
+    game_session_id: UUID
+    browser_token: str
+    connection_id: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,6 +125,7 @@ class BuzzRequest(ClientRequest):
     game_session_id: UUID
     round_id: UUID
     requesting_browser_token: str
+    source_connection_id: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -227,6 +244,7 @@ __all__ = [
     "MemberDisconnectedEvent",
     "PlaySongRequest",
     "PlaybackTimeoutEvent",
+    "RegisterConnectionRequest",
     "RevealRequest",
     "SelectPlaylistRequest",
     "SetAudioPreferenceRequest",

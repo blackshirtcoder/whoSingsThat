@@ -329,6 +329,7 @@ class GameSession:
     scoring_correction_round_id: UUID | None = None
     pending_audio_preparation: PendingAudioPreparation | None = None
     audio_preparation_responses: AudioPreparationResponseState | None = None
+    buzz_disqualified_browser_tokens: set[str] = field(default_factory=set)
     buzzing_enabled: bool = False
     displayed_deck_position: int | None = None
     displayed_artist: str | None = None

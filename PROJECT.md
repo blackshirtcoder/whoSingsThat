@@ -142,6 +142,23 @@ can use the controller. Cancellation is only an efficiency mechanism: queued
 events retain the former game/round/preparation identities and are rejected by
 ordinary identity/state validation if processed after finalization or closure.
 
+The application controller also owns a deliberately small authoritative
+connection registry. It maps each `(game_session_id, browser_token)` membership
+to one current opaque connection ID and connected/disconnected status; it does
+not duplicate member names, roles, scores, or game state. Connection
+establishment, replacement, and loss are messages on the same FIFO queue as
+gameplay, so registry and domain membership changes cannot race. Registering the
+same live connection is idempotent. Registering a different connection replaces
+the predecessor, and a delayed event from the predecessor is then stale.
+
+Connection-establishment records and connection-loss/capability/preparation
+events are trusted transport-facing inputs. Future WebSocket code must generate
+and authenticate connection IDs and translate observed transport occurrences
+into these messages; a browser must not be allowed to assert an arbitrary
+connection ID. Registration alone never creates membership. Create Game or Join
+Game remains responsible for validated membership creation, while an existing
+member's trusted registration may resume that member's current connection.
+
 ## 5. Music Storage
 
 ### 5.1 Configured music root
@@ -317,6 +334,19 @@ A browser receives a persistent local token. The user first establishes a displa
 
 The same browser token allows reconnection to the same running game. A different browser/device, or cleared local storage, is a new player in V1.
 
+Three identities remain distinct:
+
+- `game_session_id` identifies one game and prevents former-game events from
+  affecting a later game even if a browser token is reused;
+- the persistent browser token identifies one member only within the current
+  game and resumes that member's stored name, role, and score;
+- a connection ID identifies one live transport connection and is replaced on
+  refresh/reconnect without becoming the member identity.
+
+Transport connection IDs are process-local facts. They are neither persisted
+nor copied into completed history, and cross-device identity recovery remains
+outside V1.
+
 ## 12. Player Names
 
 Once a player joins a game, that display name is immutable for that game.
@@ -345,7 +375,11 @@ Suggested maximum:
 
 ## 13. Joining, Disconnecting, and Round Eligibility
 
-Players may join an active game at any time.
+New players may join in `LOBBY` and in every started gameplay state through
+`SCORING`, including `ROUND_COMPLETE`. New membership is not accepted in
+`FINISHED`; that retained state displays the participants' completed results.
+New members begin with zero committed points, audio disabled, and no usable
+browser-audio capability. They cannot replace the existing Songmaster.
 
 A player joining during an active round immediately sees synchronized game state and standings but may not buzz in that already-active round.
 
@@ -353,7 +387,29 @@ A player who refreshes/reconnects during an active round likewise loses buzz eli
 
 The buzz-eligible player set is snapshotted on transition C, `ROUND_COMPLETE → AUDIO_PREPARING`, before audio preparation begins. A player who joins or reconnects after that snapshot may observe the pending/current round but may not buzz in it.
 
+Reconnect by a recognized token preserves the stored display name, membership,
+role, committed score, and audio-enabled preference without accepting a new
+name. It replaces the prior authoritative connection and resets the new
+connection's initialized/unlocked browser-audio capability to false. A bounded
+current-song disqualification records that a member whose connection changed
+after transition C cannot reuse their token's presence in the frozen snapshot.
+That disqualification survives through preparation, playback, reveal, and
+scoring, then clears when normal `ROUND_COMPLETE` entry ends the song. A later
+transition C can include the reconnected member again.
+
+A duplicate registration of the exact same live connection changes no domain
+fact and does not revoke buzz eligibility. A legitimate replacement or
+reconnection is different and invalidates eligibility for the current song.
+Buzz requests are accepted only from the member's current connection; a merely
+snapshotted or disconnected token is insufficient.
+
 Disconnecting does not remove a player from the game. Scores and game membership persist while the game exists.
+
+Connection-bound events validate the current game, existing membership, and
+current connection before applying their ordinary state/preparation/round
+checks. Thus an old connection cannot disconnect its replacement, change its
+audio capability, report READY/FAILED for it, or buzz through it. Stale events
+are expected operational rejections and do not stop the queue consumer.
 
 There is no explicit V1 Leave Game feature.
 
@@ -544,6 +600,13 @@ Audio preference may change only in `LOBBY` or `ROUND_COMPLETE`.
 ## 22. Valid Audio Target
 
 A valid audio target is a connected client that has audio enabled and has initialized/unlocked its browser audio subsystem sufficiently to participate in preparation.
+
+Browser-audio capability is connection-specific. It is reset to false whenever
+the authoritative connection changes, while the member's audio-enabled
+preference survives. A later capability event is accepted only from the current
+connection. Frozen preparation targets remain historical facts if a target
+disconnects; the next transition C derives new targets from current membership,
+connection, preference, and capability facts.
 
 If an eligible candidate exists and the Songmaster presses Play Song in
 `ROUND_COMPLETE` while no valid audio target exists:
@@ -838,6 +901,12 @@ that failure acknowledgement is pending and remain in `AUDIO_PREPARING`. A late
 response cannot change a finalized outcome. In particular, a late READY cannot
 resurrect a failure awaiting acknowledgement.
 
+If a contestant connection is lost during preparation, its target remains
+pending unless a valid terminal response was already recorded. No response is
+fabricated. The existing preparation timeout therefore remains the mechanism
+that can finish collection without hanging, and any READY/FAILED event from the
+lost or replaced connection is rejected.
+
 ### Transition D — preparation failure
 
 Condition:
@@ -970,6 +1039,14 @@ If **any** client in the current round's `playback_clients` set disconnects or o
 Do not wait for an audio reconnect grace period and do not replay the song. Some participants may already have heard part of it.
 
 If the lost playback client is also the Songmaster, process the Songmaster-disconnect overlay as the controlling failure path and do not independently consume/void the round a second time.
+
+The connection registry and active contestant disconnect facts are implemented,
+but the playback-client-loss void/consume behavior in this subsection remains
+deferred to the next round-loss increment. For now a contestant playback-client
+disconnect is recorded without automatically voiding a `PLAYING` round. This is
+an explicit temporary implementation boundary; the immutable
+`playback_clients` snapshot and current-connection registry provide the facts
+needed for the later behavior.
 
 ## 32. State: `AWAITING_REVEAL`
 
@@ -1501,18 +1578,21 @@ seconds, rather than a player-facing game setting. Its timer may only post a
 typed timeout event to the global authoritative queue; it must not invoke the
 game engine directly.
 
-READY/FAILED events identify the reporting member and source connection. Until
-the browser connection registry exists, trusted application producers retain
-responsibility for that source assertion. Real transport integration must
-validate that an event came from the member's current connection so an old
-connection cannot affect a newer one. Full active-state join, reconnect,
-disconnect, and capability-loss behavior remains unimplemented.
+READY/FAILED events identify the reporting member and source connection. The
+controller validates that source against its current-connection registry before
+domain preparation applicability checks. The same validation applies to
+connection loss, capability updates, and buzz ingress. Real transport remains
+responsible for creating authenticated connection IDs; no WebSocket layer is
+implemented yet.
 
-The same limitation applies to buzz transport. Current domain validation uses
-the member's connected flag plus the immutable transition-C eligibility
-snapshot. Future connection-registry integration must reject stale browser
-connections and must not grant eligibility to a member who joins or reconnects
-after transition C merely because that member appears in the live session.
+Active-state new membership, contestant disconnect, and same-token reconnect
+are implemented. Playback-client-loss consequences remain deferred as noted in
+the `PLAYING` section. Songmaster disconnect grace/failover is also deferred:
+until that overlay exists, an observed Songmaster disconnect is safely rejected,
+the domain keeps the Songmaster connected, and the registry retains the current
+association. A later trusted replacement registration can still supersede that
+connection. This fail-closed temporary policy avoids partially applying the
+future suspension/failover state machine.
 
 ## 45. Browser Autoplay
 
@@ -1698,6 +1778,18 @@ min multiplier: 1.0x
     termination; only natural K requires an exhausted deck.
 69. A voided round is distinct from a completed timeout round and retains no
     accepted scoring choice or point award.
+70. Game ID, browser token, and connection ID are separate identities; every
+    connection-bound event must match all applicable scopes.
+71. Connection registration/replacement and domain connection changes are
+    serialized through the one global FIFO consumer.
+72. A stale connection cannot disconnect or mutate the current connection's
+    capability/preparation/buzz facts.
+73. A connection replacement resets browser-audio capability but preserves the
+    member's game-local identity, score, role, and audio preference.
+74. Joining or reconnecting after transition C cannot add or restore buzz
+    eligibility for that song; the next transition C may restore eligibility.
+75. Cancel Game and transition L clear the former game's connection registry
+    associations; FINISHED retains them until Close Game.
 
 ## 49. Future Directions
 

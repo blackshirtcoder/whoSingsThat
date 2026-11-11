@@ -150,12 +150,22 @@ def make_controller(
     controlled_sleep: ControlledSleep,
 ) -> ObservingController:
     database_engine, music_root = controller_storage
-    return ObservingController(
+    controller = ObservingController(
         database_engine,
         music_root,
         game_engine=engine,
         preparation_timeout_sleep=controlled_sleep,
     )
+    game = engine.active_game
+    assert game is not None
+    for token in game.members:
+        connection_id = (
+            "songmaster-connection"
+            if token == "songmaster-token"
+            else "player-connection"
+        )
+        controller.connection_registry.register(GAME_ID, token, connection_id)
+    return controller
 
 
 async def play_song(controller: GameController):

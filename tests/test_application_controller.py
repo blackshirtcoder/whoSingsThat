@@ -135,7 +135,9 @@ def create_persistent_playlist(
 
 async def create_game(controller: GameController) -> GameSession:
     result = await controller.submit_request(
-        CreateGameRequest("songmaster-token", "Songmaster")
+        CreateGameRequest(
+            "songmaster-token", "Songmaster", "songmaster-connection"
+        )
     )
     assert isinstance(result, GameSession)
     return result
@@ -148,7 +150,9 @@ async def test_controller_start_stop_and_multiple_consumer_prevention(
     controller = make_controller(controller_storage)
 
     with pytest.raises(ControllerNotRunningError):
-        await controller.submit_request(CreateGameRequest("token", "Player"))
+        await controller.submit_request(
+            CreateGameRequest("token", "Player", "connection")
+        )
 
     await controller.start()
     assert controller.is_running is True
@@ -191,7 +195,12 @@ async def test_expected_request_rejection_does_not_stop_later_processing(
         )
 
     member = await controller.submit_request(
-        JoinGameRequest(game.game_session_id, "player-token", "Player")
+        JoinGameRequest(
+            game.game_session_id,
+            "player-token",
+            "player-connection",
+            "Player",
+        )
     )
 
     assert member is game.members["player-token"]
@@ -395,7 +404,11 @@ async def test_cancelled_waiter_does_not_cancel_accepted_authoritative_work(
     await controller.start()
 
     waiter = asyncio.create_task(
-        controller.submit_request(CreateGameRequest("songmaster-token", "Songmaster"))
+        controller.submit_request(
+            CreateGameRequest(
+                "songmaster-token", "Songmaster", "songmaster-connection"
+            )
+        )
     )
     await controller.request_started.wait()
     waiter.cancel()
@@ -405,7 +418,7 @@ async def test_cancelled_waiter_does_not_cancel_accepted_authoritative_work(
     controller.release_consumer.set()
     # A later request is a barrier proving the abandoned Create Game completed.
     member = await controller.submit_request(
-        JoinGameRequest(GAME_ID, "player-token", "Player")
+        JoinGameRequest(GAME_ID, "player-token", "player-connection", "Player")
     )
 
     assert member.browser_token == "player-token"
@@ -457,7 +470,12 @@ async def test_dispatches_membership_playlist_and_connection_operations(
     game = await create_game(controller)
 
     player = await controller.submit_request(
-        JoinGameRequest(game.game_session_id, "player-token", "Player")
+        JoinGameRequest(
+            game.game_session_id,
+            "player-token",
+            "connection-1",
+            "Player",
+        )
     )
     selected = await controller.submit_request(
         SelectPlaylistRequest(
@@ -480,7 +498,7 @@ async def test_dispatches_membership_playlist_and_connection_operations(
         BrowserAudioCapabilityChangedEvent(
             game.game_session_id,
             "player-token",
-            "connection-2",
+            "connection-1",
             True,
         )
     )
@@ -488,11 +506,11 @@ async def test_dispatches_membership_playlist_and_connection_operations(
         MemberDisconnectedEvent(
             game.game_session_id,
             "player-token",
-            "connection-2",
+            "connection-1",
         )
     )
     reconnected = await controller.submit_request(
-        JoinGameRequest(game.game_session_id, "player-token")
+        JoinGameRequest(game.game_session_id, "player-token", "connection-2")
     )
 
     assert player is reconnected

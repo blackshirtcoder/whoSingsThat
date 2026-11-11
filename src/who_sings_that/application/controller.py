@@ -27,8 +27,15 @@ from who_sings_that.domain import (
     PendingAudioPreparation,
     PreparationEventResult,
     PreparationOutcome,
+    UnknownGameMemberError,
 )
 
+from .connections import (
+    ConnectionRegistration,
+    ConnectionRegistrationStatus,
+    ConnectionRegistry,
+    InvalidConnectionIdError,
+)
 from .messages import (
     AcceptScoreRequest,
     AcknowledgeAudioPreparationFailureRequest,
@@ -49,6 +56,7 @@ from .messages import (
     MemberDisconnectedEvent,
     PlaybackTimeoutEvent,
     PlaySongRequest,
+    RegisterConnectionRequest,
     RevealRequest,
     SelectPlaylistRequest,
     SetAudioPreferenceRequest,
@@ -87,6 +95,10 @@ class UnsupportedMessageError(GameControllerError):
 
 class StaleGameSessionError(GameControllerError):
     """Expected rejection for work that does not target the active game."""
+
+
+class StaleConnectionError(GameControllerError):
+    """Expected rejection for work from a non-current browser connection."""
 
 
 class ControllerFailedError(GameControllerError):
@@ -133,6 +145,8 @@ _EXPECTED_APPLICATION_ERRORS: Final = (
     NoStructurallyEligibleTracksError,
     SelectedPlaylistNotFoundError,
     StaleGameSessionError,
+    StaleConnectionError,
+    InvalidConnectionIdError,
 )
 
 
@@ -181,6 +195,7 @@ class GameController:
         self._accepting_messages = False
         self._failure: BaseException | None = None
         self._system_event_rejections: list[SystemEventRejection] = []
+        self._connection_registry = ConnectionRegistry()
         self._preparation_timeout_task: asyncio.Task[None] | None = None
         self._playback_timeout_task: asyncio.Task[None] | None = None
         self._owned_timer_tasks: set[asyncio.Task[None]] = set()
@@ -209,6 +224,12 @@ class GameController:
         """Return expected event rejections observed since construction."""
 
         return tuple(self._system_event_rejections)
+
+    @property
+    def connection_registry(self) -> ConnectionRegistry:
+        """Return the application-owned registry for diagnostics and adapters."""
+
+        return self._connection_registry
 
     @property
     def preparation_timeout_active(self) -> bool:
@@ -342,6 +363,11 @@ class GameController:
 
         if isinstance(message, _TrustedBuzzSubmission):
             request = message.request
+            self._require_current_connection(
+                request.game_session_id,
+                request.requesting_browser_token,
+                request.source_connection_id,
+            )
             result = self._game_engine.accept_buzz(
                 request.game_session_id,
                 request.round_id,
@@ -352,10 +378,23 @@ class GameController:
             return result
 
         if isinstance(message, CreateGameRequest):
-            return self._game_engine.create_game(
+            self._connection_registry.validate_connection_id(
+                message.source_connection_id
+            )
+            game = self._game_engine.create_game(
                 message.browser_token,
                 message.display_name,
             )
+            self._game_engine.record_connection_established(
+                message.browser_token,
+                connection_changed=True,
+            )
+            self._connection_registry.register(
+                game.game_session_id,
+                message.browser_token,
+                message.source_connection_id,
+            )
+            return game
         if isinstance(message, CancelGameRequest):
             self._require_target_game(message.game_session_id)
             result = self._game_engine.cancel_game(
@@ -364,13 +403,31 @@ class GameController:
             )
             self._retire_preparation_timeout()
             self._retire_playback_timeout()
+            self._connection_registry.clear_game(message.game_session_id)
             return result
         if isinstance(message, JoinGameRequest):
             self._require_target_game(message.game_session_id)
-            return self._game_engine.join_game(
+            status = self._connection_registry.registration_status(
+                message.game_session_id,
+                message.browser_token,
+                message.source_connection_id,
+            )
+            member = self._game_engine.join_game(
                 message.browser_token,
                 message.display_name,
+                connection_changed=(
+                    status is not ConnectionRegistrationStatus.UNCHANGED
+                ),
             )
+            self._connection_registry.register(
+                message.game_session_id,
+                message.browser_token,
+                message.source_connection_id,
+            )
+            return member
+        if isinstance(message, RegisterConnectionRequest):
+            self._require_target_game(message.game_session_id)
+            return self._register_member_connection(message)
         if isinstance(message, SelectPlaylistRequest):
             self._require_target_game(message.game_session_id)
             return self._game_engine.select_playlist(
@@ -428,8 +485,14 @@ class GameController:
             )
             self._retire_preparation_timeout()
             self._retire_playback_timeout()
+            self._connection_registry.clear_game(message.game_session_id)
             return result
         if isinstance(message, AudioPreparationReadyEvent):
+            self._require_current_connection(
+                message.game_session_id,
+                message.browser_token,
+                message.source_connection_id,
+            )
             result = self._game_engine.record_audio_preparation_ready(
                 message.game_session_id,
                 message.preparation_id,
@@ -438,6 +501,11 @@ class GameController:
             self._complete_preparation_event(result)
             return result
         if isinstance(message, AudioPreparationFailedEvent):
+            self._require_current_connection(
+                message.game_session_id,
+                message.browser_token,
+                message.source_connection_id,
+            )
             result = self._game_engine.record_audio_preparation_failed(
                 message.game_session_id,
                 message.preparation_id,
@@ -490,10 +558,27 @@ class GameController:
             self._retire_preparation_timeout()
             return result
         if isinstance(message, MemberDisconnectedEvent):
-            self._require_target_game(message.game_session_id)
-            return self._game_engine.disconnect_member(message.browser_token)
+            self._require_current_connection(
+                message.game_session_id,
+                message.browser_token,
+                message.source_connection_id,
+            )
+            member = self._game_engine.disconnect_member(message.browser_token)
+            if not self._connection_registry.mark_disconnected(
+                message.game_session_id,
+                message.browser_token,
+                message.source_connection_id,
+            ):
+                raise DomainInvariantError(
+                    "validated current connection could not be retired"
+                )
+            return member
         if isinstance(message, BrowserAudioCapabilityChangedEvent):
-            self._require_target_game(message.game_session_id)
+            self._require_current_connection(
+                message.game_session_id,
+                message.browser_token,
+                message.source_connection_id,
+            )
             return self._game_engine.set_browser_audio_capability(
                 message.browser_token,
                 message.browser_audio_usable,
@@ -507,6 +592,52 @@ class GameController:
         if active_game is None or active_game.game_session_id != game_session_id:
             raise StaleGameSessionError(
                 "message does not target the active game session"
+            )
+
+    def _register_member_connection(
+        self, message: RegisterConnectionRequest
+    ) -> ConnectionRegistration:
+        game = self._game_engine.active_game
+        if game is None or message.browser_token not in game.members:
+            raise UnknownGameMemberError(
+                "browser_token does not belong to the active game"
+            )
+        status = self._connection_registry.registration_status(
+            message.game_session_id,
+            message.browser_token,
+            message.connection_id,
+        )
+        self._game_engine.record_connection_established(
+            message.browser_token,
+            connection_changed=(
+                status is not ConnectionRegistrationStatus.UNCHANGED
+            ),
+        )
+        return self._connection_registry.register(
+            message.game_session_id,
+            message.browser_token,
+            message.connection_id,
+        )
+
+    def _require_current_connection(
+        self,
+        game_session_id: UUID,
+        browser_token: str,
+        source_connection_id: str,
+    ) -> None:
+        self._require_target_game(game_session_id)
+        game = self._game_engine.active_game
+        if game is None or browser_token not in game.members:  # pragma: no cover
+            raise UnknownGameMemberError(
+                "browser_token does not belong to the active game"
+            )
+        if not self._connection_registry.is_current(
+            game_session_id,
+            browser_token,
+            source_connection_id,
+        ):
+            raise StaleConnectionError(
+                "event or request did not come from the member's current connection"
             )
 
     def _schedule_preparation_timeout(
@@ -718,6 +849,7 @@ __all__ = [
     "ControllerNotRunningError",
     "GameController",
     "GameControllerError",
+    "StaleConnectionError",
     "StaleGameSessionError",
     "SystemEventRejection",
     "UnsupportedMessageError",

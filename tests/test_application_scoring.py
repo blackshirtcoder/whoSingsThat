@@ -142,7 +142,14 @@ def make_controller(
     engine: GameEngine,
 ) -> GameController:
     database_engine, music_root = storage
-    return GameController(database_engine, music_root, game_engine=engine)
+    controller = GameController(database_engine, music_root, game_engine=engine)
+    controller.connection_registry.register(
+        GAME_ID, "songmaster-token", "connection-1"
+    )
+    controller.connection_registry.register(
+        GAME_ID, "winner-token", "winner-connection"
+    )
+    return controller
 
 
 def test_scoring_requests_are_small_typed_interfaces() -> None:
@@ -363,7 +370,12 @@ async def test_one_song_controller_cycle_corrects_then_explicitly_finalizes(
 
     monotonic_clock.value = active_round.playback_started_monotonic + 8
     await controller.submit_request(
-        BuzzRequest(GAME_ID, active_round.round_id, "winner-token")
+        BuzzRequest(
+            GAME_ID,
+            active_round.round_id,
+            "winner-token",
+            "winner-connection",
+        )
     )
     await controller.submit_request(
         RevealRequest(GAME_ID, active_round.round_id, "songmaster-token")
@@ -517,7 +529,12 @@ async def test_two_successive_rounds_keep_cumulative_scoring_isolated(
     second_round = game.active_round
     monotonic_clock.value = second_round.playback_started_monotonic + 15
     await controller.submit_request(
-        BuzzRequest(GAME_ID, second_round.round_id, "winner-token")
+        BuzzRequest(
+            GAME_ID,
+            second_round.round_id,
+            "winner-token",
+            "winner-connection",
+        )
     )
     await controller.submit_request(
         RevealRequest(GAME_ID, second_round.round_id, "songmaster-token")

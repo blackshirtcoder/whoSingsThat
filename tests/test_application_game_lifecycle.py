@@ -146,12 +146,24 @@ def make_controller(
 ) -> GameController:
     database_engine, music_root = storage
     kwargs = {} if inspect_media is None else {"inspect_media": inspect_media}
-    return GameController(
+    controller = GameController(
         database_engine,
         music_root,
         game_engine=engine,
         **kwargs,
     )
+    game = engine.active_game
+    if game is not None:
+        for token in game.members:
+            connection_id = (
+                "connection-1"
+                if token == "songmaster-token"
+                else "player-connection"
+            )
+            controller.connection_registry.register(
+                game.game_session_id, token, connection_id
+            )
+    return controller
 
 
 def test_lifecycle_requests_have_only_identity_and_authorization_fields() -> None:
@@ -169,10 +181,10 @@ async def test_controller_cancel_rejections_and_success_keep_consumer_running(
     controller = make_controller(controller_storage, engine)
     await controller.start()
     game = await controller.submit_request(
-        CreateGameRequest("songmaster-token", "Songmaster")
+        CreateGameRequest("songmaster-token", "Songmaster", "connection-1")
     )
     await controller.submit_request(
-        JoinGameRequest(GAME_IDS[0], "player-token", "Player")
+        JoinGameRequest(GAME_IDS[0], "player-token", "player-connection", "Player")
     )
 
     with pytest.raises(StaleGameSessionError):
@@ -194,7 +206,7 @@ async def test_controller_cancel_rejections_and_success_keep_consumer_running(
     assert game.final_standings == ()
     assert controller.is_running is True
     fresh = await controller.submit_request(
-        CreateGameRequest("songmaster-token", "Fresh Name")
+        CreateGameRequest("songmaster-token", "Fresh Name", "connection-2")
     )
     assert fresh.game_session_id == GAME_IDS[1]
     assert fresh.songmaster.display_name == "Fresh Name"
@@ -283,7 +295,12 @@ async def test_end_game_from_playing_retires_timer_before_late_events(
     )
     with pytest.raises(BuzzNotAllowedError):
         await controller.submit_request(
-            BuzzRequest(GAME_IDS[0], active_round.round_id, "player-token")
+            BuzzRequest(
+                GAME_IDS[0],
+                active_round.round_id,
+                "player-token",
+                "player-connection",
+            )
         )
     assert controller.is_running is True
     await controller.stop()
@@ -314,7 +331,12 @@ async def test_fifo_buzz_before_end_is_retained_in_void_record(
 
     buzz_task = asyncio.create_task(
         controller.submit_request(
-            BuzzRequest(GAME_IDS[0], active_round.round_id, "player-token")
+            BuzzRequest(
+                GAME_IDS[0],
+                active_round.round_id,
+                "player-token",
+                "player-connection",
+            )
         )
     )
     await asyncio.sleep(0)
@@ -386,7 +408,7 @@ async def test_controller_create_start_end_close_and_create_fresh_game(
     await controller.start()
 
     first = await controller.submit_request(
-        CreateGameRequest("songmaster-token", "First Name")
+        CreateGameRequest("songmaster-token", "First Name", "connection-1")
     )
     await controller.submit_request(
         SelectPlaylistRequest(
@@ -414,9 +436,12 @@ async def test_controller_create_start_end_close_and_create_fresh_game(
     assert engine.active_game is None
     assert controller.preparation_timeout_active is False
     assert controller.playback_timeout_active is False
+    assert not controller.connection_registry.is_current(
+        first.game_session_id, "songmaster-token", "connection-1"
+    )
 
     second = await controller.submit_request(
-        CreateGameRequest("songmaster-token", "Second Name")
+        CreateGameRequest("songmaster-token", "Second Name", "connection-2")
     )
     controller.post_system_event(
         AudioPreparationTimeoutEvent(first.game_session_id, UUID(int=999))
@@ -428,6 +453,9 @@ async def test_controller_create_start_end_close_and_create_fresh_game(
     assert second.game_session_id != first.game_session_id
     assert second.songmaster.display_name == "Second Name"
     assert second.songmaster.committed_score == 0
+    assert controller.connection_registry.is_current(
+        second.game_session_id, "songmaster-token", "connection-2"
+    )
     assert second.selected_playlist_ids == set()
     assert second.deck is None
     assert isinstance(

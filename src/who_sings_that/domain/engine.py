@@ -541,15 +541,22 @@ class GameEngine:
     ) -> GameMember:
         """Record a trusted connection's initialized/unlocked audio condition.
 
-        Capability updates are currently accepted only in the two implemented
-        no-round states. Later preparation/playback phases will own capability
-        loss and readiness-result processing.
+        Capability is a connection fact, so current connections may update it
+        throughout the joinable game lifecycle. Frozen preparation and round
+        snapshots are not rewritten by this operation.
         """
 
-        if self._state not in {GameState.LOBBY, GameState.ROUND_COMPLETE}:
+        if self._state not in {
+            GameState.LOBBY,
+            GameState.ROUND_COMPLETE,
+            GameState.AUDIO_PREPARING,
+            GameState.PLAYING,
+            GameState.AWAITING_REVEAL,
+            GameState.SCORING,
+        }:
             raise AudioCapabilityNotAllowedError(
-                "browser audio capability updates are only implemented in "
-                "LOBBY or ROUND_COMPLETE"
+                "browser audio capability updates are not allowed in the "
+                "current state"
             )
         game = self._active_game
         if game is None:
@@ -687,6 +694,7 @@ class GameEngine:
         )
 
         game.pending_audio_preparation = pending
+        game.buzz_disqualified_browser_tokens.clear()
         game.audio_preparation_responses = AudioPreparationResponseState(
             preparation_id=preparation_id,
             target_statuses={
@@ -925,6 +933,10 @@ class GameEngine:
         if token not in active_round.buzz_eligible_browser_tokens:
             raise BuzzNotAllowedError(
                 "the requesting member is not eligible for this round"
+            )
+        if token in game.buzz_disqualified_browser_tokens:
+            raise BuzzNotAllowedError(
+                "the requesting member lost eligibility after connection change"
             )
 
         receipt = self._validated_monotonic_timestamp(
@@ -1401,36 +1413,50 @@ class GameEngine:
         )
 
     def join_game(
-        self, browser_token: str, display_name: str | None = None
+        self,
+        browser_token: str,
+        display_name: str | None = None,
+        *,
+        connection_changed: bool = True,
     ) -> GameMember:
-        """Join or reconnect to the active game while it is in ``LOBBY``.
+        """Join or reconnect to a lobby or started game.
 
         A token already in this game reconnects that exact member without
         requiring a display name. If a name is supplied for an existing token,
         it is ignored because the stored game-local identity is authoritative.
         A new token must supply a valid, unique display name.
 
-        This is an internal LOBBY operation, not a state-machine transition.
+        This is an internal membership operation, not a state transition.
+        ``connection_changed`` is supplied by the serialized application
+        registry so an idempotent repeat for the same live connection does not
+        reset capability or current-song eligibility.
         """
 
-        game = self._lobby_game_for_membership_operation()
+        game = self._game_for_membership_operation(allow_finished=False)
         token = self._validate_browser_token(
             browser_token, error_type=InvalidJoinGameRequestError
         )
 
         existing_member = game.members.get(token)
         if existing_member is not None:
+            if not connection_changed:
+                self._validate_state_invariants(self._state)
+                return existing_member
             was_connected = existing_member.connected
             was_audio_usable = existing_member.browser_audio_usable
+            was_disqualified = token in game.buzz_disqualified_browser_tokens
             existing_member.connected = True
             # A new connection must initialize/unlock audio for itself; a prior
             # connection's capability assertion is never inherited.
             existing_member.browser_audio_usable = False
+            self._disqualify_member_for_current_song(game, token)
             try:
                 self._validate_state_invariants(self._state)
             except Exception:
                 existing_member.connected = was_connected
                 existing_member.browser_audio_usable = was_audio_usable
+                if not was_disqualified:
+                    game.buzz_disqualified_browser_tokens.discard(token)
                 raise
             return existing_member
 
@@ -1463,7 +1489,7 @@ class GameEngine:
         return new_member
 
     def disconnect_member(self, browser_token: str) -> GameMember:
-        """Mark a non-Songmaster LOBBY member disconnected without removing it.
+        """Mark a non-Songmaster member disconnected without removing it.
 
         Unexpected Songmaster loss is deliberately rejected here because it
         requires the section-37 reconnect-grace/failover overlay. This lower-
@@ -1471,7 +1497,7 @@ class GameEngine:
         Repeated disconnect notifications for another member are idempotent.
         """
 
-        game = self._lobby_game_for_membership_operation()
+        game = self._game_for_membership_operation(allow_finished=True)
         token = self._validate_browser_token(
             browser_token, error_type=InvalidDisconnectRequestError
         )
@@ -1487,13 +1513,58 @@ class GameEngine:
 
         was_connected = member.connected
         was_audio_usable = member.browser_audio_usable
+        was_disqualified = token in game.buzz_disqualified_browser_tokens
         member.connected = False
         member.browser_audio_usable = False
+        self._disqualify_member_for_current_song(game, token)
         try:
             self._validate_state_invariants(self._state)
         except Exception:
             member.connected = was_connected
             member.browser_audio_usable = was_audio_usable
+            if not was_disqualified:
+                game.buzz_disqualified_browser_tokens.discard(token)
+            raise
+        return member
+
+    def record_connection_established(
+        self,
+        browser_token: str,
+        *,
+        connection_changed: bool,
+    ) -> GameMember:
+        """Apply domain connection facts after trusted registry validation."""
+
+        game = self._game_for_membership_operation(allow_finished=True)
+        token = self._validate_browser_token(
+            browser_token, error_type=InvalidJoinGameRequestError
+        )
+        member = game.members.get(token)
+        if member is None:
+            raise UnknownGameMemberError(
+                "browser_token does not belong to the active game"
+            )
+        if not isinstance(connection_changed, bool):
+            raise InvalidJoinGameRequestError(
+                "connection_changed must be a boolean"
+            )
+        if not connection_changed:
+            self._validate_state_invariants(self._state)
+            return member
+
+        was_connected = member.connected
+        was_audio_usable = member.browser_audio_usable
+        was_disqualified = token in game.buzz_disqualified_browser_tokens
+        member.connected = True
+        member.browser_audio_usable = False
+        self._disqualify_member_for_current_song(game, token)
+        try:
+            self._validate_state_invariants(self._state)
+        except Exception:
+            member.connected = was_connected
+            member.browser_audio_usable = was_audio_usable
+            if not was_disqualified:
+                game.buzz_disqualified_browser_tokens.discard(token)
             raise
         return member
 
@@ -1663,16 +1734,42 @@ class GameEngine:
         if not isinstance(started_at, datetime):
             raise DomainInvariantError("the engine clock must return a datetime")
 
-    def _lobby_game_for_membership_operation(self) -> GameSession:
+    def _game_for_membership_operation(
+        self, *, allow_finished: bool
+    ) -> GameSession:
         game = self._active_game
         if game is None:
             raise NoActiveGameError("there is no active game")
-        if self._state is not GameState.LOBBY:
+        allowed_states = {
+            GameState.LOBBY,
+            GameState.ROUND_COMPLETE,
+            GameState.AUDIO_PREPARING,
+            GameState.PLAYING,
+            GameState.AWAITING_REVEAL,
+            GameState.SCORING,
+        }
+        if allow_finished:
+            allowed_states.add(GameState.FINISHED)
+        if self._state not in allowed_states:
             raise MembershipOperationNotAllowedError(
-                "membership operation is only implemented in LOBBY"
+                "membership operation is not allowed in the current state"
             )
         self._validate_state_invariants(self._state)
         return game
+
+    @staticmethod
+    def _disqualify_member_for_current_song(
+        game: GameSession, browser_token: str
+    ) -> None:
+        """Prevent a changed connection from reusing a frozen song snapshot."""
+
+        snapshot: frozenset[str] = frozenset()
+        if game.pending_audio_preparation is not None:
+            snapshot = game.pending_audio_preparation.buzz_eligible_browser_tokens
+        elif game.active_round is not None:
+            snapshot = game.active_round.buzz_eligible_browser_tokens
+        if browser_token in snapshot:
+            game.buzz_disqualified_browser_tokens.add(browser_token)
 
     def _lobby_game_for_playlist_selection(
         self, requesting_browser_token: str
@@ -1747,6 +1844,7 @@ class GameEngine:
         game.skipped_deck_entries += new_skips
         game.deck_pointer = selection.deck_pointer
         game.deck_exhausted = selection.exhausted
+        game.buzz_disqualified_browser_tokens.clear()
         # Player-facing display fields are intentionally untouched here.
 
     def _enter_audio_preparing(self) -> None:
@@ -1833,6 +1931,7 @@ class GameEngine:
         game.pending_audio_preparation = None
         game.audio_preparation_responses = None
         game.scoring_correction_round_id = None
+        game.buzz_disqualified_browser_tokens.clear()
         game.buzzing_enabled = False
 
     @staticmethod
@@ -1934,6 +2033,10 @@ class GameEngine:
             raise DomainInvariantError("LOBBY cannot have preparation responses")
         if game.buzzing_enabled is not False:
             raise DomainInvariantError("buzzing must be disabled in LOBBY")
+        if game.buzz_disqualified_browser_tokens:
+            raise DomainInvariantError(
+                "LOBBY cannot retain current-song disqualifications"
+            )
         if game.playlist_selection_editable is not True:
             raise DomainInvariantError("playlist selection must be editable in LOBBY")
         if any(
@@ -2008,6 +2111,12 @@ class GameEngine:
             raise DomainInvariantError(
                 f"{state_name} requires a connected Songmaster until the "
                 "disconnect overlay exists"
+            )
+        if not isinstance(game.buzz_disqualified_browser_tokens, set) or not (
+            game.buzz_disqualified_browser_tokens <= set(game.members)
+        ):
+            raise DomainInvariantError(
+                "current-song buzz disqualifications must be a member-token set"
             )
 
     def _validate_started_game_facts(
@@ -2270,6 +2379,10 @@ class GameEngine:
             )
         if game.final_standings != ():
             raise DomainInvariantError("ROUND_COMPLETE cannot have final standings")
+        if game.buzz_disqualified_browser_tokens:
+            raise DomainInvariantError(
+                "ROUND_COMPLETE cannot retain current-song disqualifications"
+            )
         correction_round_id = game.scoring_correction_round_id
         completed = game.last_completed_round
         if correction_round_id is not None and (
@@ -2448,12 +2561,11 @@ class GameEngine:
             raise DomainInvariantError(
                 "audio targets must be connected prospective players"
             )
-        if any(
-            not game.members[token].is_valid_audio_target
-            for token in pending.audio_target_browser_tokens
+        if not game.buzz_disqualified_browser_tokens <= set(
+            pending.buzz_eligible_browser_tokens
         ):
             raise DomainInvariantError(
-                "audio target snapshot must contain only valid audio targets"
+                "preparation disqualifications must belong to its frozen snapshot"
             )
         self._validate_completed_round_display(
             game,
@@ -2543,6 +2655,12 @@ class GameEngine:
             )
         if not active_round.buzz_eligible_browser_tokens <= frozenset(game.members):
             raise DomainInvariantError("round eligibility must contain only members")
+        if not game.buzz_disqualified_browser_tokens <= set(
+            active_round.buzz_eligible_browser_tokens
+        ):
+            raise DomainInvariantError(
+                "round disqualifications must belong to its frozen snapshot"
+            )
         if game.pending_audio_preparation is not None:
             raise DomainInvariantError(
                 f"{state_name} cannot retain a pending preparation"
@@ -2697,6 +2815,10 @@ class GameEngine:
         if game.scoring_correction_round_id is not None:
             raise DomainInvariantError(
                 "FINISHED cannot retain a score correction window"
+            )
+        if game.buzz_disqualified_browser_tokens:
+            raise DomainInvariantError(
+                "FINISHED cannot retain current-song disqualifications"
             )
         if game.end_reason is GameEndReason.DECK_EXHAUSTED:
             if game.deck_pointer != len(deck) or game.deck_exhausted is not True:

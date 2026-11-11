@@ -28,6 +28,7 @@ from who_sings_that.domain import (
     RoundTerminationReason,
     SelectedPlaylistSnapshot,
     TrackReference,
+    UnknownGameMemberError,
 )
 
 GAME_ID = UUID("aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa")
@@ -204,7 +205,14 @@ def gated_controller(
     engine: GameEngine,
 ) -> GatedController:
     database_engine, music_root = controller_storage
-    return GatedController(database_engine, music_root, game_engine=engine)
+    controller = GatedController(database_engine, music_root, game_engine=engine)
+    controller.connection_registry.register(
+        GAME_ID, "songmaster-token", "songmaster-connection"
+    )
+    controller.connection_registry.register(
+        GAME_ID, "player-token", "player-connection"
+    )
+    return controller
 
 
 async def start_playback_through_controller(
@@ -225,6 +233,12 @@ async def start_playback_through_controller(
         playback_timeout_sleep=playback_sleep,
         monotonic_clock=monotonic_clock,
         scheduling_clock_advance=scheduling_clock_advance,
+    )
+    controller.connection_registry.register(
+        GAME_ID, "songmaster-token", "songmaster-connection"
+    )
+    controller.connection_registry.register(
+        GAME_ID, "player-token", "player-connection"
     )
     await controller.start()
     pending = await controller.submit_request(
@@ -257,6 +271,7 @@ def test_buzz_request_exposes_no_client_controlled_timing_field() -> None:
         "game_session_id",
         "round_id",
         "requesting_browser_token",
+        "source_connection_id",
     ]
 
 
@@ -271,13 +286,20 @@ async def test_two_queued_buzzes_preserve_fifo_and_first_wins(
     await controller.start()
 
     first = asyncio.create_task(
-        controller.submit_request(BuzzRequest(GAME_ID, ROUND_ID, "player-token"))
+        controller.submit_request(
+            BuzzRequest(GAME_ID, ROUND_ID, "player-token", "player-connection")
+        )
     )
     await controller.tracking_queue.wait_for_put_count(1)
     clock.value = 103.0
     second = asyncio.create_task(
         controller.submit_request(
-            BuzzRequest(GAME_ID, ROUND_ID, "songmaster-token")
+            BuzzRequest(
+                GAME_ID,
+                ROUND_ID,
+                "songmaster-token",
+                "songmaster-connection",
+            )
         )
     )
     await controller.tracking_queue.wait_for_put_count(2)
@@ -304,16 +326,20 @@ async def test_invalid_queued_buzz_does_not_block_later_valid_buzz(
     await controller.start()
 
     invalid = asyncio.create_task(
-        controller.submit_request(BuzzRequest(GAME_ID, ROUND_ID, "unknown-token"))
+        controller.submit_request(
+            BuzzRequest(GAME_ID, ROUND_ID, "unknown-token", "unknown-connection")
+        )
     )
     await controller.tracking_queue.wait_for_put_count(1)
     valid = asyncio.create_task(
-        controller.submit_request(BuzzRequest(GAME_ID, ROUND_ID, "player-token"))
+        controller.submit_request(
+            BuzzRequest(GAME_ID, ROUND_ID, "player-token", "player-connection")
+        )
     )
     await controller.tracking_queue.wait_for_put_count(2)
     controller.release_consumer.set()
 
-    with pytest.raises(BuzzNotAllowedError):
+    with pytest.raises(UnknownGameMemberError):
         await invalid
     accepted = await valid
 
@@ -333,7 +359,9 @@ async def test_consumer_delay_does_not_inflate_trusted_elapsed_time(
     await controller.start()
 
     request = asyncio.create_task(
-        controller.submit_request(BuzzRequest(GAME_ID, ROUND_ID, "player-token"))
+        controller.submit_request(
+            BuzzRequest(GAME_ID, ROUND_ID, "player-token", "player-connection")
+        )
     )
     await controller.tracking_queue.wait_for_put_count(1)
     clock.value = 129.9
@@ -356,7 +384,9 @@ async def test_predeadline_buzz_queued_before_timeout_wins(
     await controller.start()
 
     request = asyncio.create_task(
-        controller.submit_request(BuzzRequest(GAME_ID, ROUND_ID, "player-token"))
+        controller.submit_request(
+            BuzzRequest(GAME_ID, ROUND_ID, "player-token", "player-connection")
+        )
     )
     await controller.tracking_queue.wait_for_put_count(1)
     clock.value = 130.0
@@ -387,7 +417,9 @@ async def test_postdeadline_buzz_queued_before_timeout_is_rejected_then_g_wins(
     await controller.start()
 
     request = asyncio.create_task(
-        controller.submit_request(BuzzRequest(GAME_ID, ROUND_ID, "player-token"))
+        controller.submit_request(
+            BuzzRequest(GAME_ID, ROUND_ID, "player-token", "player-connection")
+        )
     )
     await controller.tracking_queue.wait_for_put_count(1)
     controller.post_system_event(PlaybackTimeoutEvent(GAME_ID, ROUND_ID))
@@ -420,7 +452,9 @@ async def test_timeout_processed_before_later_buzz_wins(
 
     controller.post_system_event(PlaybackTimeoutEvent(GAME_ID, ROUND_ID))
     request = asyncio.create_task(
-        controller.submit_request(BuzzRequest(GAME_ID, ROUND_ID, "player-token"))
+        controller.submit_request(
+            BuzzRequest(GAME_ID, ROUND_ID, "player-token", "player-connection")
+        )
     )
     await controller.tracking_queue.wait_for_put_count(2)
     controller.release_consumer.set()
@@ -515,7 +549,7 @@ async def test_accepted_buzz_retires_playback_timer(
     clock.value = 102.0
 
     accepted = await controller.submit_request(
-        BuzzRequest(GAME_ID, ROUND_ID, "player-token")
+        BuzzRequest(GAME_ID, ROUND_ID, "player-token", "player-connection")
     )
     await playback_sleep.cancelled.wait()
 
@@ -533,7 +567,7 @@ async def test_already_queued_stale_timeout_after_buzz_is_harmless(
     )
     clock.value = 102.0
     accepted = await controller.submit_request(
-        BuzzRequest(GAME_ID, ROUND_ID, "player-token")
+        BuzzRequest(GAME_ID, ROUND_ID, "player-token", "player-connection")
     )
     controller.post_system_event(PlaybackTimeoutEvent(GAME_ID, ROUND_ID))
     await controller.playback_timeout_processed.wait()
@@ -574,7 +608,7 @@ async def test_fatal_failure_cleans_up_playback_timer(
     controller.post_system_event(UnknownSystemEvent())
     with pytest.raises(ControllerFailedError):
         await controller.submit_request(
-            BuzzRequest(GAME_ID, ROUND_ID, "player-token")
+            BuzzRequest(GAME_ID, ROUND_ID, "player-token", "player-connection")
         )
     await playback_sleep.cancelled.wait()
 
