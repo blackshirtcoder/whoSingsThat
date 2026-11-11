@@ -9,6 +9,7 @@ from unicodedata import category, normalize
 from uuid import UUID
 
 from .deck import Deck, DeckEntry, TrackReference
+from .scoring import ScoringChoice
 
 MAX_PLAYER_NAME_LENGTH: Final = 24
 _ALLOWED_PLAYER_NAME_PUNCTUATION: Final = frozenset(" -_'.")
@@ -223,12 +224,13 @@ class RoundTermination:
 class CompletedRound:
     """The most recently completed played round retained in live memory.
 
-    This is the minimal lifecycle snapshot needed after transition I, not the
-    durable completed-game history schema planned for a later increment.
+    This is the bounded lifecycle snapshot needed after transitions I/J and for
+    replacement scoring, not the durable history schema planned for later.
     """
 
     active_round: ActiveRound
     termination: RoundTermination
+    scoring_choice: ScoringChoice | None
     awarded_points: int
 
 
@@ -298,6 +300,7 @@ class GameSession:
     active_round: ActiveRound | None = None
     round_termination: RoundTermination | None = None
     last_completed_round: CompletedRound | None = None
+    scoring_correction_round_id: UUID | None = None
     pending_audio_preparation: PendingAudioPreparation | None = None
     audio_preparation_responses: AudioPreparationResponseState | None = None
     buzzing_enabled: bool = False

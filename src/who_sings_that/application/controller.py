@@ -28,6 +28,7 @@ from who_sings_that.domain import (
 )
 
 from .messages import (
+    AcceptScoreRequest,
     AcknowledgeAudioPreparationFailureRequest,
     AudioPreparationFailedEvent,
     AudioPreparationReadyEvent,
@@ -36,6 +37,7 @@ from .messages import (
     BrowserAudioCapabilityChangedEvent,
     BuzzRequest,
     ClientRequest,
+    CorrectScoreRequest,
     CreateGameRequest,
     DeselectPlaylistRequest,
     JoinGameRequest,
@@ -427,6 +429,20 @@ class GameController:
                 message.game_session_id,
                 message.round_id,
                 message.requesting_browser_token,
+            )
+        if isinstance(message, AcceptScoreRequest):
+            return self._game_engine.accept_score(
+                message.game_session_id,
+                message.round_id,
+                message.requesting_browser_token,
+                message.scoring_choice,
+            )
+        if isinstance(message, CorrectScoreRequest):
+            return self._game_engine.correct_score(
+                message.game_session_id,
+                message.round_id,
+                message.requesting_browser_token,
+                message.scoring_choice,
             )
         if isinstance(message, AcknowledgeAudioPreparationFailureRequest):
             result = self._game_engine.acknowledge_audio_preparation_failure(

@@ -13,6 +13,7 @@ from .controller import (
     UnsupportedMessageError,
 )
 from .messages import (
+    AcceptScoreRequest,
     AcknowledgeAudioPreparationFailureRequest,
     AudioPreparationFailedEvent,
     AudioPreparationReadyEvent,
@@ -21,6 +22,7 @@ from .messages import (
     BrowserAudioCapabilityChangedEvent,
     BuzzRequest,
     ClientRequest,
+    CorrectScoreRequest,
     CreateGameRequest,
     DeselectPlaylistRequest,
     JoinGameRequest,
@@ -48,6 +50,7 @@ from .start_game import (
 
 __all__ = [
     "DEFAULT_PREPARATION_TIMEOUT_SECONDS",
+    "AcceptScoreRequest",
     "AcknowledgeAudioPreparationFailureRequest",
     "AudioPreparationFailedEvent",
     "AudioPreparationReadyEvent",
@@ -60,6 +63,7 @@ __all__ = [
     "ConsumerSelfRequestError",
     "ControllerFailedError",
     "ControllerNotRunningError",
+    "CorrectScoreRequest",
     "CreateGameRequest",
     "DeselectPlaylistRequest",
     "GameController",

@@ -3,6 +3,8 @@
 from dataclasses import dataclass
 from uuid import UUID
 
+from who_sings_that.domain import ScoringChoice
+
 
 class ClientRequest:
     """Marker for queued work whose submitting client expects one response."""
@@ -95,6 +97,26 @@ class RevealRequest(ClientRequest):
 
 
 @dataclass(frozen=True, slots=True)
+class AcceptScoreRequest(ClientRequest):
+    """Request transition J for the current revealed buzz round."""
+
+    game_session_id: UUID
+    round_id: UUID
+    requesting_browser_token: str
+    scoring_choice: ScoringChoice
+
+
+@dataclass(frozen=True, slots=True)
+class CorrectScoreRequest(ClientRequest):
+    """Replace the most recently completed buzz round's scoring decision."""
+
+    game_session_id: UUID
+    round_id: UUID
+    requesting_browser_token: str
+    scoring_choice: ScoringChoice
+
+
+@dataclass(frozen=True, slots=True)
 class AcknowledgeAudioPreparationFailureRequest(ClientRequest):
     """Request transition D for a finalized unsuccessful preparation."""
 
@@ -162,6 +184,7 @@ AuthoritativeMessage = ClientRequest | SystemEvent
 
 
 __all__ = [
+    "AcceptScoreRequest",
     "AcknowledgeAudioPreparationFailureRequest",
     "AudioPreparationFailedEvent",
     "AudioPreparationReadyEvent",
@@ -170,6 +193,7 @@ __all__ = [
     "BrowserAudioCapabilityChangedEvent",
     "BuzzRequest",
     "ClientRequest",
+    "CorrectScoreRequest",
     "CreateGameRequest",
     "DeselectPlaylistRequest",
     "JoinGameRequest",

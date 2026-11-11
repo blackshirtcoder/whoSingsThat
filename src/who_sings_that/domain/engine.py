@@ -39,6 +39,7 @@ from .playback import (
     is_duration_eligible,
     select_deck_candidate,
 )
+from .scoring import ScoringChoice, calculate_points
 
 
 class GameEngineError(RuntimeError):
@@ -171,6 +172,26 @@ class RevealNotAllowedError(GameEngineError):
 
 class UnauthorizedRevealError(GameEngineError):
     """Raised when Reveal is not requested by the connected Songmaster."""
+
+
+class ScoringNotAllowedError(GameEngineError):
+    """Raised when an initial score does not target the current scoring round."""
+
+
+class UnauthorizedScoringError(GameEngineError):
+    """Raised when scoring is not requested by the connected Songmaster."""
+
+
+class InvalidScoringDecisionError(GameEngineError, ValueError):
+    """Raised when a scoring request has no supported adjudication."""
+
+
+class ScoreCorrectionNotAllowedError(GameEngineError):
+    """Raised when a completed round is outside its correction window."""
+
+
+class UnauthorizedScoreCorrectionError(GameEngineError):
+    """Raised when correction is not requested by the connected Songmaster."""
 
 
 class PreparationOutcome(Enum):
@@ -602,6 +623,9 @@ class GameEngine:
                 token: AudioPreparationStatus.PENDING for token in audio_targets
             },
         )
+        # The prior round remains correctable until transition C successfully
+        # commits a preparation. All request validation above is non-mutating.
+        game.scoring_correction_round_id = None
         self._transition_to(GameState.AUDIO_PREPARING)
         return pending
 
@@ -857,14 +881,181 @@ class GameEngine:
             game.last_completed_round = CompletedRound(
                 active_round=active_round,
                 termination=termination,
+                scoring_choice=None,
                 awarded_points=0,
             )
+            game.scoring_correction_round_id = None
             game.deck_pointer += 1
             game.active_round = None
             game.round_termination = None
             self._transition_to(GameState.ROUND_COMPLETE)
             return game
         raise DomainInvariantError("round termination reason is not supported")
+
+    def accept_score(
+        self,
+        game_session_id: UUID,
+        round_id: UUID,
+        requesting_browser_token: str,
+        scoring_choice: ScoringChoice,
+    ) -> CompletedRound:
+        """Apply transition J and commit one buzz round's initial award."""
+
+        if self._state is not GameState.SCORING:
+            raise ScoringNotAllowedError("initial scoring is only allowed in SCORING")
+        game = self._active_game
+        if game is None or game.game_session_id != game_session_id:
+            raise ScoringNotAllowedError("initial scoring targets a stale game")
+
+        token = self._validate_browser_token(
+            requesting_browser_token,
+            error_type=UnauthorizedScoringError,
+        )
+        if token != game.songmaster_browser_token or not game.songmaster.connected:
+            raise UnauthorizedScoringError(
+                "only the current connected Songmaster may accept a score"
+            )
+        if not isinstance(scoring_choice, ScoringChoice):
+            raise InvalidScoringDecisionError(
+                "scoring_choice must be a ScoringChoice"
+            )
+
+        active_round = game.active_round
+        if not isinstance(active_round, ActiveRound):
+            raise DomainInvariantError("SCORING requires an actual played round")
+        if active_round.round_id != round_id:
+            raise ScoringNotAllowedError("initial scoring targets a stale round")
+        self._validate_state_invariants(GameState.SCORING)
+        termination = game.round_termination
+        if not isinstance(termination, RoundTermination):  # pragma: no cover
+            raise DomainInvariantError("SCORING requires a termination outcome")
+        winner_token = termination.winning_browser_token
+        elapsed = termination.buzz_elapsed_seconds
+        if winner_token is None or elapsed is None:  # pragma: no cover
+            raise DomainInvariantError("SCORING requires winner and elapsed facts")
+
+        awarded_points = self._calculate_round_points(
+            active_round,
+            elapsed,
+            scoring_choice,
+        )
+        completed = CompletedRound(
+            active_round=active_round,
+            termination=termination,
+            scoring_choice=scoring_choice,
+            awarded_points=awarded_points,
+        )
+
+        # Transition-J-specific work is committed exactly once before normal
+        # ROUND_COMPLETE entry scanning (and possible immediate K) executes.
+        game.members[winner_token].committed_score += awarded_points
+        game.last_completed_round = completed
+        game.scoring_correction_round_id = round_id
+        game.deck_pointer += 1
+        game.active_round = None
+        game.round_termination = None
+        self._transition_to(GameState.ROUND_COMPLETE)
+        return completed
+
+    def correct_score(
+        self,
+        game_session_id: UUID,
+        round_id: UUID,
+        requesting_browser_token: str,
+        scoring_choice: ScoringChoice,
+    ) -> CompletedRound:
+        """Replace the most recent buzz round's award within its open window."""
+
+        if self._state is not GameState.ROUND_COMPLETE:
+            raise ScoreCorrectionNotAllowedError(
+                "score correction is only allowed in ROUND_COMPLETE"
+            )
+        game = self._active_game
+        if game is None or game.game_session_id != game_session_id:
+            raise ScoreCorrectionNotAllowedError("score correction targets a stale game")
+
+        token = self._validate_browser_token(
+            requesting_browser_token,
+            error_type=UnauthorizedScoreCorrectionError,
+        )
+        if token != game.songmaster_browser_token or not game.songmaster.connected:
+            raise UnauthorizedScoreCorrectionError(
+                "only the current connected Songmaster may correct a score"
+            )
+        if not isinstance(scoring_choice, ScoringChoice):
+            raise InvalidScoringDecisionError(
+                "scoring_choice must be a ScoringChoice"
+            )
+
+        completed = game.last_completed_round
+        if (
+            not isinstance(completed, CompletedRound)
+            or completed.active_round.round_id != round_id
+            or game.scoring_correction_round_id != round_id
+            or completed.termination.reason is not RoundTerminationReason.BUZZ
+            or completed.scoring_choice is None
+        ):
+            raise ScoreCorrectionNotAllowedError(
+                "score correction does not target the open completed buzz round"
+            )
+        self._validate_state_invariants(GameState.ROUND_COMPLETE)
+
+        winner_token = completed.termination.winning_browser_token
+        elapsed = completed.termination.buzz_elapsed_seconds
+        if winner_token is None or elapsed is None:  # pragma: no cover
+            raise DomainInvariantError(
+                "a correctable completed round requires winner and elapsed facts"
+            )
+        new_points = self._calculate_round_points(
+            completed.active_round,
+            elapsed,
+            scoring_choice,
+        )
+        if (
+            scoring_choice is completed.scoring_choice
+            and new_points == completed.awarded_points
+        ):
+            return completed
+
+        adjusted_score = (
+            game.members[winner_token].committed_score
+            + new_points
+            - completed.awarded_points
+        )
+        if adjusted_score < 0:
+            raise DomainInvariantError(
+                "replacement scoring cannot make a cumulative score negative"
+            )
+        replacement = CompletedRound(
+            active_round=completed.active_round,
+            termination=completed.termination,
+            scoring_choice=scoring_choice,
+            awarded_points=new_points,
+        )
+        game.members[winner_token].committed_score = adjusted_score
+        game.last_completed_round = replacement
+        self._validate_state_invariants(GameState.ROUND_COMPLETE)
+        return replacement
+
+    @staticmethod
+    def _calculate_round_points(
+        active_round: ActiveRound,
+        elapsed_seconds: float,
+        scoring_choice: ScoringChoice,
+    ) -> int:
+        """Delegate award arithmetic to the pure scoring module."""
+
+        try:
+            return calculate_points(
+                scoring_choice,
+                active_round.playback_duration_seconds,
+                active_round.speed_bonus_plateau_percent / 100,
+                elapsed_seconds,
+            )
+        except (TypeError, ValueError) as error:  # immutable facts are invalid
+            raise DomainInvariantError(
+                "actual-round scoring inputs must satisfy the scoring rules"
+            ) from error
 
     @staticmethod
     def _answer_for_reveal(active_round: ActiveRound) -> tuple[str, str]:
@@ -1492,6 +1683,7 @@ class GameEngine:
         game.round_termination = None
         game.pending_audio_preparation = None
         game.audio_preparation_responses = None
+        game.scoring_correction_round_id = None
         game.buzzing_enabled = False
 
     @staticmethod
@@ -1583,6 +1775,8 @@ class GameEngine:
             raise DomainInvariantError("LOBBY cannot have round termination facts")
         if game.last_completed_round is not None:
             raise DomainInvariantError("LOBBY cannot have a completed round")
+        if game.scoring_correction_round_id is not None:
+            raise DomainInvariantError("LOBBY cannot have a score correction window")
         if game.pending_audio_preparation is not None:
             raise DomainInvariantError("LOBBY cannot have a pending preparation")
         if game.audio_preparation_responses is not None:
@@ -1824,10 +2018,12 @@ class GameEngine:
             if (
                 termination.winning_browser_token is not None
                 or termination.buzz_elapsed_seconds is not None
+                or completed.scoring_choice is not None
                 or completed.awarded_points != 0
             ):
                 raise DomainInvariantError(
-                    "a completed timeout round must have no winner and zero points"
+                    "a completed timeout round must have no scoring decision, "
+                    "winner, or points"
                 )
         elif termination.reason is RoundTerminationReason.BUZZ:
             winner = termination.winning_browser_token
@@ -1846,6 +2042,23 @@ class GameEngine:
             if not 0 <= elapsed < active_round.playback_duration_seconds:
                 raise DomainInvariantError(
                     "completed buzz elapsed time must be within playback"
+                )
+            if not isinstance(completed.scoring_choice, ScoringChoice):
+                raise DomainInvariantError(
+                    "a completed buzz round must retain its scoring decision"
+                )
+            expected_points = self._calculate_round_points(
+                active_round,
+                elapsed,
+                completed.scoring_choice,
+            )
+            if completed.awarded_points != expected_points:
+                raise DomainInvariantError(
+                    "completed buzz points must match its original scoring inputs"
+                )
+            if game.members[winner].committed_score < completed.awarded_points:
+                raise DomainInvariantError(
+                    "the winner's cumulative score must include the current award"
                 )
         else:
             raise DomainInvariantError(
@@ -1904,6 +2117,18 @@ class GameEngine:
             )
         if game.final_standings != ():
             raise DomainInvariantError("ROUND_COMPLETE cannot have final standings")
+        correction_round_id = game.scoring_correction_round_id
+        completed = game.last_completed_round
+        if correction_round_id is not None and (
+            not isinstance(correction_round_id, UUID)
+            or completed is None
+            or completed.active_round.round_id != correction_round_id
+            or completed.termination.reason is not RoundTerminationReason.BUZZ
+            or completed.scoring_choice is None
+        ):
+            raise DomainInvariantError(
+                "score correction eligibility must identify the completed buzz round"
+            )
         self._validate_completed_round_display(
             game,
             state_name="ROUND_COMPLETE",
@@ -1955,6 +2180,10 @@ class GameEngine:
         if game.final_standings != ():
             raise DomainInvariantError(
                 "AUDIO_PREPARING cannot have final standings"
+            )
+        if game.scoring_correction_round_id is not None:
+            raise DomainInvariantError(
+                "AUDIO_PREPARING cannot retain a score correction window"
             )
 
         pending = game.pending_audio_preparation
@@ -2188,6 +2417,10 @@ class GameEngine:
             )
         if game.final_standings != ():
             raise DomainInvariantError(f"{state_name} cannot have final standings")
+        if game.scoring_correction_round_id is not None:
+            raise DomainInvariantError(
+                f"{state_name} cannot retain a score correction window"
+            )
         return active_round
 
     def _validate_playing_invariants(self) -> None:
@@ -2304,6 +2537,10 @@ class GameEngine:
             raise DomainInvariantError("FINISHED cannot have preparation responses")
         if game.buzzing_enabled is not False:
             raise DomainInvariantError("buzzing must be disabled in FINISHED")
+        if game.scoring_correction_round_id is not None:
+            raise DomainInvariantError(
+                "FINISHED cannot retain a score correction window"
+            )
         if game.deck_pointer != len(deck) or game.deck_exhausted is not True:
             raise DomainInvariantError(
                 "deck-exhausted FINISHED requires the pointer at deck end"

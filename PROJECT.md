@@ -701,6 +701,12 @@ After entry completes, either the deck is exhausted or the pointer identifies th
 
 If Play Song is requested with no valid audio target, show warning and remain in `ROUND_COMPLETE`.
 
+The most recently completed buzz round may be score-corrected as an internal
+`ROUND_COMPLETE` action while its explicit round-scoped correction window is
+open. A correction replaces its prior adjudication and award; the engine applies
+only the net point difference and does not re-enter the state, rescan the deck,
+or consume another entry. Timeout-completed rounds are not correctable.
+
 ### Transition C — begin audio preparation
 
 Condition:
@@ -718,6 +724,8 @@ Actions:
 - calculate effective offset;
 - snapshot the buzz-eligible player set for the prospective round;
 - create pending audio-preparation context;
+- close any previous round's score-correction window only when these transition
+  actions successfully commit;
 - do not change old-song display.
 
 Target: `AUDIO_PREPARING`.
@@ -1023,9 +1031,9 @@ Each selection replaces the prior provisional choice, recalculates provisional p
 
 `Accept Score` is visible immediately but disabled until the first scoring option is selected.
 
-The current implementation stops at SCORING entry. Provisional adjudication,
-point assignment, acceptance, transition J, and buzz-round consumption remain
-the next domain increment.
+The current domain/application interface accepts the Songmaster's selected
+adjudication together with `Accept Score`; browser controls and separately
+broadcast provisional selections remain future UI/transport work.
 
 ### Transition J — accept score
 
@@ -1038,13 +1046,42 @@ AND provisional scoring choice exists
 
 Actions:
 
-- commit adjudication as final;
-- commit final awarded points;
-- mark round fully completed;
-- persist final scoring details;
-- clear provisional scoring state.
+- identify the winner from the immutable BUZZ termination;
+- calculate points with the existing pure scoring arithmetic using the actual
+  round's frozen duration and plateau plus its trusted buzz elapsed time;
+- add that award to the winner's committed cumulative score;
+- record an immutable completed-round snapshot containing the original round,
+  termination, adjudication, and award;
+- consume the played deck entry exactly once and clear live round/termination
+  fields;
+- open correction eligibility for this completed buzz round.
 
 The revealed artist/title/deck-position display remains unchanged.
+
+Transition J is implemented synchronously through the global controller queue.
+Normal `ROUND_COMPLETE` duration scanning and automatic K, when exhausted,
+finish before the scoring request returns.
+
+### Score correction after transition J
+
+While still in `ROUND_COMPLETE`, the connected current Songmaster may replace
+the most recent completed buzz round's Artist/Title/Both/Neither decision. The
+award is always recalculated from that completed round's original settings and
+trusted elapsed time. The winner's cumulative score changes by:
+
+```text
+new award - previous award
+```
+
+Repeated identical correction is idempotent, and `Neither` is a valid zero-point
+replacement. Correction does not change the round identity, winner, answer,
+timing/settings snapshot, deck pointer, display, or state.
+
+The correction window closes at the exact successful-transition-C boundary: a
+rejected Play Song request leaves it open, but once a new song is successfully
+bound and queued for preparation it closes permanently. A later preparation
+failure and return to `ROUND_COMPLETE` does not reopen it. Only a later
+transition J may establish a new window for its own completed buzz round.
 
 Target: `ROUND_COMPLETE`.
 
@@ -1098,6 +1135,10 @@ The software does not judge fuzzy correctness; the Songmaster/humans do.
 Meaning:
 
 > The game is over. No gameplay or scoring changes remain possible. Final results remain visible until the finished session is closed/reset.
+
+Automatic K closes any still-open correction window. Therefore scoring the final
+available entry includes its committed award in frozen final standings but does
+not permit a post-finish correction.
 
 ### Entry actions
 
@@ -1314,6 +1355,10 @@ Skipped deck entries that never became rounds should still be represented suffic
 
 Later metadata corrections or playlist changes must not rewrite historical games.
 
+The live engine currently retains only `last_completed_round`, sufficient for
+the bounded correction window. Durable completed-game/round history persistence
+and transport-facing history projections remain unimplemented.
+
 ## 43. Historical Player Identity
 
 V1 does not attempt to identify the same human across separate games.
@@ -1484,6 +1529,16 @@ min multiplier: 1.0x
     answer for the next actual round.
 60. The internal Python controller/domain results are not transport payloads;
     future player-facing serialization must project only state-appropriate data.
+61. J uses the recorded BUZZ winner, trusted elapsed time, and frozen round
+    settings to award points, consumes the played entry once, and enters normal
+    `ROUND_COMPLETE` scanning within the same request.
+62. A completed buzz round retains one current adjudication and award; correction
+    replaces that award by net delta and never accumulates multiple awards.
+63. Score correction is round-scoped and legal only in `ROUND_COMPLETE` before
+    the next successful C; a rejected Play Song leaves it open, while a later
+    preparation failure cannot reopen it.
+64. Timeout-completed rounds and `FINISHED` games are not score-correctable, and
+    automatic K freezes standings including the final round's committed award.
 
 ## 49. Future Directions
 
