@@ -17,10 +17,12 @@ from who_sings_that.application import (
     GameController,
     PlaySongRequest,
     RevealRequest,
+    StaleGameSessionError,
 )
 from who_sings_that.database import create_sqlite_engine, upgrade_database
 from who_sings_that.domain import (
     GameEngine,
+    GameFinalizationResult,
     GameSettings,
     GameState,
     ResolvedPlaylist,
@@ -31,6 +33,10 @@ from who_sings_that.domain import (
     TrackReference,
     UnauthorizedScoringError,
     calculate_points,
+)
+from who_sings_that.domain.engine import (
+    PlaySongNotAllowedError,
+    UnauthorizedPlaySongError,
 )
 
 GAME_ID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
@@ -81,19 +87,20 @@ def controller_storage(tmp_path: Path) -> Iterator[tuple[Engine, Path]]:
     database_engine.dispose()
 
 
-def resolved_playlist() -> ResolvedPlaylist:
+def resolved_playlist(*tracks: TrackReference) -> ResolvedPlaylist:
+    resolved_tracks = tracks or TRACKS
     return ResolvedPlaylist(
         snapshot=SelectedPlaylistSnapshot(
             playlist_id="playlist",
             playlist_name="Playlist",
             playlist_created_at=PLAYLIST_CREATED_AT,
-            playlist_song_count=len(TRACKS),
+            playlist_song_count=len(resolved_tracks),
         ),
-        tracks=TRACKS,
+        tracks=resolved_tracks,
     )
 
 
-def scoring_engine():
+def scoring_engine(*tracks: TrackReference):
     monotonic_clock = MutableMonotonicClock()
     engine = GameEngine(
         GameSettings(
@@ -111,7 +118,7 @@ def scoring_engine():
     engine.join_game("winner-token", "Winner")
     engine.set_browser_audio_capability("songmaster-token", True)
     engine.select_playlist("songmaster-token", "playlist")
-    engine.start_game("songmaster-token", [resolved_playlist()])
+    engine.start_game("songmaster-token", [resolved_playlist(*tracks)])
     pending = engine.play_song("songmaster-token")
     engine.record_audio_preparation_ready(
         GAME_ID,
@@ -307,6 +314,164 @@ async def test_fifo_play_before_correction_makes_correction_stale(
 
     assert engine.state is GameState.AUDIO_PREPARING
     assert game.members["winner-token"].committed_score == initial.awarded_points
+    assert controller.is_running is True
+    await controller.stop()
+
+
+@pytest.mark.asyncio
+async def test_one_song_controller_cycle_corrects_then_explicitly_finalizes(
+    controller_storage: tuple[Engine, Path],
+) -> None:
+    monotonic_clock = MutableMonotonicClock()
+    engine = GameEngine(
+        GameSettings(
+            playback_duration_seconds=30,
+            speed_bonus_plateau_percent=Decimal(10),
+        ),
+        clock=AdvancingClock(),
+        monotonic_clock=monotonic_clock,
+        game_id_factory=lambda: GAME_ID,
+        preparation_id_factory=UUIDFactory(100),
+        round_id_factory=UUIDFactory(200),
+        shuffle=lambda values: None,
+    )
+    game = engine.create_game("songmaster-token", "Songmaster")
+    engine.join_game("winner-token", "Winner")
+    engine.set_browser_audio_capability("songmaster-token", True)
+    engine.select_playlist("songmaster-token", "playlist")
+    engine.start_game("songmaster-token", [resolved_playlist(TRACKS[0])])
+    controller = make_controller(controller_storage, engine)
+    await controller.start()
+
+    pending = await controller.submit_request(
+        PlaySongRequest(GAME_ID, "songmaster-token")
+    )
+    assert controller.preparation_timeout_active is True
+    controller.post_system_event(
+        AudioPreparationReadyEvent(
+            GAME_ID,
+            pending.preparation_id,
+            "songmaster-token",
+            "connection-1",
+        )
+    )
+    await controller._queue.join()
+    assert game.active_round is not None
+    active_round = game.active_round
+    assert controller.preparation_timeout_active is False
+    assert controller.playback_timeout_active is True
+
+    monotonic_clock.value = active_round.playback_started_monotonic + 8
+    await controller.submit_request(
+        BuzzRequest(GAME_ID, active_round.round_id, "winner-token")
+    )
+    await controller.submit_request(
+        RevealRequest(GAME_ID, active_round.round_id, "songmaster-token")
+    )
+    initial = await controller.submit_request(
+        AcceptScoreRequest(
+            GAME_ID,
+            active_round.round_id,
+            "songmaster-token",
+            ScoringChoice.ARTIST,
+        )
+    )
+
+    assert engine.state is GameState.ROUND_COMPLETE
+    assert game.deck_exhausted is True
+    assert game.final_standings == ()
+    assert game.scoring_correction_round_id == active_round.round_id
+    assert controller.playback_timeout_active is False
+
+    with pytest.raises(StaleGameSessionError):
+        await controller.submit_request(
+            PlaySongRequest(UUID(int=999), "songmaster-token")
+        )
+    with pytest.raises(UnauthorizedPlaySongError):
+        await controller.submit_request(PlaySongRequest(GAME_ID, "winner-token"))
+    game.songmaster.connected = False
+    with pytest.raises(UnauthorizedPlaySongError):
+        await controller.submit_request(
+            PlaySongRequest(GAME_ID, "songmaster-token")
+        )
+    game.songmaster.connected = True
+    assert game.scoring_correction_round_id == active_round.round_id
+
+    correction_task = asyncio.create_task(
+        controller.submit_request(
+            CorrectScoreRequest(
+                GAME_ID,
+                active_round.round_id,
+                "songmaster-token",
+                ScoringChoice.BOTH,
+            )
+        )
+    )
+    await asyncio.sleep(0)
+    finalization_task = asyncio.create_task(
+        controller.submit_request(PlaySongRequest(GAME_ID, "songmaster-token"))
+    )
+    corrected, finalization = await asyncio.gather(
+        correction_task,
+        finalization_task,
+    )
+
+    assert initial.awarded_points < corrected.awarded_points
+    assert isinstance(finalization, GameFinalizationResult)
+    assert engine.state is GameState.FINISHED
+    assert game.final_standings[0].score == corrected.awarded_points
+    assert game.scoring_correction_round_id is None
+    assert game.pending_audio_preparation is None
+    assert controller.preparation_timeout_active is False
+    assert controller.playback_timeout_active is False
+    with pytest.raises(PlaySongNotAllowedError):
+        await controller.submit_request(
+            PlaySongRequest(GAME_ID, "songmaster-token")
+        )
+    assert controller.is_running is True
+    await controller.stop()
+
+
+@pytest.mark.asyncio
+async def test_fifo_finalization_before_correction_rejects_correction(
+    controller_storage: tuple[Engine, Path],
+) -> None:
+    engine, game, _, active_round = scoring_engine(TRACKS[0])
+    controller = make_controller(controller_storage, engine)
+    await controller.start()
+    initial = await controller.submit_request(
+        AcceptScoreRequest(
+            GAME_ID,
+            active_round.round_id,
+            "songmaster-token",
+            ScoringChoice.ARTIST,
+        )
+    )
+
+    finalization_task = asyncio.create_task(
+        controller.submit_request(PlaySongRequest(GAME_ID, "songmaster-token"))
+    )
+    await asyncio.sleep(0)
+    correction_task = asyncio.create_task(
+        controller.submit_request(
+            CorrectScoreRequest(
+                GAME_ID,
+                active_round.round_id,
+                "songmaster-token",
+                ScoringChoice.BOTH,
+            )
+        )
+    )
+
+    finalization = await finalization_task
+    with pytest.raises(ScoreCorrectionNotAllowedError):
+        await correction_task
+
+    assert isinstance(finalization, GameFinalizationResult)
+    assert engine.state is GameState.FINISHED
+    assert game.final_standings[0].score == initial.awarded_points
+    assert controller.preparation_timeout_active is False
+    assert controller.playback_timeout_active is False
     assert controller.is_running is True
     await controller.stop()
 

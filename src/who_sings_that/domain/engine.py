@@ -20,6 +20,7 @@ from .models import (
     DeckSkipReason,
     FinalStanding,
     GameEndReason,
+    GameFinalizationResult,
     GameMember,
     GameSession,
     GameSettings,
@@ -531,8 +532,15 @@ class GameEngine:
             raise
         return member
 
-    def play_song(self, requesting_browser_token: str) -> PendingAudioPreparation:
-        """Apply transition C (``ROUND_COMPLETE`` to ``AUDIO_PREPARING``)."""
+    def play_song(
+        self, requesting_browser_token: str
+    ) -> PendingAudioPreparation | GameFinalizationResult:
+        """Apply transition C or K from ``ROUND_COMPLETE``.
+
+        Candidate availability is established by ``ROUND_COMPLETE`` entry.
+        An available candidate takes C and returns its immutable preparation;
+        an exhausted deck takes K and returns frozen finalization facts.
+        """
 
         if self._state is not GameState.ROUND_COMPLETE:
             raise PlaySongNotAllowedError(
@@ -555,12 +563,23 @@ class GameEngine:
             )
 
         # ROUND_COMPLETE entry already performed candidate scanning. Inspect
-        # only the established entry under the pointer; transition C never
-        # searches ahead for another candidate.
+        # only the established outcome; neither transition C nor K searches
+        # ahead. Exhaustion dispatches K before candidate/audio validation.
+        self._validate_state_invariants(GameState.ROUND_COMPLETE)
         deck = game.deck
-        if deck is None or game.deck_exhausted or game.deck_pointer >= len(deck):
+        if deck is None:
             raise DomainInvariantError(
-                "Play Song requires an established non-exhausted deck candidate"
+                "Play Song requires an established deck"
+            )
+        if game.deck_exhausted:
+            self._take_transition_k()
+            return GameFinalizationResult(
+                end_reason=GameEndReason.DECK_EXHAUSTED,
+                final_standings=game.final_standings,
+            )
+        if game.deck_pointer >= len(deck):
+            raise DomainInvariantError(
+                "a non-exhausted deck requires a candidate under the pointer"
             )
         deck_entry = deck[game.deck_pointer]
         if not is_duration_eligible(
@@ -947,7 +966,7 @@ class GameEngine:
         )
 
         # Transition-J-specific work is committed exactly once before normal
-        # ROUND_COMPLETE entry scanning (and possible immediate K) executes.
+        # ROUND_COMPLETE entry scanning executes without finalizing the game.
         game.members[winner_token].committed_score += awarded_points
         game.last_completed_round = completed
         game.scoring_correction_round_id = round_id
@@ -1548,10 +1567,6 @@ class GameEngine:
         self._state = target
         self._enter_state(target)
         self._validate_state_invariants(target)
-        if target is GameState.ROUND_COMPLETE:
-            game = self._active_game
-            if game is not None and game.deck_exhausted:
-                self._take_transition_k()
 
     def _enter_state(self, state: GameState) -> None:
         match state:
@@ -1650,7 +1665,7 @@ class GameEngine:
         game.buzzing_enabled = False
 
     def _take_transition_k(self) -> None:
-        """Apply transition K after established deck exhaustion."""
+        """Apply transition K on authorized Play Song after deck exhaustion."""
 
         game = self._active_game
         if (
@@ -2547,7 +2562,7 @@ class GameEngine:
             )
         if game.end_reason is not GameEndReason.DECK_EXHAUSTED:
             raise DomainInvariantError(
-                "automatic transition K requires deck_exhausted as end reason"
+                "transition K requires deck_exhausted as end reason"
             )
         if not isinstance(game.ended_at, datetime):
             raise DomainInvariantError("FINISHED requires a game end timestamp")

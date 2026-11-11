@@ -17,6 +17,8 @@ from who_sings_that.domain.engine import (
     UnauthorizedPlaySongError,
 )
 from who_sings_that.domain.models import (
+    GameEndReason,
+    GameFinalizationResult,
     GameSettings,
     GameState,
     ResolvedPlaylist,
@@ -25,6 +27,7 @@ from who_sings_that.domain.models import (
 
 CREATED_AT = datetime(2026, 11, 1, 12, 30, tzinfo=UTC)
 STARTED_AT = datetime(2026, 11, 1, 12, 35, tzinfo=UTC)
+ENDED_AT = datetime(2026, 11, 1, 12, 40, tzinfo=UTC)
 PLAYLIST_CREATED_AT = datetime(2024, 5, 4, 9, 15, tzinfo=UTC)
 PREPARATION_ID = UUID("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee")
 
@@ -271,6 +274,47 @@ def test_no_valid_audio_target_rejection_preserves_authoritative_facts() -> None
     assert game.deck_pointer == 0
     assert engine.state is GameState.ROUND_COMPLETE
     engine.validate_invariants()
+
+
+def test_exhausted_play_song_requires_connected_songmaster_and_skips_audio_work(
+) -> None:
+    def unexpected_preparation_id() -> UUID:
+        raise AssertionError("transition K must not create a preparation ID")
+
+    engine = GameEngine(
+        clock=SequenceClock(CREATED_AT, STARTED_AT, ENDED_AT),
+        preparation_id_factory=unexpected_preparation_id,
+        shuffle=unchanged,
+    )
+    game = engine.create_game("songmaster-token", "Songmaster")
+    engine.join_game("player-token", "Player")
+    engine.select_playlist("songmaster-token", "playlist")
+    engine.start_game(
+        "songmaster-token",
+        [resolved_playlist(TrackReference(1, 10))],
+    )
+    assert game.deck_exhausted is True
+    before = deepcopy(game)
+
+    with pytest.raises(UnauthorizedPlaySongError):
+        engine.play_song("player-token")
+    assert game == before
+
+    game.songmaster.connected = False
+    disconnected = deepcopy(game)
+    with pytest.raises(UnauthorizedPlaySongError):
+        engine.play_song("songmaster-token")
+    assert game == disconnected
+
+    game.songmaster.connected = True
+    result = engine.play_song("songmaster-token")
+
+    assert isinstance(result, GameFinalizationResult)
+    assert result.end_reason is GameEndReason.DECK_EXHAUSTED
+    assert engine.state is GameState.FINISHED
+    assert game.pending_audio_preparation is None
+    with pytest.raises(PlaySongNotAllowedError):
+        engine.play_song("songmaster-token")
 
 
 def test_pending_preparation_has_opaque_uuid_and_settings_snapshots() -> None:

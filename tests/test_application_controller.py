@@ -41,7 +41,9 @@ from who_sings_that.database import (
     upgrade_database,
 )
 from who_sings_that.domain import (
+    GameEndReason,
     GameEngine,
+    GameFinalizationResult,
     GameSession,
     GameState,
     UnauthorizedPlaylistSelectionError,
@@ -552,7 +554,7 @@ async def test_persistent_start_audio_capability_and_play_song_through_controlle
 
 
 @pytest.mark.asyncio
-async def test_start_game_keeps_immediate_transition_k_in_same_message(
+async def test_exhausted_start_waits_for_play_song_then_finalizes_without_timer(
     controller_storage: tuple[Engine, Path],
 ) -> None:
     database_engine, music_root = controller_storage
@@ -594,8 +596,21 @@ async def test_start_game_keeps_immediate_transition_k_in_same_message(
     )
 
     assert result.game is game
-    assert controller.game_engine.state is GameState.FINISHED
+    assert controller.game_engine.state is GameState.ROUND_COMPLETE
     assert game.deck_exhausted is True
     assert game.deck_pointer == 1
+    assert game.ended_at is None
+    assert game.final_standings == ()
+
+    finalization = await controller.submit_request(
+        PlaySongRequest(game.game_session_id, "songmaster-token")
+    )
+
+    assert isinstance(finalization, GameFinalizationResult)
+    assert finalization.end_reason is GameEndReason.DECK_EXHAUSTED
+    assert controller.game_engine.state is GameState.FINISHED
     assert game.ended_at == ENDED_AT
+    assert game.pending_audio_preparation is None
+    assert controller.preparation_timeout_active is False
+    assert controller.is_running is True
     await controller.stop()

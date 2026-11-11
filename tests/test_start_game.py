@@ -19,6 +19,7 @@ from who_sings_that.domain.models import (
     DeckSkipReason,
     FinalStanding,
     GameEndReason,
+    GameFinalizationResult,
     GameSession,
     GameState,
     ResolvedPlaylist,
@@ -375,7 +376,7 @@ def test_round_complete_entry_preserves_player_facing_display_on_every_entry() -
     engine.validate_invariants()
 
 
-def test_all_short_tracks_finish_with_zero_played_rounds_and_zero_score() -> None:
+def test_all_short_tracks_leave_exhausted_round_complete_until_play_song() -> None:
     engine = make_engine()
     game = create_selected_lobby(engine, "short")
 
@@ -391,16 +392,25 @@ def test_all_short_tracks_finish_with_zero_played_rounds_and_zero_score() -> Non
     )
 
     assert returned is game
-    assert engine.state is GameState.FINISHED
+    assert engine.state is GameState.ROUND_COMPLETE
     assert game.deck is not None
     assert game.deck_pointer == len(game.deck)
     assert game.deck_exhausted is True
     assert len(game.skipped_deck_entries) == len(game.deck)
     assert game.active_round is None
     assert game.displayed_deck_position is None
+    assert game.end_reason is None
+    assert game.ended_at is None
+    assert game.final_standings == ()
+    engine.validate_invariants()
+
+    result = engine.play_song("songmaster-token")
+
+    assert isinstance(result, GameFinalizationResult)
+    assert engine.state is GameState.FINISHED
     assert game.end_reason is GameEndReason.DECK_EXHAUSTED
     assert game.ended_at == ENDED_AT
-    assert game.final_standings == (
+    assert result.final_standings == game.final_standings == (
         FinalStanding(1, "songmaster-token", "Songmaster", 0),
     )
     engine.validate_invariants()
@@ -426,6 +436,10 @@ def test_finished_standings_are_frozen_sorted_and_preserve_ties() -> None:
             )
         ],
     )
+
+    assert engine.state is GameState.ROUND_COMPLETE
+    assert game.final_standings == ()
+    engine.play_song("songmaster-token")
 
     assert engine.state is GameState.FINISHED
     assert engine.active_game is lobby

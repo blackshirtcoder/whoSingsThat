@@ -8,6 +8,7 @@ import pytest
 from who_sings_that.domain import (
     GameEndReason,
     GameEngine,
+    GameFinalizationResult,
     GameSettings,
     GameState,
     InvalidScoringDecisionError,
@@ -235,7 +236,7 @@ def test_trusted_elapsed_time_and_round_snapshot_control_award() -> None:
     assert game.members["winner-token"].committed_score == completed.awarded_points
 
 
-def test_transition_j_scans_next_candidate_and_final_entry_takes_k() -> None:
+def test_final_transition_j_keeps_corrections_open_until_explicit_k() -> None:
     short_track = TrackReference(15, 10, "Short Artist", "Short Title")
     engine, game, monotonic_clock = started_engine(TRACKS[0], short_track, TRACKS[1])
     first_round = enter_scoring(engine, monotonic_clock)
@@ -249,9 +250,35 @@ def test_transition_j_scans_next_candidate_and_final_entry_takes_k() -> None:
     final_round = enter_scoring(engine, monotonic_clock, elapsed=4)
     completed = complete_score(engine, final_round, ScoringChoice.BOTH)
 
-    assert engine.state is GameState.FINISHED
+    assert engine.state is GameState.ROUND_COMPLETE
     assert game.deck_pointer == 3
     assert game.deck_exhausted is True
+    assert game.end_reason is None
+    assert game.scoring_correction_round_id == final_round.round_id
+    assert game.final_standings == ()
+    assert game.displayed_artist == "Second Artist"
+    assert game.displayed_title == "Second Title"
+
+    pointer = game.deck_pointer
+    for choice in (
+        ScoringChoice.NEITHER,
+        ScoringChoice.ARTIST,
+        ScoringChoice.BOTH,
+    ):
+        completed = engine.correct_score(
+            GAME_ID,
+            final_round.round_id,
+            "songmaster-token",
+            choice,
+        )
+        assert engine.state is GameState.ROUND_COMPLETE
+        assert game.deck_pointer == pointer
+        assert game.deck_exhausted is True
+
+    finalization = engine.play_song("songmaster-token")
+
+    assert isinstance(finalization, GameFinalizationResult)
+    assert engine.state is GameState.FINISHED
     assert game.end_reason is GameEndReason.DECK_EXHAUSTED
     assert game.scoring_correction_round_id is None
     assert game.final_standings[0].browser_token == "winner-token"
@@ -259,8 +286,6 @@ def test_transition_j_scans_next_candidate_and_final_entry_takes_k() -> None:
         calculate_points(ScoringChoice.ARTIST, 40, Decimal(".25"), 12.5)
         + completed.awarded_points
     )
-    assert game.displayed_artist == "Second Artist"
-    assert game.displayed_title == "Second Title"
 
     with pytest.raises(ScoreCorrectionNotAllowedError):
         engine.correct_score(
@@ -269,6 +294,31 @@ def test_transition_j_scans_next_candidate_and_final_entry_takes_k() -> None:
             "songmaster-token",
             ScoringChoice.NEITHER,
         )
+
+
+def test_transition_j_consumes_trailing_short_entries_without_changing_display(
+) -> None:
+    trailing_short = (
+        TrackReference(40, 10, "Short One", "Short One"),
+        TrackReference(50, 20, "Short Two", "Short Two"),
+    )
+    engine, game, monotonic_clock = started_engine(TRACKS[0], *trailing_short)
+    active_round = enter_scoring(engine, monotonic_clock)
+
+    completed = complete_score(engine, active_round, ScoringChoice.ARTIST)
+
+    assert engine.state is GameState.ROUND_COMPLETE
+    assert game.deck is not None
+    assert game.original_deck_size == 3
+    assert game.deck_pointer == len(game.deck)
+    assert game.deck_exhausted is True
+    assert [skip.original_position for skip in game.skipped_deck_entries] == [2, 3]
+    assert game.displayed_deck_position == 1
+    assert game.displayed_artist == "First Artist"
+    assert game.displayed_title == "First Title"
+    assert game.scoring_correction_round_id == active_round.round_id
+    assert game.final_standings == ()
+    assert completed is game.last_completed_round
 
 
 @pytest.mark.parametrize(

@@ -276,6 +276,14 @@ class FinalStanding:
     score: int
 
 
+@dataclass(frozen=True, slots=True)
+class GameFinalizationResult:
+    """Successful transition-K result returned by the Play Song operation."""
+
+    end_reason: GameEndReason
+    final_standings: tuple[FinalStanding, ...]
+
+
 @dataclass(slots=True)
 class GameSession:
     """The live in-memory aggregate for the currently implemented states."""

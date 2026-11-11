@@ -68,7 +68,7 @@ class SetAudioPreferenceRequest(ClientRequest):
 
 @dataclass(frozen=True, slots=True)
 class PlaySongRequest(ClientRequest):
-    """Request transition C from the connected Songmaster."""
+    """Request transition C or K from the connected Songmaster."""
 
     game_session_id: UUID
     requesting_browser_token: str

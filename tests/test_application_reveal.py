@@ -9,12 +9,14 @@ from sqlalchemy import Engine
 
 from who_sings_that.application import (
     GameController,
+    PlaySongRequest,
     RevealRequest,
     StaleGameSessionError,
 )
 from who_sings_that.database import create_sqlite_engine, upgrade_database
 from who_sings_that.domain import (
     GameEngine,
+    GameFinalizationResult,
     GameSettings,
     GameState,
     ResolvedPlaylist,
@@ -233,7 +235,7 @@ async def test_controller_transition_i_reaches_round_complete_in_one_dispatch(
 
 
 @pytest.mark.asyncio
-async def test_controller_transition_i_includes_automatic_k_before_response(
+async def test_controller_transition_i_waits_for_play_song_to_take_k(
     controller_storage: tuple[Engine, Path],
 ) -> None:
     engine, game = awaiting_engine(TRACK, buzz=False)
@@ -245,9 +247,11 @@ async def test_controller_transition_i_includes_automatic_k_before_response(
     )
 
     assert result is game
-    assert controller.reveal_dispatch_states == [GameState.FINISHED]
-    assert engine.state is GameState.FINISHED
+    assert controller.reveal_dispatch_states == [GameState.ROUND_COMPLETE]
+    assert engine.state is GameState.ROUND_COMPLETE
     assert game.deck_pointer == 1
+    assert game.deck_exhausted is True
+    assert game.final_standings == ()
     assert game.displayed_artist == "Secret Artist"
     assert game.displayed_title == "Secret Title"
 
@@ -255,5 +259,13 @@ async def test_controller_transition_i_includes_automatic_k_before_response(
         await controller.submit_request(
             RevealRequest(GAME_ID, ROUND_ID, "songmaster-token")
         )
+
+    finalization = await controller.submit_request(
+        PlaySongRequest(GAME_ID, "songmaster-token")
+    )
+    assert isinstance(finalization, GameFinalizationResult)
+    assert engine.state is GameState.FINISHED
+    assert game.displayed_artist == "Secret Artist"
+    assert game.displayed_title == "Secret Title"
     assert controller.is_running is True
     await controller.stop()

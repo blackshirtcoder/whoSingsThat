@@ -9,6 +9,7 @@ from who_sings_that.domain import (
     DomainInvariantError,
     GameEndReason,
     GameEngine,
+    GameFinalizationResult,
     GameSettings,
     GameState,
     ResolvedPlaylist,
@@ -317,21 +318,31 @@ def test_duplicate_timeout_reveal_cannot_consume_next_song() -> None:
     assert game.last_completed_round is completed_after
 
 
-def test_transition_i_exhaustion_takes_k_in_same_reveal_request() -> None:
+def test_transition_i_exhaustion_waits_for_explicit_transition_k() -> None:
     engine, game, _, active_round = awaiting_timeout(FIRST_TRACK)
 
     reveal(engine, active_round.round_id)
 
-    assert engine.state is GameState.FINISHED
+    assert engine.state is GameState.ROUND_COMPLETE
     assert game.deck_pointer == 1
     assert game.deck_exhausted is True
-    assert game.end_reason is GameEndReason.DECK_EXHAUSTED
-    assert game.ended_at == SECOND_PLAYBACK_AT
+    assert game.end_reason is None
+    assert game.ended_at is None
+    assert game.final_standings == ()
     assert game.displayed_deck_position == 1
     assert game.displayed_artist == "First Artist"
     assert game.displayed_title == "First Title"
     assert game.last_completed_round is not None
     assert game.last_completed_round.active_round.round_id == active_round.round_id
+    assert game.scoring_correction_round_id is None
+    engine.validate_invariants()
+
+    finalization = engine.play_song("songmaster-token")
+
+    assert isinstance(finalization, GameFinalizationResult)
+    assert engine.state is GameState.FINISHED
+    assert game.end_reason is GameEndReason.DECK_EXHAUSTED
+    assert game.ended_at == SECOND_PLAYBACK_AT
     engine.validate_invariants()
 
 

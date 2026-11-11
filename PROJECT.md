@@ -100,10 +100,12 @@ that event to be processed. The queue consumer must never submit a client reques
 to its own queue and await the response. Circular synchronous dependencies among
 queued messages are prohibited.
 
-Immediate deterministic state-machine work, including automatic transition K
-after `ROUND_COMPLETE` entry discovers deck exhaustion, completes within the
-current message. A future independent occurrence, such as a timer expiry or
-browser response, enters the global FIFO queue as a new message.
+Immediate deterministic state-machine work, including transition K when an
+authorized Play Song request finds the already-established exhausted-deck
+condition, completes within the current message. Merely entering
+`ROUND_COMPLETE` with an exhausted deck does not take K. A future independent
+occurrence, such as a timer expiry or browser response, enters the global FIFO
+queue as a new message.
 
 For the current increment, persistent-playlist lookup and media inspection run
 synchronously inside the serialized handler. This preserves message atomicity
@@ -409,6 +411,11 @@ Track length relative to current playback duration is **not** a Start Game filte
 
 If the resulting structural deck is empty, Start Game is rejected and the game remains in `LOBBY`.
 
+If the structural deck is non-empty but every entry is duration-ineligible,
+`ROUND_COMPLETE` entry consumes those entries through the normal skip-record
+scan and remains in `ROUND_COMPLETE` with `deck_exhausted = true`. A later
+authorized Play Song request takes transition K.
+
 ## 17. Deck Semantics
 
 The deck is immutable after Start Game.
@@ -428,6 +435,11 @@ During `AUDIO_PREPARING` and `PLAYING`, it still points at the current selected/
 It advances exactly when that entry becomes consumed.
 
 Skipped entries are consumed permanently and do not return even if settings later change.
+
+Deck exhaustion and game finalization are separate authoritative facts. The
+server establishes exhaustion during `ROUND_COMPLETE` entry scanning, may wait
+there while final-round score correction remains available, and finalizes only
+when the connected Songmaster subsequently requests Play Song.
 
 ## 18. Game Settings
 
@@ -514,12 +526,16 @@ Audio preference may change only in `LOBBY` or `ROUND_COMPLETE`.
 
 A valid audio target is a connected client that has audio enabled and has initialized/unlocked its browser audio subsystem sufficiently to participate in preparation.
 
-If the Songmaster presses Play Song in `ROUND_COMPLETE` and no valid audio target exists:
+If an eligible candidate exists and the Songmaster presses Play Song in
+`ROUND_COMPLETE` while no valid audio target exists:
 
 - show a Songmaster-only error dialog;
 - do not transition;
 - do not alter the deck pointer;
 - do not consume the selected song.
+
+If the deck is exhausted, the same authorized Play Song operation takes
+transition K without requiring or inspecting an audio target.
 
 ## 23. Pre-Reveal Metadata Secrecy
 
@@ -572,7 +588,7 @@ stateDiagram-v2
     NO_GAME --> LOBBY: A Create Game
     LOBBY --> ROUND_COMPLETE: B Start Game
 
-    ROUND_COMPLETE --> AUDIO_PREPARING: C Play Song
+    ROUND_COMPLETE --> AUDIO_PREPARING: C Play Song / candidate available
     AUDIO_PREPARING --> ROUND_COMPLETE: D Prepare Failed
     AUDIO_PREPARING --> PLAYING: E Prepare Ready
 
@@ -584,7 +600,7 @@ stateDiagram-v2
 
     SCORING --> ROUND_COMPLETE: J Accept Score
 
-    ROUND_COMPLETE --> FINISHED: K Deck Exhausted
+    ROUND_COMPLETE --> FINISHED: K Play Song / deck exhausted
     FINISHED --> NO_GAME: L Close / Reset
 ```
 
@@ -604,7 +620,7 @@ End Game and Songmaster disconnect/failover are global overlays and are intentio
 | H | `AWAITING_REVEAL` | `SCORING` | Reveal requested and round ended by buzz |
 | I | `AWAITING_REVEAL` | `ROUND_COMPLETE` | Reveal requested and round ended by timeout |
 | J | `SCORING` | `ROUND_COMPLETE` | Accept Score requested and provisional scoring choice exists |
-| K | `ROUND_COMPLETE` | `FINISHED` | Deck exhausted |
+| K | `ROUND_COMPLETE` | `FINISHED` | Songmaster requests Play Song and deck is exhausted |
 | L | `FINISHED` | `NO_GAME` | Songmaster closes/resets finished session |
 
 ## 27. State: `NO_GAME`
@@ -689,6 +705,8 @@ On every entry:
    - stop.
 
 After entry completes, either the deck is exhausted or the pointer identifies the next known duration-eligible candidate.
+An exhausted result remains in `ROUND_COMPLETE`; state entry never finalizes the
+game merely because the scan reached the deck end.
 
 ### Internal work
 
@@ -700,6 +718,8 @@ After entry completes, either the deck is exhausted or the pointer identifies th
 - view standings.
 
 If Play Song is requested with no valid audio target, show warning and remain in `ROUND_COMPLETE`.
+This audio-target rejection applies only when an eligible candidate exists. An
+exhausted deck dispatches transition K before candidate-specific audio checks.
 
 The most recently completed buzz round may be score-corrected as an internal
 `ROUND_COMPLETE` action while its explicit round-scoped correction window is
@@ -730,17 +750,30 @@ Actions:
 
 Target: `AUDIO_PREPARING`.
 
-### Transition K — deck exhausted
+### Transition K — explicit finalization of an exhausted deck
 
 Condition:
 
 ```text
 deck_exhausted == true
+AND Play Song requested
+AND requester is the current connected Songmaster
 ```
 
-No user event required.
+Actions:
 
-Set `end_reason = deck_exhausted`.
+- close any remaining score-correction window;
+- set `end_reason = deck_exhausted`;
+- do not validate audio targets or create audio preparation work.
+
+Invalid, stale, unauthorized, or disconnected requests do not take K and do not
+close the score-correction window.
+
+The synchronous Play Song operation has two explicit successful result forms:
+transition C returns the immutable pending audio preparation, while transition
+K returns distinct finalization facts. The application schedules a preparation
+timer only for the transition-C result. Both results complete the same typed
+client request normally, and K creates no preparation UUID or timer.
 
 Target: `FINISHED`.
 
@@ -793,6 +826,11 @@ Actions:
 - leave previous-song display unchanged.
 
 Target: `ROUND_COMPLETE`.
+
+If entry scanning finds no later eligible candidate, remain in exhausted
+`ROUND_COMPLETE` until a later authorized Play Song request takes K. Transition
+D does not reopen a correction window that successful transition C already
+closed.
 
 ### Transition E — preparation ready
 
@@ -999,8 +1037,8 @@ Actions:
 - consume the bound played entry exactly once by incrementing the zero-based
   deck pointer;
 - clear the active-round and live termination fields;
-- enter normal `ROUND_COMPLETE` candidate scanning, including immediate K when
-  the deck is exhausted.
+- enter normal `ROUND_COMPLETE` candidate scanning and remain there when the
+  deck is exhausted.
 
 Target: `ROUND_COMPLETE`.
 
@@ -1059,8 +1097,9 @@ Actions:
 The revealed artist/title/deck-position display remains unchanged.
 
 Transition J is implemented synchronously through the global controller queue.
-Normal `ROUND_COMPLETE` duration scanning and automatic K, when exhausted,
-finish before the scoring request returns.
+Normal `ROUND_COMPLETE` duration scanning finishes before the scoring request
+returns. If that scan exhausts the deck, the game remains in `ROUND_COMPLETE`
+with this completed buzz round's correction window open.
 
 ### Score correction after transition J
 
@@ -1077,11 +1116,12 @@ Repeated identical correction is idempotent, and `Neither` is a valid zero-point
 replacement. Correction does not change the round identity, winner, answer,
 timing/settings snapshot, deck pointer, display, or state.
 
-The correction window closes at the exact successful-transition-C boundary: a
-rejected Play Song request leaves it open, but once a new song is successfully
-bound and queued for preparation it closes permanently. A later preparation
-failure and return to `ROUND_COMPLETE` does not reopen it. Only a later
-transition J may establish a new window for its own completed buzz round.
+The correction window closes at the exact successful advance boundary: a
+rejected Play Song request leaves it open; successful C closes it when a new
+song is bound for preparation, and successful K closes it when the exhausted
+game is finalized. A later preparation failure and return to `ROUND_COMPLETE`
+does not reopen it. Only a later transition J may establish a new window for
+its own completed buzz round.
 
 Target: `ROUND_COMPLETE`.
 
@@ -1136,9 +1176,11 @@ Meaning:
 
 > The game is over. No gameplay or scoring changes remain possible. Final results remain visible until the finished session is closed/reset.
 
-Automatic K closes any still-open correction window. Therefore scoring the final
-available entry includes its committed award in frozen final standings but does
-not permit a post-finish correction.
+Explicit K closes any still-open correction window. Scoring the final available
+entry therefore leaves its correction window open while the exhausted game
+waits in `ROUND_COMPLETE`; the Songmaster may replace that award repeatedly.
+The latest committed award is included in frozen final standings when the
+Songmaster then requests Play Song, and no post-finish correction is permitted.
 
 ### Entry actions
 
@@ -1422,6 +1464,34 @@ Exception: in `SCORING`, `Accept Score` is visible immediately but disabled unti
 
 Songmaster controls must be absent for ordinary players.
 
+### Future no-round controls
+
+The future browser must present controls from authoritative `ROUND_COMPLETE`
+deck availability, not infer availability from `displayed_deck_position`.
+
+When another eligible song exists, the Songmaster sees:
+
+- **Play Next Song**, which invokes the existing authoritative Play Song
+  operation and takes transition C;
+- **End Game**, which will invoke a separate voluntary early-termination
+  operation in a future increment.
+
+When the deck is exhausted, the Songmaster instead sees only **Finish Game**.
+It invokes the same authoritative Play Song operation as Play Next Song, and the
+server takes transition K because the established deck condition is exhausted.
+Do not also show End Game in this case. All applicable score-correction controls
+remain available, and other players can see that the deck is exhausted and the
+game is awaiting Songmaster finalization.
+
+In `FINISHED`, the eventual Songmaster control is **Close Game**, which will
+invoke transition L. End Game, Close Game/transition L, and these browser
+controls are not implemented in the current domain/application increment.
+
+Displayed position is not an exhaustion signal. For example, the last played
+song may retain original position 64 of 67 while positions 65–67 were consumed
+as duration-ineligible skips; authoritative deck availability is exhausted even
+though the displayed position is 64.
+
 ## 47. Configuration Hierarchy
 
 ```text
@@ -1469,7 +1539,8 @@ min multiplier: 1.0x
 9. Deck positions never renumber.
 10. Deck pointer identifies the next unconsumed/current selected entry.
 11. `ROUND_COMPLETE` identifies next duration-eligible candidate or exhaustion before the state is considered fully entered.
-12. No Play Song transition occurs without a valid audio target.
+12. Transition C does not occur without a valid audio target; transition K does
+    not require an audio target.
 13. No round becomes real until audio preparation succeeds.
 14. Audio preparation failure consumes/skips that candidate only after SM acknowledges failure.
 15. Old revealed-song display remains visible through `ROUND_COMPLETE` and `AUDIO_PREPARING`.
@@ -1535,10 +1606,16 @@ min multiplier: 1.0x
 62. A completed buzz round retains one current adjudication and award; correction
     replaces that award by net delta and never accumulates multiple awards.
 63. Score correction is round-scoped and legal only in `ROUND_COMPLETE` before
-    the next successful C; a rejected Play Song leaves it open, while a later
-    preparation failure cannot reopen it.
-64. Timeout-completed rounds and `FINISHED` games are not score-correctable, and
-    automatic K freezes standings including the final round's committed award.
+    the next successful C or K; a rejected Play Song leaves it open, while a
+    later preparation failure cannot reopen it.
+64. Timeout-completed rounds and `FINISHED` games are not score-correctable.
+    Exhaustion alone does not close final-round correction eligibility;
+    explicit K closes it and freezes standings with the latest committed award.
+65. Exhausted `ROUND_COMPLETE` has its pointer at deck end, no next candidate,
+    no active round/preparation, no frozen standings, and may retain correction
+    eligibility for its last completed buzz round.
+66. Deck exhaustion and game finalization are distinct facts; only an
+    authorized Play Song request takes K after exhaustion is established.
 
 ## 49. Future Directions
 

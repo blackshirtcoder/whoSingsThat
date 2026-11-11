@@ -12,6 +12,7 @@ from who_sings_that.domain import (
     DomainInvariantError,
     GameEndReason,
     GameEngine,
+    GameFinalizationResult,
     GameSettings,
     GameState,
     PreparationEventInapplicableError,
@@ -426,19 +427,33 @@ def test_transition_d_round_complete_entry_scans_additional_short_candidates() -
     assert game.deck[game.deck_pointer].track.track_id == 30
 
 
-def test_transition_d_exhaustion_immediately_takes_transition_k() -> None:
+def test_transition_d_exhaustion_waits_in_round_complete_for_transition_k() -> None:
     engine, game, _ = prepare_game(TrackReference(10, 180))
+    game.displayed_deck_position = 1
+    game.displayed_artist = "Previous Artist"
+    game.displayed_title = "Previous Title"
     failed(engine, "songmaster-token")
 
     acknowledge(engine)
 
-    assert engine.state is GameState.FINISHED
+    assert engine.state is GameState.ROUND_COMPLETE
     assert game.deck_pointer == 1
     assert game.deck_exhausted is True
-    assert game.end_reason is GameEndReason.DECK_EXHAUSTED
-    # No transition E occurred, so K uses the next clock value.
-    assert game.ended_at == PLAYBACK_STARTED_AT
+    assert game.end_reason is None
+    assert game.ended_at is None
+    assert game.final_standings == ()
     assert game.active_round is None
+    assert game.displayed_deck_position == 1
+    assert game.displayed_artist == "Previous Artist"
+    assert game.displayed_title == "Previous Title"
+
+    finalization = engine.play_song("songmaster-token")
+
+    assert isinstance(finalization, GameFinalizationResult)
+    assert engine.state is GameState.FINISHED
+    assert game.end_reason is GameEndReason.DECK_EXHAUSTED
+    # No transition E occurred, so explicit K uses the next clock value.
+    assert game.ended_at == PLAYBACK_STARTED_AT
 
 
 def test_transition_e_creates_round_from_frozen_preparation_without_consuming() -> None:

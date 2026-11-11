@@ -22,7 +22,9 @@ from who_sings_that.domain import (
     DomainInvariantError,
     GameEngine,
     GameEngineError,
+    GameFinalizationResult,
     InvalidPlayerNameError,
+    PendingAudioPreparation,
     PreparationEventResult,
     PreparationOutcome,
 )
@@ -386,12 +388,17 @@ class GameController:
             )
         if isinstance(message, PlaySongRequest):
             self._require_target_game(message.game_session_id)
-            pending = self._game_engine.play_song(message.requesting_browser_token)
-            self._schedule_preparation_timeout(
-                message.game_session_id,
-                pending.preparation_id,
-            )
-            return pending
+            result = self._game_engine.play_song(message.requesting_browser_token)
+            if isinstance(result, PendingAudioPreparation):
+                self._schedule_preparation_timeout(
+                    message.game_session_id,
+                    result.preparation_id,
+                )
+            elif not isinstance(result, GameFinalizationResult):  # pragma: no cover
+                raise DomainInvariantError(
+                    "Play Song must return preparation or finalization facts"
+                )
+            return result
         if isinstance(message, AudioPreparationReadyEvent):
             result = self._game_engine.record_audio_preparation_ready(
                 message.game_session_id,

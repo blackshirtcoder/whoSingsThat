@@ -40,6 +40,7 @@ from who_sings_that.domain import (
     EmptyDeckError,
     GameEndReason,
     GameEngine,
+    GameFinalizationResult,
     GameSession,
     GameState,
     ResolvedPlaylist,
@@ -542,7 +543,7 @@ def test_structurally_valid_short_track_enters_initial_deck_then_is_skipped(
     )
 
 
-def test_all_structurally_valid_tracks_too_short_preserve_automatic_finished(
+def test_all_structurally_valid_tracks_too_short_leave_exhausted_round_complete(
     catalog_database: tuple[Engine, Path],
 ) -> None:
     database_engine, music_root = catalog_database
@@ -566,12 +567,20 @@ def test_all_structurally_valid_tracks_too_short_preserve_automatic_finished(
     )
 
     game = result.game
-    assert game_engine.state is GameState.FINISHED
+    assert game_engine.state is GameState.ROUND_COMPLETE
     assert game.original_deck_size == 2
     assert game.deck_exhausted is True
+    assert game.end_reason is None
+    assert game.ended_at is None
+    assert game.final_standings == ()
+    assert len(game.skipped_deck_entries) == 2
+
+    finalization = game_engine.play_song("songmaster-token")
+
+    assert isinstance(finalization, GameFinalizationResult)
+    assert game_engine.state is GameState.FINISHED
     assert game.end_reason is GameEndReason.DECK_EXHAUSTED
     assert game.ended_at == ENDED_AT
-    assert len(game.skipped_deck_entries) == 2
 
 
 def test_all_structurally_ineligible_tracks_reject_start_and_preserve_lobby(
