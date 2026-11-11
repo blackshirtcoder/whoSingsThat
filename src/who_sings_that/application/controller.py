@@ -38,10 +38,13 @@ from .messages import (
     AuthoritativeMessage,
     BrowserAudioCapabilityChangedEvent,
     BuzzRequest,
+    CancelGameRequest,
     ClientRequest,
+    CloseGameRequest,
     CorrectScoreRequest,
     CreateGameRequest,
     DeselectPlaylistRequest,
+    EndGameRequest,
     JoinGameRequest,
     MemberDisconnectedEvent,
     PlaybackTimeoutEvent,
@@ -353,6 +356,15 @@ class GameController:
                 message.browser_token,
                 message.display_name,
             )
+        if isinstance(message, CancelGameRequest):
+            self._require_target_game(message.game_session_id)
+            result = self._game_engine.cancel_game(
+                message.game_session_id,
+                message.requesting_browser_token,
+            )
+            self._retire_preparation_timeout()
+            self._retire_playback_timeout()
+            return result
         if isinstance(message, JoinGameRequest):
             self._require_target_game(message.game_session_id)
             return self._game_engine.join_game(
@@ -398,6 +410,24 @@ class GameController:
                 raise DomainInvariantError(
                     "Play Song must return preparation or finalization facts"
                 )
+            return result
+        if isinstance(message, EndGameRequest):
+            self._require_target_game(message.game_session_id)
+            result = self._game_engine.end_game(
+                message.game_session_id,
+                message.requesting_browser_token,
+            )
+            self._retire_preparation_timeout()
+            self._retire_playback_timeout()
+            return result
+        if isinstance(message, CloseGameRequest):
+            self._require_target_game(message.game_session_id)
+            result = self._game_engine.close_game(
+                message.game_session_id,
+                message.requesting_browser_token,
+            )
+            self._retire_preparation_timeout()
+            self._retire_playback_timeout()
             return result
         if isinstance(message, AudioPreparationReadyEvent):
             result = self._game_engine.record_audio_preparation_ready(

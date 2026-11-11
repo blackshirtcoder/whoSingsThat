@@ -23,6 +23,14 @@ class CreateGameRequest(ClientRequest):
 
 
 @dataclass(frozen=True, slots=True)
+class CancelGameRequest(ClientRequest):
+    """Cancel the identified unstarted lobby directly into NO_GAME."""
+
+    game_session_id: UUID
+    requesting_browser_token: str
+
+
+@dataclass(frozen=True, slots=True)
 class JoinGameRequest(ClientRequest):
     """Join a new member or reconnect an existing browser identity."""
 
@@ -69,6 +77,22 @@ class SetAudioPreferenceRequest(ClientRequest):
 @dataclass(frozen=True, slots=True)
 class PlaySongRequest(ClientRequest):
     """Request transition C or K from the connected Songmaster."""
+
+    game_session_id: UUID
+    requesting_browser_token: str
+
+
+@dataclass(frozen=True, slots=True)
+class EndGameRequest(ClientRequest):
+    """Voluntarily finalize the identified started game."""
+
+    game_session_id: UUID
+    requesting_browser_token: str
+
+
+@dataclass(frozen=True, slots=True)
+class CloseGameRequest(ClientRequest):
+    """Request transition L for the identified finished game."""
 
     game_session_id: UUID
     requesting_browser_token: str
@@ -192,10 +216,13 @@ __all__ = [
     "AuthoritativeMessage",
     "BrowserAudioCapabilityChangedEvent",
     "BuzzRequest",
+    "CancelGameRequest",
     "ClientRequest",
+    "CloseGameRequest",
     "CorrectScoreRequest",
     "CreateGameRequest",
     "DeselectPlaylistRequest",
+    "EndGameRequest",
     "JoinGameRequest",
     "MemberDisconnectedEvent",
     "PlaySongRequest",

@@ -135,6 +135,13 @@ for elapsed time. A post-deadline buzz is rejected even if queued before the
 timeout event. Once either transition F or G completes, the later queued event
 is stale and harmless. Messages are not reordered by timestamp or priority.
 
+Cancel Game, End Game, and Close Game are typed client requests on this same
+queue. An accepted End Game retires any preparation/playback timer owned by the
+controller, and Close Game retires any remaining owned timer before a new game
+can use the controller. Cancellation is only an efficiency mechanism: queued
+events retain the former game/round/preparation identities and are rejected by
+ordinary identity/state validation if processed after finalization or closure.
+
 ## 5. Music Storage
 
 ### 5.1 Configured music root
@@ -383,7 +390,19 @@ Creating a game creates a game session, adds the creator as a game member, makes
 
 The game enters `LOBBY`.
 
-### 16.2 Start Game
+### 16.2 Cancel Game
+
+The current connected Songmaster may cancel an unstarted game only in `LOBBY`.
+Cancellation discards the live `GameSession` and all game-local memberships,
+roles, names, scores, and playlist selections, then returns directly to
+`NO_GAME`. It does not enter `FINISHED`, freeze standings, or create completed
+history. Persistent catalog and playlist data are unaffected.
+
+The browser token mechanism is independent of game membership. A token from a
+canceled game may immediately create a new game with a fresh game-local name,
+role, and score.
+
+### 16.3 Start Game
 
 Starting a game is separate from creating it.
 
@@ -586,6 +605,7 @@ stateDiagram-v2
     [*] --> NO_GAME
 
     NO_GAME --> LOBBY: A Create Game
+    LOBBY --> NO_GAME: Cancel Game
     LOBBY --> ROUND_COMPLETE: B Start Game
 
     ROUND_COMPLETE --> AUDIO_PREPARING: C Play Song / candidate available
@@ -622,6 +642,9 @@ End Game and Songmaster disconnect/failover are global overlays and are intentio
 | J | `SCORING` | `ROUND_COMPLETE` | Accept Score requested and provisional scoring choice exists |
 | K | `ROUND_COMPLETE` | `FINISHED` | Songmaster requests Play Song and deck is exhausted |
 | L | `FINISHED` | `NO_GAME` | Songmaster closes/resets finished session |
+
+Cancel Game is an unlettered direct `LOBBY` to `NO_GAME` lifecycle operation,
+not an End Game path and not an additional normal-flow state.
 
 ## 27. State: `NO_GAME`
 
@@ -668,6 +691,10 @@ Internal work:
 - Songmaster changes game settings;
 - players change audio preference;
 - voluntary Songmaster transfer allowed.
+- connected Songmaster may cancel the unstarted lobby directly to `NO_GAME`.
+
+Cancel Game is distinct from End Game. It discards the unstarted session
+without final standings or a retained results state.
 
 Transition B actions:
 
@@ -1182,12 +1209,18 @@ waits in `ROUND_COMPLETE`; the Songmaster may replace that award repeatedly.
 The latest committed award is included in frozen final standings when the
 Songmaster then requests Play Song, and no post-finish correction is permitted.
 
+Voluntary End Game also enters `FINISHED`, with
+`end_reason = songmaster_ended_game`. Unlike natural transition K, voluntary
+finalization may retain an unexhausted deck or a pointer on an unfinished actual
+round. Final standings always contain committed scores only. An unfinished
+actual round is retained as a void and contributes no award.
+
 ### Entry actions
 
 1. record game end timestamp;
 2. calculate/freeze final standings;
-3. persist completed-game history;
-4. persist remaining final metadata;
+3. retain final metadata in the live session;
+4. reserve completed-game persistence for a later increment;
 5. clear transient playback/preparation/timer state;
 6. broadcast final game state;
 7. replace gameplay controls with final-results UI.
@@ -1196,7 +1229,8 @@ Songmaster then requests Play Song, and no post-finish correction is permitted.
 
 Condition:
 
-- the Songmaster requests Close Game / New Game / Reset.
+- the current connected Songmaster requests Close Game for the retained
+  finished session.
 
 Only the Songmaster may take transition L. The Songmaster remains in charge through the end of `FINISHED`; if the Songmaster disconnects, normal reconnect-grace/failover rules apply.
 
@@ -1206,25 +1240,37 @@ Actions:
 - clear game-local transient state and memberships;
 - clear Songmaster assignment;
 - clear deck/current-round/display state;
-- preserve durable history;
 - preserve each browser's local identity/token;
-- notify connected browsers that no active game exists.
+- leave future client notification to the transport layer.
 
 Target: `NO_GAME`.
 
-Closing a finished session does **not** delete history and does **not** require players to re-enter their browser-local display identity before creating/joining another game.
+The current implementation has no completed-game-history persistence. Closing
+therefore discards the only live finished session; a future persistence
+increment must archive history before transition L performs this teardown.
+Closing does not invalidate browser-local tokens. Reusing a token creates a
+fresh game-local membership and does not inherit the former name, role, or
+score.
 
 ## 36. Global Overlay: End Game
 
-End Game is Songmaster-only and always requires confirmation.
+End Game is available only to the current connected Songmaster after Start
+Game. The future browser always requires confirmation; no confirmation state is
+added to the authoritative eight-state model.
 
 General rule:
 
 > Preserve everything already final; void anything still unresolved; then enter `FINISHED`.
 
-From `LOBBY` or `ROUND_COMPLETE`:
+From `LOBBY`, End Game is illegal; Cancel Game is the direct `LOBBY` to
+`NO_GAME` operation.
+
+From `ROUND_COMPLETE`:
 
 - nothing to void;
+- preserve the previous-song display, deck pointer, skip facts, completed
+  rounds, and committed scores;
+- close any open correction window;
 - set `end_reason = songmaster_ended_game`;
 - enter `FINISHED`.
 
@@ -1233,21 +1279,40 @@ From `AUDIO_PREPARING`:
 - cancel preparation;
 - discard pending prospective-round context;
 - do not create a played round;
+- do not consume the unplayed candidate or fabricate a void;
+- preserve the previous-song display and committed scores;
 - set end reason;
 - enter `FINISHED`.
 
-From `PLAYING`, `AWAITING_REVEAL`, or `SCORING`:
+From `PLAYING`:
 
-- mark current round void;
-- `void_reason = game_ended`;
-- award zero points from it;
-- discard provisional scoring;
-- preserve voided round in history;
-- stop/cancel audio/timers/buzzing as appropriate;
-- set end reason;
-- enter `FINISHED`.
+- stop the authoritative interval and disable buzzing;
+- retain the immutable actual-round facts in a void record;
+- retain no termination facts because F/G did not occur;
+- keep the current answer hidden and award no points;
+- set end reason and enter `FINISHED`.
+
+From `AWAITING_REVEAL`:
+
+- retain the actual round and existing buzz-or-timeout termination in a void
+  record;
+- keep the answer hidden and award no points;
+- set end reason and enter `FINISHED`.
+
+From `SCORING`:
+
+- retain the actual round, buzz termination, and already-revealed answer in a
+  void record;
+- preserve the revealed display but do not invent an accepted adjudication;
+- award no points, set end reason, and enter `FINISHED`.
 
 A provisional score in `SCORING` does not count unless Accept Score has already taken transition J.
+
+The live `last_voided_round` snapshot is immutable and retains the actual round,
+the `game_ended` reason, optional F/G termination facts, and whether Reveal had
+already occurred. A void is not a zero-point completed round: ordinary timeout
+transition I creates a completed zero-point round, while voluntary termination
+of an unresolved played round creates a void with no scoring decision or award.
 
 ## 37. Global Overlay: Songmaster Disconnect / Failover
 
@@ -1351,7 +1416,8 @@ No special solo state machine exists.
 
 ## 42. Game History
 
-Completed game history is retained indefinitely in SQLite.
+Completed game history is intended to be retained indefinitely in SQLite; that
+persistence is not implemented in the current phase.
 
 Persist immutable historical snapshots rather than relying on mutable catalog records.
 
@@ -1398,8 +1464,10 @@ Skipped deck entries that never became rounds should still be represented suffic
 Later metadata corrections or playlist changes must not rewrite historical games.
 
 The live engine currently retains only `last_completed_round`, sufficient for
-the bounded correction window. Durable completed-game/round history persistence
-and transport-facing history projections remain unimplemented.
+the bounded correction window, and `last_voided_round`, sufficient to preserve
+one unfinished actual round when End Game finalizes from an active-round state.
+Durable completed-game/round history persistence and transport-facing history
+projections remain unimplemented.
 
 ## 43. Historical Player Identity
 
@@ -1469,12 +1537,15 @@ Songmaster controls must be absent for ordinary players.
 The future browser must present controls from authoritative `ROUND_COMPLETE`
 deck availability, not infer availability from `displayed_deck_position`.
 
+In `LOBBY`, the connected Songmaster sees **Cancel Game**, which invokes the
+direct cancellation operation and returns to `NO_GAME` without results.
+
 When another eligible song exists, the Songmaster sees:
 
 - **Play Next Song**, which invokes the existing authoritative Play Song
   operation and takes transition C;
 - **End Game**, which will invoke a separate voluntary early-termination
-  operation in a future increment.
+  operation and enter `FINISHED` with committed scores.
 
 When the deck is exhausted, the Songmaster instead sees only **Finish Game**.
 It invokes the same authoritative Play Song operation as Play Next Song, and the
@@ -1484,8 +1555,8 @@ remain available, and other players can see that the deck is exhausted and the
 game is awaiting Songmaster finalization.
 
 In `FINISHED`, the eventual Songmaster control is **Close Game**, which will
-invoke transition L. End Game, Close Game/transition L, and these browser
-controls are not implemented in the current domain/application increment.
+invoke transition L. Cancel Game, End Game, and Close Game are implemented as
+domain/application requests; these browser controls remain future UI work.
 
 Displayed position is not an exhaustion signal. For example, the last played
 song may retain original position 64 of 67 while positions 65–67 were consumed
@@ -1569,53 +1640,64 @@ min multiplier: 1.0x
 37. Unresolved rounds are voided on Songmaster loss.
 38. Provisional scoring is discarded on Songmaster loss.
 39. If Songmaster grace expires with zero connected players, the game is suspended in memory rather than ended; the first subsequently connected/joining player becomes Songmaster and resumes it.
-40. The Songmaster remains authoritative through `FINISHED`; only the Songmaster may close/reset the finished session.
-41. End Game always requires confirmation.
-42. End Game voids any unresolved current round.
-43. Loss of any current-round `playback_client` during `PLAYING` voids and consumes that round and returns to `ROUND_COMPLETE`.
-44. Active games need not survive server restart in V1.
-45. Completed game history persists indefinitely.
-46. Closing a finished live session never deletes historical record or browser-local identity.
-47. Preparation waits for all targets or timeout before evaluating READY targets.
-48. A target's first accepted READY/FAILED result is terminal for that preparation.
-49. Preparation failure does not consume the selected entry until Songmaster acknowledgement.
-50. Transition E creates the actual round and includes only READY targets as playback clients.
-51. Playback start, deadline, buzz receipt, elapsed time, and timeout scheduling
+40. The Songmaster remains authoritative through `FINISHED`; only the connected
+    Songmaster may close/reset the finished session through transition L.
+41. Cancel Game is legal only in `LOBBY`, returns directly to `NO_GAME`, and
+    creates neither standings nor completed history.
+42. End Game is legal only after Start Game and before `FINISHED`; the future UI
+    requires confirmation without adding a state.
+43. End Game from an actual-round state retains that round as a zero-award void;
+    End Game from `AUDIO_PREPARING` fabricates neither a round nor a void.
+44. Loss of any current-round `playback_client` during `PLAYING` voids and consumes that round and returns to `ROUND_COMPLETE`.
+45. Active games need not survive server restart in V1.
+46. Completed game history is intended to persist indefinitely, but its database
+    persistence remains unimplemented.
+47. Transition L clears the live session and game-local memberships while
+    browser-local tokens remain reusable with fresh membership facts.
+48. Preparation waits for all targets or timeout before evaluating READY targets.
+49. A target's first accepted READY/FAILED result is terminal for that preparation.
+50. Preparation failure does not consume the selected entry until Songmaster acknowledgement.
+51. Transition E creates the actual round and includes only READY targets as playback clients.
+52. Playback start, deadline, buzz receipt, elapsed time, and timeout scheduling
     use one authoritative monotonic clock domain; UTC is diagnostic only.
-52. A buzz is deadline-eligible only at or after monotonic playback start and
+53. A buzz is deadline-eligible only at or after monotonic playback start and
     strictly before the deadline.
-53. Client requests cannot supply authoritative buzz timing metadata.
-54. Buzz and timeout races retain global FIFO processing order; timers only
+54. Client requests cannot supply authoritative buzz timing metadata.
+55. Buzz and timeout races retain global FIFO processing order; timers only
     enqueue system events.
-55. F/G preserve the winner/elapsed-or-timeout outcome without assigning points,
+56. F/G preserve the winner/elapsed-or-timeout outcome without assigning points,
     revealing answer metadata, or consuming the played entry.
-56. Reveal is accepted only from the current connected Songmaster for the
+57. Reveal is accepted only from the current connected Songmaster for the
     current game and actual round in `AWAITING_REVEAL`.
-57. H reveals a buzz round and enters `SCORING` without consuming its entry or
+58. H reveals a buzz round and enters `SCORING` without consuming its entry or
     changing committed scores.
-58. I reveals a timeout round, records zero awarded points, consumes its entry
+59. I reveals a timeout round, records zero awarded points, consumes its entry
     exactly once, and enters normal `ROUND_COMPLETE` scanning.
-59. Revealed previous-song display survives `ROUND_COMPLETE`, preparation, and
+60. Revealed previous-song display survives `ROUND_COMPLETE`, preparation, and
     deck exhaustion; transition E alone replaces its position and hides the
     answer for the next actual round.
-60. The internal Python controller/domain results are not transport payloads;
+61. The internal Python controller/domain results are not transport payloads;
     future player-facing serialization must project only state-appropriate data.
-61. J uses the recorded BUZZ winner, trusted elapsed time, and frozen round
+62. J uses the recorded BUZZ winner, trusted elapsed time, and frozen round
     settings to award points, consumes the played entry once, and enters normal
     `ROUND_COMPLETE` scanning within the same request.
-62. A completed buzz round retains one current adjudication and award; correction
+63. A completed buzz round retains one current adjudication and award; correction
     replaces that award by net delta and never accumulates multiple awards.
-63. Score correction is round-scoped and legal only in `ROUND_COMPLETE` before
+64. Score correction is round-scoped and legal only in `ROUND_COMPLETE` before
     the next successful C or K; a rejected Play Song leaves it open, while a
     later preparation failure cannot reopen it.
-64. Timeout-completed rounds and `FINISHED` games are not score-correctable.
+65. Timeout-completed rounds and `FINISHED` games are not score-correctable.
     Exhaustion alone does not close final-round correction eligibility;
     explicit K closes it and freezes standings with the latest committed award.
-65. Exhausted `ROUND_COMPLETE` has its pointer at deck end, no next candidate,
+66. Exhausted `ROUND_COMPLETE` has its pointer at deck end, no next candidate,
     no active round/preparation, no frozen standings, and may retain correction
     eligibility for its last completed buzz round.
-66. Deck exhaustion and game finalization are distinct facts; only an
+67. Deck exhaustion and game finalization are distinct facts; only an
     authorized Play Song request takes K after exhaustion is established.
+68. `FINISHED` supports either natural deck exhaustion or voluntary early
+    termination; only natural K requires an exhausted deck.
+69. A voided round is distinct from a completed timeout round and retains no
+    accepted scoring choice or point award.
 
 ## 49. Future Directions
 

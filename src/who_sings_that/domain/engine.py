@@ -30,8 +30,10 @@ from .models import (
     ResolvedPlaylist,
     RoundTermination,
     RoundTerminationReason,
+    RoundVoidReason,
     SelectedPlaylistSnapshot,
     SkippedDeckEntry,
+    VoidedRound,
     normalize_player_name,
     player_name_uniqueness_key,
 )
@@ -195,6 +197,30 @@ class UnauthorizedScoreCorrectionError(GameEngineError):
     """Raised when correction is not requested by the connected Songmaster."""
 
 
+class CancelGameNotAllowedError(GameEngineError):
+    """Raised when Cancel Game does not target the current lobby."""
+
+
+class UnauthorizedCancelGameError(GameEngineError):
+    """Raised when Cancel Game is not requested by the connected Songmaster."""
+
+
+class EndGameNotAllowedError(GameEngineError):
+    """Raised when End Game is requested outside a started active state."""
+
+
+class UnauthorizedEndGameError(GameEngineError):
+    """Raised when End Game is not requested by the connected Songmaster."""
+
+
+class CloseGameNotAllowedError(GameEngineError):
+    """Raised when Close Game does not target the current finished game."""
+
+
+class UnauthorizedCloseGameError(GameEngineError):
+    """Raised when Close Game is not requested by the connected Songmaster."""
+
+
 class PreparationOutcome(Enum):
     """Outcome exposed internally after applying one preparation event."""
 
@@ -321,6 +347,31 @@ class GameEngine:
             raise
 
         return game
+
+    def cancel_game(
+        self,
+        game_session_id: UUID,
+        requesting_browser_token: str,
+    ) -> None:
+        """Cancel an unstarted lobby directly into ``NO_GAME``."""
+
+        if self._state is not GameState.LOBBY:
+            raise CancelGameNotAllowedError("Cancel Game is only allowed in LOBBY")
+        game = self._active_game
+        if game is None or game.game_session_id != game_session_id:
+            raise CancelGameNotAllowedError("Cancel Game targets a stale game")
+        token = self._validate_browser_token(
+            requesting_browser_token,
+            error_type=UnauthorizedCancelGameError,
+        )
+        if token != game.songmaster_browser_token or not game.songmaster.connected:
+            raise UnauthorizedCancelGameError(
+                "only the current connected Songmaster may cancel the game"
+            )
+        self._validate_state_invariants(GameState.LOBBY)
+
+        self._active_game = None
+        self._transition_to(GameState.NO_GAME)
 
     def select_playlist(
         self, requesting_browser_token: str, playlist_id: str
@@ -647,6 +698,89 @@ class GameEngine:
         game.scoring_correction_round_id = None
         self._transition_to(GameState.AUDIO_PREPARING)
         return pending
+
+    def end_game(
+        self,
+        game_session_id: UUID,
+        requesting_browser_token: str,
+    ) -> GameFinalizationResult:
+        """Voluntarily finalize a started game from any active gameplay state."""
+
+        legal_states = {
+            GameState.ROUND_COMPLETE,
+            GameState.AUDIO_PREPARING,
+            GameState.PLAYING,
+            GameState.AWAITING_REVEAL,
+            GameState.SCORING,
+        }
+        source_state = self._state
+        if source_state not in legal_states:
+            raise EndGameNotAllowedError(
+                "End Game is only allowed after Start Game and before FINISHED"
+            )
+        game = self._active_game
+        if game is None or game.game_session_id != game_session_id:
+            raise EndGameNotAllowedError("End Game targets a stale game")
+        token = self._validate_browser_token(
+            requesting_browser_token,
+            error_type=UnauthorizedEndGameError,
+        )
+        if token != game.songmaster_browser_token or not game.songmaster.connected:
+            raise UnauthorizedEndGameError(
+                "only the current connected Songmaster may end the game"
+            )
+        self._validate_state_invariants(source_state)
+
+        if source_state in {
+            GameState.PLAYING,
+            GameState.AWAITING_REVEAL,
+            GameState.SCORING,
+        }:
+            active_round = game.active_round
+            if not isinstance(active_round, ActiveRound):  # pragma: no cover
+                raise DomainInvariantError(
+                    f"{source_state.name} requires an actual round"
+                )
+            game.last_voided_round = VoidedRound(
+                active_round=active_round,
+                reason=RoundVoidReason.GAME_ENDED,
+                termination=game.round_termination,
+                answer_revealed=source_state is GameState.SCORING,
+            )
+
+        game.end_reason = GameEndReason.SONGMASTER_ENDED_GAME
+        self._transition_to(GameState.FINISHED)
+        return GameFinalizationResult(
+            end_reason=GameEndReason.SONGMASTER_ENDED_GAME,
+            final_standings=game.final_standings,
+        )
+
+    def close_game(
+        self,
+        game_session_id: UUID,
+        requesting_browser_token: str,
+    ) -> None:
+        """Apply transition L and discard the retained finished session."""
+
+        if self._state is not GameState.FINISHED:
+            raise CloseGameNotAllowedError(
+                "Close Game is only allowed in FINISHED"
+            )
+        game = self._active_game
+        if game is None or game.game_session_id != game_session_id:
+            raise CloseGameNotAllowedError("Close Game targets a stale game")
+        token = self._validate_browser_token(
+            requesting_browser_token,
+            error_type=UnauthorizedCloseGameError,
+        )
+        if token != game.songmaster_browser_token or not game.songmaster.connected:
+            raise UnauthorizedCloseGameError(
+                "only the current connected Songmaster may close the game"
+            )
+        self._validate_state_invariants(GameState.FINISHED)
+
+        self._active_game = None
+        self._transition_to(GameState.NO_GAME)
 
     def record_audio_preparation_ready(
         self,
@@ -1790,6 +1924,8 @@ class GameEngine:
             raise DomainInvariantError("LOBBY cannot have round termination facts")
         if game.last_completed_round is not None:
             raise DomainInvariantError("LOBBY cannot have a completed round")
+        if game.last_voided_round is not None:
+            raise DomainInvariantError("LOBBY cannot have a voided round")
         if game.scoring_correction_round_id is not None:
             raise DomainInvariantError("LOBBY cannot have a score correction window")
         if game.pending_audio_preparation is not None:
@@ -2110,6 +2246,8 @@ class GameEngine:
         )
         if game.active_round is not None:
             raise DomainInvariantError("ROUND_COMPLETE cannot have an active round")
+        if game.last_voided_round is not None:
+            raise DomainInvariantError("ROUND_COMPLETE cannot have a voided round")
         if game.round_termination is not None:
             raise DomainInvariantError(
                 "ROUND_COMPLETE cannot have round termination facts"
@@ -2180,6 +2318,8 @@ class GameEngine:
             raise DomainInvariantError(
                 "AUDIO_PREPARING cannot have an active played round"
             )
+        if game.last_voided_round is not None:
+            raise DomainInvariantError("AUDIO_PREPARING cannot have a voided round")
         if game.round_termination is not None:
             raise DomainInvariantError(
                 "AUDIO_PREPARING cannot have round termination facts"
@@ -2335,6 +2475,8 @@ class GameEngine:
         active_round = game.active_round
         if not isinstance(active_round, ActiveRound):
             raise DomainInvariantError(f"{state_name} requires an actual round")
+        if game.last_voided_round is not None:
+            raise DomainInvariantError(f"{state_name} cannot have a voided round")
         if active_round.deck_entry is not deck[game.deck_pointer]:
             raise DomainInvariantError(
                 "the actual round must bind the unconsumed deck entry under the pointer"
@@ -2556,24 +2698,179 @@ class GameEngine:
             raise DomainInvariantError(
                 "FINISHED cannot retain a score correction window"
             )
-        if game.deck_pointer != len(deck) or game.deck_exhausted is not True:
-            raise DomainInvariantError(
-                "deck-exhausted FINISHED requires the pointer at deck end"
-            )
-        if game.end_reason is not GameEndReason.DECK_EXHAUSTED:
-            raise DomainInvariantError(
-                "transition K requires deck_exhausted as end reason"
-            )
+        if game.end_reason is GameEndReason.DECK_EXHAUSTED:
+            if game.deck_pointer != len(deck) or game.deck_exhausted is not True:
+                raise DomainInvariantError(
+                    "deck-exhausted FINISHED requires the pointer at deck end"
+                )
+            if game.last_voided_round is not None:
+                raise DomainInvariantError(
+                    "natural completion cannot retain a voided round"
+                )
+        elif game.end_reason is GameEndReason.SONGMASTER_ENDED_GAME:
+            if game.last_voided_round is not None:
+                self._validate_last_voided_round(game, deck)
+        else:
+            raise DomainInvariantError("FINISHED requires a supported end reason")
         if not isinstance(game.ended_at, datetime):
             raise DomainInvariantError("FINISHED requires a game end timestamp")
         if not isinstance(game.final_standings, tuple):
             raise DomainInvariantError("final standings must be immutable")
-        self._validate_completed_round_display(
-            game,
-            state_name="FINISHED",
-        )
+        if game.last_voided_round is None:
+            self._validate_completed_round_display(
+                game,
+                state_name="FINISHED",
+            )
         expected_standings = self._calculate_final_standings(game)
         if game.final_standings != expected_standings:
             raise DomainInvariantError(
                 "final standings must match finalized member scores"
+            )
+
+    def _validate_last_voided_round(self, game: GameSession, deck: Deck) -> None:
+        """Validate the bounded unfinished-round snapshot retained in FINISHED."""
+
+        voided = game.last_voided_round
+        if not isinstance(voided, VoidedRound):
+            raise DomainInvariantError("a voided round must be an immutable snapshot")
+        active_round = voided.active_round
+        if not isinstance(active_round, ActiveRound):
+            raise DomainInvariantError("a voided round must retain actual-round facts")
+        position = active_round.original_deck_position
+        if (
+            not 1 <= position <= len(deck)
+            or active_round.deck_entry is not deck[position - 1]
+            or active_round.track_id != active_round.deck_entry.track.track_id
+            or active_round.original_deck_position
+            != active_round.deck_entry.original_position
+        ):
+            raise DomainInvariantError(
+                "a voided round must retain its original deck entry"
+            )
+        if game.deck_pointer != position - 1 or game.deck_exhausted is not False:
+            raise DomainInvariantError(
+                "a voluntarily voided round must remain under the deck pointer"
+            )
+        if not isinstance(active_round.round_id, UUID) or not isinstance(
+            active_round.preparation_id, UUID
+        ):
+            raise DomainInvariantError(
+                "voided round and preparation identities must be UUIDs"
+            )
+        if not isinstance(active_round.playback_started_at, datetime):
+            raise DomainInvariantError(
+                "a voided round must retain its UTC playback timestamp"
+            )
+        started_monotonic = self._validated_monotonic_timestamp(
+            active_round.playback_started_monotonic,
+            error_type=DomainInvariantError,
+            name="voided playback monotonic start",
+        )
+        deadline_monotonic = self._validated_monotonic_timestamp(
+            active_round.playback_deadline_monotonic,
+            error_type=DomainInvariantError,
+            name="voided playback monotonic deadline",
+        )
+        if deadline_monotonic != (
+            started_monotonic + active_round.playback_duration_seconds
+        ):
+            raise DomainInvariantError(
+                "voided playback deadline must retain its start and duration"
+            )
+        if (
+            active_round.configured_playback_offset_seconds
+            != game.settings.playback_offset_seconds
+            or active_round.playback_duration_seconds
+            != game.settings.playback_duration_seconds
+            or active_round.speed_bonus_plateau_percent
+            != game.settings.speed_bonus_plateau_percent
+        ):
+            raise DomainInvariantError(
+                "a voided round must retain its settings snapshot"
+            )
+        expected_offset = calculate_effective_playback_offset(
+            active_round.deck_entry.track,
+            active_round.configured_playback_offset_seconds,
+            active_round.playback_duration_seconds,
+        )
+        if active_round.effective_playback_offset_seconds != expected_offset:
+            raise DomainInvariantError(
+                "voided round effective offset is inconsistent"
+            )
+        if not isinstance(
+            active_round.buzz_eligible_browser_tokens, frozenset
+        ) or not isinstance(active_round.playback_clients, frozenset):
+            raise DomainInvariantError(
+                "voided eligibility and playback clients must be immutable"
+            )
+        if not active_round.playback_clients or not (
+            active_round.playback_clients
+            <= active_round.buzz_eligible_browser_tokens
+            <= frozenset(game.members)
+        ):
+            raise DomainInvariantError(
+                "voided playback clients and eligibility are inconsistent"
+            )
+        if voided.reason is not RoundVoidReason.GAME_ENDED:
+            raise DomainInvariantError("voided-round reason is not supported")
+        if not isinstance(voided.answer_revealed, bool):
+            raise DomainInvariantError("voided answer-reveal status must be boolean")
+
+        termination = voided.termination
+        if termination is not None:
+            if not isinstance(termination, RoundTermination):
+                raise DomainInvariantError(
+                    "voided termination facts must be immutable"
+                )
+            if termination.reason is RoundTerminationReason.BUZZ:
+                winner = termination.winning_browser_token
+                if (
+                    winner not in game.members
+                    or winner not in active_round.buzz_eligible_browser_tokens
+                ):
+                    raise DomainInvariantError(
+                        "a voided buzz termination requires its eligible winner"
+                    )
+                elapsed = self._validated_monotonic_timestamp(
+                    termination.buzz_elapsed_seconds,
+                    error_type=DomainInvariantError,
+                    name="voided buzz elapsed time",
+                )
+                if not 0 <= elapsed < active_round.playback_duration_seconds:
+                    raise DomainInvariantError(
+                        "voided buzz elapsed time must be within playback"
+                    )
+            elif termination.reason is RoundTerminationReason.PLAYBACK_TIMEOUT:
+                if (
+                    termination.winning_browser_token is not None
+                    or termination.buzz_elapsed_seconds is not None
+                ):
+                    raise DomainInvariantError(
+                        "a voided timeout cannot contain buzz winner facts"
+                    )
+            else:
+                raise DomainInvariantError(
+                    "voided-round termination reason is not supported"
+                )
+        if voided.answer_revealed and (
+            termination is None
+            or termination.reason is not RoundTerminationReason.BUZZ
+        ):
+            raise DomainInvariantError(
+                "a revealed void requires the prior buzz termination"
+            )
+
+        if game.displayed_deck_position != position:
+            raise DomainInvariantError(
+                "FINISHED must preserve the voided round's displayed position"
+            )
+        if voided.answer_revealed:
+            artist, title = self._answer_for_reveal(active_round)
+            if game.displayed_artist != artist or game.displayed_title != title:
+                raise DomainInvariantError(
+                    "FINISHED must preserve the revealed voided answer"
+                )
+        elif game.displayed_artist is not None or game.displayed_title is not None:
+            raise DomainInvariantError(
+                "FINISHED cannot reveal an unanswered voided round"
             )

@@ -39,6 +39,13 @@ class GameEndReason(Enum):
     """Authoritative reasons a game entered ``FINISHED``."""
 
     DECK_EXHAUSTED = "deck_exhausted"
+    SONGMASTER_ENDED_GAME = "songmaster_ended_game"
+
+
+class RoundVoidReason(Enum):
+    """Authoritative reasons an actual played round was left unfinished."""
+
+    GAME_ENDED = "game_ended"
 
 
 class RoundTerminationReason(Enum):
@@ -235,6 +242,16 @@ class CompletedRound:
 
 
 @dataclass(frozen=True, slots=True)
+class VoidedRound:
+    """The bounded immutable snapshot of an unfinished actual round."""
+
+    active_round: ActiveRound
+    reason: RoundVoidReason
+    termination: RoundTermination | None
+    answer_revealed: bool
+
+
+@dataclass(frozen=True, slots=True)
 class SelectedPlaylistSnapshot:
     """Immutable playlist metadata captured when a game starts."""
 
@@ -278,7 +295,7 @@ class FinalStanding:
 
 @dataclass(frozen=True, slots=True)
 class GameFinalizationResult:
-    """Successful transition-K result returned by the Play Song operation."""
+    """Successful natural or voluntary game-finalization result."""
 
     end_reason: GameEndReason
     final_standings: tuple[FinalStanding, ...]
@@ -308,6 +325,7 @@ class GameSession:
     active_round: ActiveRound | None = None
     round_termination: RoundTermination | None = None
     last_completed_round: CompletedRound | None = None
+    last_voided_round: VoidedRound | None = None
     scoring_correction_round_id: UUID | None = None
     pending_audio_preparation: PendingAudioPreparation | None = None
     audio_preparation_responses: AudioPreparationResponseState | None = None
