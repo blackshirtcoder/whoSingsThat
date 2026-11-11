@@ -381,27 +381,34 @@ New players may join in `LOBBY` and in every started gameplay state through
 New members begin with zero committed points, audio disabled, and no usable
 browser-audio capability. They cannot replace the existing Songmaster.
 
-A player joining during an active round immediately sees synchronized game state and standings but may not buzz in that already-active round.
+A player joining during an active round immediately sees synchronized game state
+and standings but may not buzz in that already-active round.
 
-A player who refreshes/reconnects during an active round likewise loses buzz eligibility for the remainder of that round.
-
-The buzz-eligible player set is snapshotted on transition C, `ROUND_COMPLETE → AUDIO_PREPARING`, before audio preparation begins. A player who joins or reconnects after that snapshot may observe the pending/current round but may not buzz in it.
+The buzz-eligible player set is snapshotted on transition C, `ROUND_COMPLETE →
+AUDIO_PREPARING`, before audio preparation begins. A genuinely new member who
+joins after that snapshot may observe the pending/current round but may not buzz
+in it. An existing member who was included in the snapshot remains eligible by
+browser token: disconnect prevents that member from buzzing only while
+disconnected, and the member may buzz again after successfully reconnecting
+through the current authoritative connection while the round remains open. An
+existing member who was not connected at transition C is absent from the
+snapshot and cannot gain eligibility by reconnecting later in the song.
 
 Reconnect by a recognized token preserves the stored display name, membership,
 role, committed score, and audio-enabled preference without accepting a new
 name. It replaces the prior authoritative connection and resets the new
-connection's initialized/unlocked browser-audio capability to false. A bounded
-current-song disqualification records that a member whose connection changed
-after transition C cannot reuse their token's presence in the frozen snapshot.
-That disqualification survives through preparation, playback, reveal, and
-scoring, then clears when normal `ROUND_COMPLETE` entry ends the song. A later
-transition C can include the reconnected member again.
+connection's initialized/unlocked browser-audio capability to false. It does
+not restore local audio playback, make the new connection READY for preparation,
+or change the immutable preparation-target or playback-client snapshots.
 
 A duplicate registration of the exact same live connection changes no domain
-fact and does not revoke buzz eligibility. A legitimate replacement or
-reconnection is different and invalidates eligibility for the current song.
-Buzz requests are accepted only from the member's current connection; a merely
-snapshotted or disconnected token is insufficient.
+fact and does not change buzz eligibility. A legitimate replacement or
+reconnection changes the authoritative connection but does not change the
+frozen token-based eligibility snapshot. Buzz requests are accepted only from
+the member's current authoritative connection; a merely snapshotted or
+disconnected token is insufficient, and a stale predecessor connection is
+rejected. Connection identity establishes whether a request is currently
+authoritative, not whether the member was present when the song began.
 
 Disconnecting does not remove a player from the game. Scores and game membership persist while the game exists.
 
@@ -887,7 +894,11 @@ Internal work:
 - keep old song display visible;
 - keep buzzing disabled.
 
-A pending preparation context is allowed, but this is not yet a played round. The prospective round's buzz-eligible player set is already frozen from transition C; players joining or reconnecting during preparation are observers for this round.
+A pending preparation context is allowed, but this is not yet a played round.
+The prospective round's buzz-eligible player set is already frozen from
+transition C. New members joining during preparation are observers for this
+round. Reconnecting neither adds a missing token nor removes a token already in
+that snapshot.
 
 Every targeted client begins with status `PENDING`. A target's first accepted
 `READY` or `FAILED` response is terminal and cannot be replaced. Evaluate the
@@ -1696,7 +1707,9 @@ min multiplier: 1.0x
 14. Audio preparation failure consumes/skips that candidate only after SM acknowledges failure.
 15. Old revealed-song display remains visible through `ROUND_COMPLETE` and `AUDIO_PREPARING`.
 16. Artist/title are blanked only when the next round begins.
-17. Round buzz eligibility is snapshotted on transition C before `AUDIO_PREPARING`; joins/reconnects after that snapshot are observers for that round.
+17. Round buzz eligibility is snapshotted by browser token on transition C
+    before `AUDIO_PREPARING`; later joins do not enter that snapshot, while a
+    reconnect neither adds nor removes existing snapshot membership.
 18. First valid buzz wins.
 19. Buzz and timeout are mutually exclusive terminating events.
 20. `AWAITING_REVEAL` disables buzzing and preserves the played entry under the
@@ -1714,7 +1727,9 @@ min multiplier: 1.0x
 31. Game settings/audio preference may change only while no round is active.
 32. Player names do not change after joining.
 33. Disconnected players retain identity and score.
-34. Mid-round join/reconnect does not grant current-round buzz eligibility.
+34. A new mid-round member cannot buzz; a snapshotted member may resume buzzing
+    after reconnecting through the current authoritative connection, while a
+    member absent from the snapshot cannot gain eligibility by reconnecting.
 35. Songmaster transfer is manual only in `LOBBY` or `ROUND_COMPLETE`.
 36. Unexpected Songmaster loss may invoke automatic failover.
 37. Unresolved rounds are voided on Songmaster loss.
@@ -1786,8 +1801,10 @@ min multiplier: 1.0x
     capability/preparation/buzz facts.
 73. A connection replacement resets browser-audio capability but preserves the
     member's game-local identity, score, role, and audio preference.
-74. Joining or reconnecting after transition C cannot add or restore buzz
-    eligibility for that song; the next transition C may restore eligibility.
+74. Joining after transition C cannot add eligibility for that song. An
+    originally snapshotted member may buzz after reconnecting if currently
+    connected through the authoritative connection; reconnecting does not
+    restore local audio playback.
 75. Cancel Game and transition L clear the former game's connection registry
     associations; FINISHED retains them until Close Game.
 

@@ -694,7 +694,6 @@ class GameEngine:
         )
 
         game.pending_audio_preparation = pending
-        game.buzz_disqualified_browser_tokens.clear()
         game.audio_preparation_responses = AudioPreparationResponseState(
             preparation_id=preparation_id,
             target_statuses={
@@ -933,10 +932,6 @@ class GameEngine:
         if token not in active_round.buzz_eligible_browser_tokens:
             raise BuzzNotAllowedError(
                 "the requesting member is not eligible for this round"
-            )
-        if token in game.buzz_disqualified_browser_tokens:
-            raise BuzzNotAllowedError(
-                "the requesting member lost eligibility after connection change"
             )
 
         receipt = self._validated_monotonic_timestamp(
@@ -1429,7 +1424,7 @@ class GameEngine:
         This is an internal membership operation, not a state transition.
         ``connection_changed`` is supplied by the serialized application
         registry so an idempotent repeat for the same live connection does not
-        reset capability or current-song eligibility.
+        reset its connection-specific audio capability.
         """
 
         game = self._game_for_membership_operation(allow_finished=False)
@@ -1444,19 +1439,15 @@ class GameEngine:
                 return existing_member
             was_connected = existing_member.connected
             was_audio_usable = existing_member.browser_audio_usable
-            was_disqualified = token in game.buzz_disqualified_browser_tokens
             existing_member.connected = True
             # A new connection must initialize/unlock audio for itself; a prior
             # connection's capability assertion is never inherited.
             existing_member.browser_audio_usable = False
-            self._disqualify_member_for_current_song(game, token)
             try:
                 self._validate_state_invariants(self._state)
             except Exception:
                 existing_member.connected = was_connected
                 existing_member.browser_audio_usable = was_audio_usable
-                if not was_disqualified:
-                    game.buzz_disqualified_browser_tokens.discard(token)
                 raise
             return existing_member
 
@@ -1513,17 +1504,13 @@ class GameEngine:
 
         was_connected = member.connected
         was_audio_usable = member.browser_audio_usable
-        was_disqualified = token in game.buzz_disqualified_browser_tokens
         member.connected = False
         member.browser_audio_usable = False
-        self._disqualify_member_for_current_song(game, token)
         try:
             self._validate_state_invariants(self._state)
         except Exception:
             member.connected = was_connected
             member.browser_audio_usable = was_audio_usable
-            if not was_disqualified:
-                game.buzz_disqualified_browser_tokens.discard(token)
             raise
         return member
 
@@ -1554,17 +1541,13 @@ class GameEngine:
 
         was_connected = member.connected
         was_audio_usable = member.browser_audio_usable
-        was_disqualified = token in game.buzz_disqualified_browser_tokens
         member.connected = True
         member.browser_audio_usable = False
-        self._disqualify_member_for_current_song(game, token)
         try:
             self._validate_state_invariants(self._state)
         except Exception:
             member.connected = was_connected
             member.browser_audio_usable = was_audio_usable
-            if not was_disqualified:
-                game.buzz_disqualified_browser_tokens.discard(token)
             raise
         return member
 
@@ -1757,20 +1740,6 @@ class GameEngine:
         self._validate_state_invariants(self._state)
         return game
 
-    @staticmethod
-    def _disqualify_member_for_current_song(
-        game: GameSession, browser_token: str
-    ) -> None:
-        """Prevent a changed connection from reusing a frozen song snapshot."""
-
-        snapshot: frozenset[str] = frozenset()
-        if game.pending_audio_preparation is not None:
-            snapshot = game.pending_audio_preparation.buzz_eligible_browser_tokens
-        elif game.active_round is not None:
-            snapshot = game.active_round.buzz_eligible_browser_tokens
-        if browser_token in snapshot:
-            game.buzz_disqualified_browser_tokens.add(browser_token)
-
     def _lobby_game_for_playlist_selection(
         self, requesting_browser_token: str
     ) -> GameSession:
@@ -1844,7 +1813,6 @@ class GameEngine:
         game.skipped_deck_entries += new_skips
         game.deck_pointer = selection.deck_pointer
         game.deck_exhausted = selection.exhausted
-        game.buzz_disqualified_browser_tokens.clear()
         # Player-facing display fields are intentionally untouched here.
 
     def _enter_audio_preparing(self) -> None:
@@ -1931,7 +1899,6 @@ class GameEngine:
         game.pending_audio_preparation = None
         game.audio_preparation_responses = None
         game.scoring_correction_round_id = None
-        game.buzz_disqualified_browser_tokens.clear()
         game.buzzing_enabled = False
 
     @staticmethod
@@ -2033,10 +2000,6 @@ class GameEngine:
             raise DomainInvariantError("LOBBY cannot have preparation responses")
         if game.buzzing_enabled is not False:
             raise DomainInvariantError("buzzing must be disabled in LOBBY")
-        if game.buzz_disqualified_browser_tokens:
-            raise DomainInvariantError(
-                "LOBBY cannot retain current-song disqualifications"
-            )
         if game.playlist_selection_editable is not True:
             raise DomainInvariantError("playlist selection must be editable in LOBBY")
         if any(
@@ -2111,12 +2074,6 @@ class GameEngine:
             raise DomainInvariantError(
                 f"{state_name} requires a connected Songmaster until the "
                 "disconnect overlay exists"
-            )
-        if not isinstance(game.buzz_disqualified_browser_tokens, set) or not (
-            game.buzz_disqualified_browser_tokens <= set(game.members)
-        ):
-            raise DomainInvariantError(
-                "current-song buzz disqualifications must be a member-token set"
             )
 
     def _validate_started_game_facts(
@@ -2379,10 +2336,6 @@ class GameEngine:
             )
         if game.final_standings != ():
             raise DomainInvariantError("ROUND_COMPLETE cannot have final standings")
-        if game.buzz_disqualified_browser_tokens:
-            raise DomainInvariantError(
-                "ROUND_COMPLETE cannot retain current-song disqualifications"
-            )
         correction_round_id = game.scoring_correction_round_id
         completed = game.last_completed_round
         if correction_round_id is not None and (
@@ -2561,12 +2514,6 @@ class GameEngine:
             raise DomainInvariantError(
                 "audio targets must be connected prospective players"
             )
-        if not game.buzz_disqualified_browser_tokens <= set(
-            pending.buzz_eligible_browser_tokens
-        ):
-            raise DomainInvariantError(
-                "preparation disqualifications must belong to its frozen snapshot"
-            )
         self._validate_completed_round_display(
             game,
             state_name="AUDIO_PREPARING",
@@ -2655,12 +2602,6 @@ class GameEngine:
             )
         if not active_round.buzz_eligible_browser_tokens <= frozenset(game.members):
             raise DomainInvariantError("round eligibility must contain only members")
-        if not game.buzz_disqualified_browser_tokens <= set(
-            active_round.buzz_eligible_browser_tokens
-        ):
-            raise DomainInvariantError(
-                "round disqualifications must belong to its frozen snapshot"
-            )
         if game.pending_audio_preparation is not None:
             raise DomainInvariantError(
                 f"{state_name} cannot retain a pending preparation"
@@ -2815,10 +2756,6 @@ class GameEngine:
         if game.scoring_correction_round_id is not None:
             raise DomainInvariantError(
                 "FINISHED cannot retain a score correction window"
-            )
-        if game.buzz_disqualified_browser_tokens:
-            raise DomainInvariantError(
-                "FINISHED cannot retain current-song disqualifications"
             )
         if game.end_reason is GameEndReason.DECK_EXHAUSTED:
             if game.deck_pointer != len(deck) or game.deck_exhausted is not True:

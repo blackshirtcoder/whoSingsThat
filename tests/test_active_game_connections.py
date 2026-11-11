@@ -7,7 +7,6 @@ import pytest
 from sqlalchemy import Engine
 
 from who_sings_that.application import (
-    AudioPreparationFailedEvent,
     AudioPreparationReadyEvent,
     AudioPreparationTimeoutEvent,
     BrowserAudioCapabilityChangedEvent,
@@ -19,10 +18,7 @@ from who_sings_that.application import (
     GameController,
     JoinGameRequest,
     MemberDisconnectedEvent,
-    PlaybackTimeoutEvent,
-    PlaySongRequest,
     RegisterConnectionRequest,
-    RevealRequest,
     StaleConnectionError,
 )
 from who_sings_that.database import create_sqlite_engine, upgrade_database
@@ -229,6 +225,51 @@ def test_new_member_can_join_started_states_without_current_song_eligibility(
     assert "late-token" not in snapshot
 
 
+def test_new_member_joining_round_complete_is_eligible_at_next_transition_c() -> None:
+    engine, _ = started_engine()
+
+    member = engine.join_game("late-token", "Late Player")
+    pending = engine.play_song("songmaster-token")
+
+    assert member.connected is True
+    assert "late-token" in pending.buzz_eligible_browser_tokens
+
+
+def test_join_during_preparation_stays_ineligible_until_subsequent_transition_c(
+) -> None:
+    engine, monotonic_clock = started_engine()
+    pending = engine.play_song("songmaster-token")
+    late_member = engine.join_game("late-token", "Late Player")
+
+    assert "late-token" not in pending.buzz_eligible_browser_tokens
+    engine.record_audio_preparation_ready(
+        GAME_IDS[0], pending.preparation_id, "songmaster-token"
+    )
+    game = engine.active_game
+    assert game is not None and game.active_round is not None
+    first_round = game.active_round
+    monotonic_clock.value = first_round.playback_started_monotonic + 1
+
+    with pytest.raises(BuzzNotAllowedError, match="not eligible"):
+        engine.accept_buzz(
+            GAME_IDS[0],
+            first_round.round_id,
+            late_member.browser_token,
+            monotonic_clock.value,
+        )
+
+    monotonic_clock.value = first_round.playback_deadline_monotonic
+    engine.playback_timed_out(
+        GAME_IDS[0], first_round.round_id, monotonic_clock.value
+    )
+    engine.reveal_answer(
+        GAME_IDS[0], first_round.round_id, "songmaster-token"
+    )
+    next_pending = engine.play_song("songmaster-token")
+
+    assert "late-token" in next_pending.buzz_eligible_browser_tokens
+
+
 def test_join_is_rejected_after_game_is_finished() -> None:
     engine, _ = started_engine()
     engine.end_game(GAME_IDS[0], "songmaster-token")
@@ -238,32 +279,63 @@ def test_join_is_rejected_after_game_is_finished() -> None:
 
 
 @pytest.mark.asyncio
-async def test_replacement_stale_disconnect_and_current_song_buzz_ineligibility(
+async def test_fifo_disconnect_reconnect_stale_events_then_current_connection_buzz_wins(
     controller_storage: tuple[Engine, Path],
 ) -> None:
-    """Focused manual integration target for connection replacement behavior."""
+    """Exercise reconnect-then-buzz through the one authoritative FIFO."""
 
-    engine, monotonic_clock = playing_engine()
+    engine, monotonic_clock = started_engine()
+    engine.set_audio_preference("player-token", True)
+    pending = engine.play_song("songmaster-token")
+    engine.record_audio_preparation_ready(
+        GAME_IDS[0], pending.preparation_id, "songmaster-token"
+    )
+    engine.set_browser_audio_capability("player-token", True)
     game = engine.active_game
     assert game is not None and game.active_round is not None
-    first_round_id = game.active_round.round_id
+    active_round = game.active_round
+    original_eligibility = active_round.buzz_eligible_browser_tokens
     player = game.members["player-token"]
-    player.audio_enabled = True
-    player.browser_audio_usable = True
     player.committed_score = 77
     controller = controller_for_engine(controller_storage, engine)
     await controller.start()
 
-    replacement = await controller.submit_request(
+    controller.post_system_event(
+        MemberDisconnectedEvent(
+            GAME_IDS[0], "player-token", "player-connection-a"
+        )
+    )
+    await controller.submit_request(
+        RegisterConnectionRequest(
+            GAME_IDS[0], "songmaster-token", "songmaster-connection"
+        )
+    )
+    assert player.connected is False
+    assert engine.state is GameState.PLAYING
+    with pytest.raises(StaleConnectionError):
+        await controller.submit_request(
+            BuzzRequest(
+                GAME_IDS[0],
+                active_round.round_id,
+                "player-token",
+                "player-connection-a",
+            )
+        )
+
+    reconnection = await controller.submit_request(
         RegisterConnectionRequest(
             GAME_IDS[0], "player-token", "player-connection-b"
         )
     )
-    assert replacement.status is ConnectionRegistrationStatus.REPLACED
+    assert reconnection.status is ConnectionRegistrationStatus.REPLACED
+    assert player.connected is True
     assert player.display_name == "Player"
     assert player.committed_score == 77
+    assert game.songmaster_browser_token == "songmaster-token"
     assert player.audio_enabled is True
     assert player.browser_audio_usable is False
+    assert game.active_round is active_round
+    assert active_round.buzz_eligible_browser_tokens is original_eligibility
 
     controller.post_system_event(
         MemberDisconnectedEvent(
@@ -288,80 +360,31 @@ async def test_replacement_stale_disconnect_and_current_song_buzz_ineligibility(
         isinstance(rejection.error, StaleConnectionError)
         for rejection in controller.system_event_rejections
     )
+    assert active_round.buzz_eligible_browser_tokens is original_eligibility
 
-    controller.post_system_event(
-        BrowserAudioCapabilityChangedEvent(
-            GAME_IDS[0], "player-token", "player-connection-b", True
-        )
-    )
-    await controller.submit_request(
-        RegisterConnectionRequest(
-            GAME_IDS[0], "player-token", "player-connection-b"
-        )
-    )
-    assert player.browser_audio_usable is True
-
-    with pytest.raises(BuzzNotAllowedError):
+    with pytest.raises(StaleConnectionError):
         await controller.submit_request(
             BuzzRequest(
                 GAME_IDS[0],
-                first_round_id,
+                active_round.round_id,
                 "player-token",
-                "player-connection-b",
+                "player-connection-a",
             )
         )
 
-    monotonic_clock.value = game.active_round.playback_deadline_monotonic
-    controller.post_system_event(
-        PlaybackTimeoutEvent(GAME_IDS[0], first_round_id)
-    )
-    await controller.submit_request(
-        RevealRequest(GAME_IDS[0], first_round_id, "songmaster-token")
-    )
-    controller.post_system_event(
-        BrowserAudioCapabilityChangedEvent(
-            GAME_IDS[0],
-            "songmaster-token",
-            "songmaster-connection",
-            True,
-        )
-    )
-    pending = await controller.submit_request(
-        PlaySongRequest(GAME_IDS[0], "songmaster-token")
-    )
-    controller.post_system_event(
-        AudioPreparationReadyEvent(
-            GAME_IDS[0],
-            pending.preparation_id,
-            "songmaster-token",
-            "songmaster-connection",
-        )
-    )
-    controller.post_system_event(
-        AudioPreparationFailedEvent(
-            GAME_IDS[0],
-            pending.preparation_id,
-            "player-token",
-            "player-connection-b",
-        )
-    )
-    await controller.submit_request(
-        RegisterConnectionRequest(
-            GAME_IDS[0], "player-token", "player-connection-b"
-        )
-    )
-    assert game.active_round is not None
-    monotonic_clock.value = game.active_round.playback_started_monotonic + 1
+    monotonic_clock.value = active_round.playback_started_monotonic + 1
 
     termination = await controller.submit_request(
         BuzzRequest(
             GAME_IDS[0],
-            game.active_round.round_id,
+            active_round.round_id,
             "player-token",
             "player-connection-b",
         )
     )
     assert termination.reason is RoundTerminationReason.BUZZ
+    assert termination.winning_browser_token == "player-token"
+    assert engine.state is GameState.AWAITING_REVEAL
     await controller.stop()
 
 
