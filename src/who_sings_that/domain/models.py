@@ -47,6 +47,24 @@ class RoundVoidReason(Enum):
 
     GAME_ENDED = "game_ended"
     PLAYBACK_CLIENT_LOST = "playback_client_lost"
+    SONGMASTER_DISCONNECTED = "songmaster_disconnected"
+
+
+class SongmasterRecoveryStatus(Enum):
+    """The explicit suspension overlay applied to a normal game state."""
+
+    RECONNECT_GRACE = "sm_reconnect_grace"
+    INDEFINITE_SUSPENSION = "sm_indefinite_suspension"
+
+
+class SongmasterRecoveryResolution(Enum):
+    """How the most recent Songmaster recovery process completed."""
+
+    ORIGINAL_RECONNECTED = "original_reconnected"
+    AUTOMATIC_FAILOVER = "automatic_failover"
+    RESUMED_AFTER_INDEFINITE_SUSPENSION = (
+        "resumed_after_indefinite_suspension"
+    )
 
 
 class RoundTerminationReason(Enum):
@@ -121,6 +139,7 @@ class GameMember:
     browser_token: str
     display_name: str
     name_uniqueness_key: str
+    join_order: int = 0
     committed_score: int = 0
     connected: bool = True
     audio_enabled: bool = False
@@ -303,6 +322,34 @@ class GameFinalizationResult:
     final_standings: tuple[FinalStanding, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class SongmasterRecovery:
+    """Authoritative facts for one active recovery/suspension overlay."""
+
+    recovery_id: UUID
+    status: SongmasterRecoveryStatus
+    original_songmaster_browser_token: str
+    interrupted_state: GameState
+    normalized_state: GameState
+    started_at_monotonic: float
+    grace_deadline_monotonic: float | None
+    preparation_discarded: bool
+    voided_round_id: UUID | None
+
+
+@dataclass(frozen=True, slots=True)
+class SongmasterRecoveryOutcome:
+    """Inspectible facts retained after a recovery overlay is resolved."""
+
+    recovery_id: UUID
+    resolution: SongmasterRecoveryResolution
+    original_songmaster_browser_token: str
+    resulting_songmaster_browser_token: str
+    interrupted_state: GameState
+    resumed_state: GameState
+    voided_round_id: UUID | None
+
+
 @dataclass(slots=True)
 class GameSession:
     """The live in-memory aggregate for the currently implemented states."""
@@ -312,6 +359,8 @@ class GameSession:
     settings: GameSettings
     members: dict[str, GameMember]
     songmaster_browser_token: str
+    songmaster_recovery: SongmasterRecovery | None = None
+    last_songmaster_recovery_outcome: SongmasterRecoveryOutcome | None = None
     selected_playlist_ids: set[str] | frozenset[str] = field(default_factory=set)
     playlist_selection_editable: bool = True
     selected_playlist_snapshots: tuple[SelectedPlaylistSnapshot, ...] = ()

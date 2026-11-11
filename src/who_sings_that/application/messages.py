@@ -91,6 +91,15 @@ class SetAudioPreferenceRequest(ClientRequest):
 
 
 @dataclass(frozen=True, slots=True)
+class TransferSongmasterRequest(ClientRequest):
+    """Voluntarily transfer the role to another connected member."""
+
+    game_session_id: UUID
+    requesting_browser_token: str
+    recipient_browser_token: str
+
+
+@dataclass(frozen=True, slots=True)
 class PlaySongRequest(ClientRequest):
     """Request transition C or K from the connected Songmaster."""
 
@@ -221,6 +230,14 @@ class PlaybackTimeoutEvent(SystemEvent):
     round_id: UUID
 
 
+@dataclass(frozen=True, slots=True)
+class SongmasterReconnectGraceExpiredEvent(SystemEvent):
+    """Application timer expiry for one recovery generation."""
+
+    game_session_id: UUID
+    recovery_id: UUID
+
+
 AuthoritativeMessage = ClientRequest | SystemEvent
 
 
@@ -248,6 +265,8 @@ __all__ = [
     "RevealRequest",
     "SelectPlaylistRequest",
     "SetAudioPreferenceRequest",
+    "SongmasterReconnectGraceExpiredEvent",
     "StartGameRequest",
     "SystemEvent",
+    "TransferSongmasterRequest",
 ]

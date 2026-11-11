@@ -157,6 +157,7 @@ def test_ineligible_and_disconnected_members_are_rejected() -> None:
         browser_token="late-token",
         display_name="Late Player",
         name_uniqueness_key=player_name_uniqueness_key("Late Player"),
+        join_order=2,
     )
     game.members[late_member.browser_token] = late_member
 

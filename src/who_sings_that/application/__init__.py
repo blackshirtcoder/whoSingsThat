@@ -8,6 +8,7 @@ from .connections import (
 )
 from .controller import (
     DEFAULT_PREPARATION_TIMEOUT_SECONDS,
+    DEFAULT_SONGMASTER_RECONNECT_GRACE_SECONDS,
     ConsumerAlreadyRunningError,
     ConsumerSelfRequestError,
     ControllerFailedError,
@@ -43,8 +44,10 @@ from .messages import (
     RevealRequest,
     SelectPlaylistRequest,
     SetAudioPreferenceRequest,
+    SongmasterReconnectGraceExpiredEvent,
     StartGameRequest,
     SystemEvent,
+    TransferSongmasterRequest,
 )
 from .start_game import (
     InvalidMusicRootError,
@@ -61,6 +64,7 @@ from .start_game import (
 
 __all__ = [
     "DEFAULT_PREPARATION_TIMEOUT_SECONDS",
+    "DEFAULT_SONGMASTER_RECONNECT_GRACE_SECONDS",
     "AcceptScoreRequest",
     "AcknowledgeAudioPreparationFailureRequest",
     "AudioPreparationFailedEvent",
@@ -99,6 +103,7 @@ __all__ = [
     "SelectPlaylistRequest",
     "SelectedPlaylistNotFoundError",
     "SetAudioPreferenceRequest",
+    "SongmasterReconnectGraceExpiredEvent",
     "StaleConnectionError",
     "StaleGameSessionError",
     "StartGameRequest",
@@ -107,6 +112,7 @@ __all__ = [
     "SystemEventRejection",
     "TrackExclusion",
     "TrackExclusionReason",
+    "TransferSongmasterRequest",
     "UnsupportedMessageError",
     "resolve_selected_playlists",
     "start_game_from_persistent_playlists",

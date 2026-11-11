@@ -15,7 +15,6 @@ from who_sings_that.domain.engine import (
     InvalidDisconnectRequestError,
     InvalidJoinGameRequestError,
     NoActiveGameError,
-    SongmasterDisconnectRequiresFailoverError,
     UnknownGameMemberError,
 )
 from who_sings_that.domain.models import (
@@ -23,6 +22,7 @@ from who_sings_that.domain.models import (
     GameState,
     InvalidPlayerNameError,
     SelectedPlaylistSnapshot,
+    SongmasterRecoveryStatus,
     normalize_player_name,
     player_name_uniqueness_key,
 )
@@ -414,16 +414,15 @@ def test_repeated_non_songmaster_disconnect_is_idempotent() -> None:
     engine.validate_invariants()
 
 
-def test_songmaster_disconnect_is_deferred_to_global_overlay() -> None:
+def test_songmaster_disconnect_activates_reconnect_grace_overlay() -> None:
     engine = make_engine()
     game = engine.create_game("creator-token", "Creator")
 
-    with pytest.raises(
-        SongmasterDisconnectRequiresFailoverError, match="reconnect-grace"
-    ):
-        engine.disconnect_member("creator-token")
+    recovery = engine.begin_songmaster_recovery("creator-token", 100.0, 110.0)
 
-    assert game.songmaster.connected is True
+    assert recovery.status is SongmasterRecoveryStatus.RECONNECT_GRACE
+    assert game.songmaster.connected is False
+    assert game.songmaster_recovery is recovery
     assert engine.state is GameState.LOBBY
     engine.validate_invariants()
 

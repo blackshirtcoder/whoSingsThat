@@ -33,6 +33,10 @@ from .models import (
     RoundVoidReason,
     SelectedPlaylistSnapshot,
     SkippedDeckEntry,
+    SongmasterRecovery,
+    SongmasterRecoveryOutcome,
+    SongmasterRecoveryResolution,
+    SongmasterRecoveryStatus,
     VoidedRound,
     normalize_player_name,
     player_name_uniqueness_key,
@@ -81,8 +85,12 @@ class UnknownGameMemberError(GameEngineError):
     """Raised when a browser token has no membership in the active game."""
 
 
-class SongmasterDisconnectRequiresFailoverError(GameEngineError):
-    """Raised until the Songmaster reconnect-grace overlay is implemented."""
+class GameSuspendedForSongmasterRecoveryError(GameEngineError):
+    """Raised when ordinary gameplay targets a suspended stable state."""
+
+
+class SongmasterRecoveryInapplicableError(GameEngineError):
+    """Expected rejection of a stale, early, or otherwise inapplicable recovery."""
 
 
 class DomainInvariantError(GameEngineError):
@@ -221,6 +229,14 @@ class UnauthorizedCloseGameError(GameEngineError):
     """Raised when Close Game is not requested by the connected Songmaster."""
 
 
+class SongmasterTransferNotAllowedError(GameEngineError):
+    """Raised when voluntary role transfer is unavailable or invalid."""
+
+
+class UnauthorizedSongmasterTransferError(GameEngineError):
+    """Raised when a contestant attempts voluntary Songmaster transfer."""
+
+
 class PreparationOutcome(Enum):
     """Outcome exposed internally after applying one preparation event."""
 
@@ -253,6 +269,7 @@ class GameEngine:
         game_id_factory: Callable[[], UUID] | None = None,
         preparation_id_factory: Callable[[], UUID] | None = None,
         round_id_factory: Callable[[], UUID] | None = None,
+        recovery_id_factory: Callable[[], UUID] | None = None,
         shuffle: Shuffle | None = None,
     ) -> None:
         self._installation_defaults = deepcopy(
@@ -274,6 +291,9 @@ class GameEngine:
         )
         self._round_id_factory = (
             round_id_factory if round_id_factory is not None else uuid4
+        )
+        self._recovery_id_factory = (
+            recovery_id_factory if recovery_id_factory is not None else uuid4
         )
         self._shuffle = shuffle if shuffle is not None else random_shuffle
         self._state = GameState.NO_GAME
@@ -323,6 +343,7 @@ class GameEngine:
             browser_token=token,
             display_name=normalized_name,
             name_uniqueness_key=player_name_uniqueness_key(normalized_name),
+            join_order=0,
             audio_enabled=True,
         )
         game = GameSession(
@@ -355,6 +376,8 @@ class GameEngine:
     ) -> None:
         """Cancel an unstarted lobby directly into ``NO_GAME``."""
 
+        self._reject_if_songmaster_recovery_active("Cancel Game")
+
         if self._state is not GameState.LOBBY:
             raise CancelGameNotAllowedError("Cancel Game is only allowed in LOBBY")
         game = self._active_game
@@ -383,6 +406,8 @@ class GameEngine:
         Repeated selection is intentionally idempotent.
         """
 
+        self._reject_if_songmaster_recovery_active("playlist selection")
+
         game = self._lobby_game_for_playlist_selection(requesting_browser_token)
         validated_playlist_id = self._validate_playlist_id(playlist_id)
         assert isinstance(game.selected_playlist_ids, set)
@@ -398,6 +423,8 @@ class GameEngine:
         Playlist IDs are opaque to the domain engine. Deselecting an ID that is
         not currently selected is intentionally idempotent.
         """
+
+        self._reject_if_songmaster_recovery_active("playlist selection")
 
         game = self._lobby_game_for_playlist_selection(requesting_browser_token)
         validated_playlist_id = self._validate_playlist_id(playlist_id)
@@ -420,6 +447,8 @@ class GameEngine:
         are committed to the one authoritative session before normal target-state
         entry runs to completion as one serialized authoritative event.
         """
+
+        self._reject_if_songmaster_recovery_active("Start Game")
 
         self.validate_start_game_request(requesting_browser_token)
         game = self._active_game
@@ -472,6 +501,8 @@ class GameEngine:
         Selected IDs are returned in deterministic order for resolution only.
         """
 
+        self._reject_if_songmaster_recovery_active("Start Game")
+
         if self._state is not GameState.LOBBY:
             raise StartGameNotAllowedError("Start Game is only allowed in LOBBY")
         game = self._active_game
@@ -503,6 +534,8 @@ class GameEngine:
         audio usability is an independent connection fact and is deliberately
         not inferred from this preference.
         """
+
+        self._reject_if_songmaster_recovery_active("audio preference changes")
 
         if self._state not in {GameState.LOBBY, GameState.ROUND_COMPLETE}:
             raise AudioPreferenceNotAllowedError(
@@ -599,6 +632,8 @@ class GameEngine:
         An available candidate takes C and returns its immutable preparation;
         an exhausted deck takes K and returns frozen finalization facts.
         """
+
+        self._reject_if_songmaster_recovery_active("Play Song")
 
         if self._state is not GameState.ROUND_COMPLETE:
             raise PlaySongNotAllowedError(
@@ -713,6 +748,8 @@ class GameEngine:
     ) -> GameFinalizationResult:
         """Voluntarily finalize a started game from any active gameplay state."""
 
+        self._reject_if_songmaster_recovery_active("End Game")
+
         legal_states = {
             GameState.ROUND_COMPLETE,
             GameState.AUDIO_PREPARING,
@@ -769,6 +806,8 @@ class GameEngine:
     ) -> None:
         """Apply transition L and discard the retained finished session."""
 
+        self._reject_if_songmaster_recovery_active("Close Game")
+
         if self._state is not GameState.FINISHED:
             raise CloseGameNotAllowedError(
                 "Close Game is only allowed in FINISHED"
@@ -789,6 +828,47 @@ class GameEngine:
         self._active_game = None
         self._transition_to(GameState.NO_GAME)
 
+    def transfer_songmaster(
+        self,
+        requesting_browser_token: str,
+        recipient_browser_token: str,
+    ) -> GameMember:
+        """Voluntarily assign the role to another connected member."""
+
+        self._reject_if_songmaster_recovery_active("Songmaster transfer")
+        if self._state not in {GameState.LOBBY, GameState.ROUND_COMPLETE}:
+            raise SongmasterTransferNotAllowedError(
+                "Songmaster transfer is allowed only in LOBBY or ROUND_COMPLETE"
+            )
+        game = self._active_game
+        if game is None:  # pragma: no cover - legal states require it
+            raise DomainInvariantError("Songmaster transfer requires an active game")
+        requester = self._validate_browser_token(
+            requesting_browser_token,
+            error_type=UnauthorizedSongmasterTransferError,
+        )
+        if requester != game.songmaster_browser_token or not game.songmaster.connected:
+            raise UnauthorizedSongmasterTransferError(
+                "only the current connected Songmaster may transfer the role"
+            )
+        recipient_token = self._validate_browser_token(
+            recipient_browser_token,
+            error_type=SongmasterTransferNotAllowedError,
+        )
+        recipient = game.members.get(recipient_token)
+        if (
+            recipient is None
+            or not recipient.connected
+            or recipient_token == requester
+        ):
+            raise SongmasterTransferNotAllowedError(
+                "the recipient must be another connected game member"
+            )
+        self._validate_state_invariants(self._state)
+        game.songmaster_browser_token = recipient_token
+        self._validate_state_invariants(self._state)
+        return recipient
+
     def record_audio_preparation_ready(
         self,
         game_session_id: UUID,
@@ -796,6 +876,8 @@ class GameEngine:
         browser_token: str,
     ) -> PreparationEventResult:
         """Accept a target's first READY response and evaluate when complete."""
+
+        self._reject_if_songmaster_recovery_active("audio preparation")
 
         return self._record_audio_preparation_response(
             game_session_id,
@@ -812,6 +894,8 @@ class GameEngine:
     ) -> PreparationEventResult:
         """Accept a target's first FAILED response and evaluate when complete."""
 
+        self._reject_if_songmaster_recovery_active("audio preparation")
+
         return self._record_audio_preparation_response(
             game_session_id,
             preparation_id,
@@ -826,6 +910,8 @@ class GameEngine:
     ) -> PreparationEventResult:
         """Finalize response collection when its application timer expires."""
 
+        self._reject_if_songmaster_recovery_active("audio preparation")
+
         _, responses = self._current_preparation_for_event(
             game_session_id,
             preparation_id,
@@ -839,6 +925,10 @@ class GameEngine:
         requesting_browser_token: str,
     ) -> GameSession:
         """Apply transition D after the connected Songmaster acknowledges failure."""
+
+        self._reject_if_songmaster_recovery_active(
+            "audio preparation failure acknowledgement"
+        )
 
         if self._state is not GameState.AUDIO_PREPARING:
             raise PreparationFailureAcknowledgementNotAllowedError(
@@ -911,6 +1001,8 @@ class GameEngine:
     ) -> RoundTermination:
         """Apply transition F using an application-trusted receipt timestamp."""
 
+        self._reject_if_songmaster_recovery_active("buzzing")
+
         game, active_round = self._current_playing_round_for_event(
             game_session_id,
             round_id,
@@ -963,6 +1055,8 @@ class GameEngine:
     ) -> RoundTermination:
         """Apply transition G after the authoritative playback deadline."""
 
+        self._reject_if_songmaster_recovery_active("playback timeout")
+
         game, active_round = self._current_playing_round_for_event(
             game_session_id,
             round_id,
@@ -993,6 +1087,8 @@ class GameEngine:
         requesting_browser_token: str,
     ) -> GameSession:
         """Apply transition H or I according to the recorded termination."""
+
+        self._reject_if_songmaster_recovery_active("Reveal")
 
         if self._state is not GameState.AWAITING_REVEAL:
             raise RevealNotAllowedError(
@@ -1061,6 +1157,8 @@ class GameEngine:
     ) -> CompletedRound:
         """Apply transition J and commit one buzz round's initial award."""
 
+        self._reject_if_songmaster_recovery_active("scoring")
+
         if self._state is not GameState.SCORING:
             raise ScoringNotAllowedError("initial scoring is only allowed in SCORING")
         game = self._active_game
@@ -1125,6 +1223,8 @@ class GameEngine:
         scoring_choice: ScoringChoice,
     ) -> CompletedRound:
         """Replace the most recent buzz round's award within its open window."""
+
+        self._reject_if_songmaster_recovery_active("score correction")
 
         if self._state is not GameState.ROUND_COMPLETE:
             raise ScoreCorrectionNotAllowedError(
@@ -1230,6 +1330,306 @@ class GameEngine:
                 "an actual round must retain artist and title for reveal"
             )
         return track.artist, track.title
+
+    def begin_songmaster_recovery(
+        self,
+        browser_token: str,
+        started_at_monotonic: float,
+        grace_deadline_monotonic: float,
+    ) -> SongmasterRecovery:
+        """Normalize an unexpected Songmaster loss and activate grace."""
+
+        game = self._game_for_membership_operation(allow_finished=True)
+        if game.songmaster_recovery is not None:
+            raise SongmasterRecoveryInapplicableError(
+                "Songmaster recovery is already active"
+            )
+        token = self._validate_browser_token(
+            browser_token,
+            error_type=InvalidDisconnectRequestError,
+        )
+        if token != game.songmaster_browser_token:
+            raise SongmasterRecoveryInapplicableError(
+                "recovery can begin only for the current Songmaster"
+            )
+        member = game.members[token]
+        if not member.connected:
+            raise SongmasterRecoveryInapplicableError(
+                "the current Songmaster is already disconnected"
+            )
+        started = self._validated_monotonic_timestamp(
+            started_at_monotonic,
+            error_type=SongmasterRecoveryInapplicableError,
+            name="Songmaster recovery start",
+        )
+        deadline = self._validated_monotonic_timestamp(
+            grace_deadline_monotonic,
+            error_type=SongmasterRecoveryInapplicableError,
+            name="Songmaster recovery deadline",
+        )
+        if deadline <= started:
+            raise SongmasterRecoveryInapplicableError(
+                "Songmaster recovery deadline must follow its start"
+            )
+        recovery_id = self._recovery_id_factory()
+        if not isinstance(recovery_id, UUID):
+            raise DomainInvariantError("the recovery ID factory must return a UUID")
+
+        interrupted_state = self._state
+        if interrupted_state is GameState.NO_GAME:
+            raise SongmasterRecoveryInapplicableError(
+                "NO_GAME cannot begin Songmaster recovery"
+            )
+        self._validate_state_invariants(interrupted_state)
+
+        normalized_state = interrupted_state
+        preparation_discarded = False
+        voided_round_id: UUID | None = None
+        if interrupted_state is GameState.AUDIO_PREPARING:
+            preparation_discarded = True
+            game.pending_audio_preparation = None
+            game.audio_preparation_responses = None
+            normalized_state = GameState.ROUND_COMPLETE
+        elif interrupted_state in {
+            GameState.PLAYING,
+            GameState.AWAITING_REVEAL,
+            GameState.SCORING,
+        }:
+            voided_round_id = self._void_round_for_songmaster_loss(
+                interrupted_state
+            )
+            normalized_state = GameState.ROUND_COMPLETE
+
+        member.connected = False
+        member.browser_audio_usable = False
+        recovery = SongmasterRecovery(
+            recovery_id=recovery_id,
+            status=SongmasterRecoveryStatus.RECONNECT_GRACE,
+            original_songmaster_browser_token=token,
+            interrupted_state=interrupted_state,
+            normalized_state=normalized_state,
+            started_at_monotonic=started,
+            grace_deadline_monotonic=deadline,
+            preparation_discarded=preparation_discarded,
+            voided_round_id=voided_round_id,
+        )
+        game.songmaster_recovery = recovery
+        if normalized_state is not interrupted_state:
+            self._transition_to(normalized_state)
+        else:
+            self._validate_state_invariants(self._state)
+        return recovery
+
+    def recover_original_songmaster(
+        self,
+        browser_token: str,
+        received_at_monotonic: float,
+    ) -> SongmasterRecoveryOutcome:
+        """Resolve grace for the incumbent using a strict trusted deadline."""
+
+        game = self._active_game
+        recovery = game.songmaster_recovery if game is not None else None
+        if (
+            game is None
+            or recovery is None
+            or recovery.status is not SongmasterRecoveryStatus.RECONNECT_GRACE
+        ):
+            raise SongmasterRecoveryInapplicableError(
+                "no Songmaster reconnect grace is active"
+            )
+        token = self._validate_browser_token(
+            browser_token,
+            error_type=SongmasterRecoveryInapplicableError,
+        )
+        if token != recovery.original_songmaster_browser_token:
+            raise SongmasterRecoveryInapplicableError(
+                "only the original Songmaster can reclaim the role during grace"
+            )
+        received = self._validated_monotonic_timestamp(
+            received_at_monotonic,
+            error_type=SongmasterRecoveryInapplicableError,
+            name="Songmaster reconnect receipt",
+        )
+        deadline = recovery.grace_deadline_monotonic
+        if deadline is None or received >= deadline:
+            raise SongmasterRecoveryInapplicableError(
+                "Songmaster reconnect was received at or after the grace deadline"
+            )
+
+        member = game.members[token]
+        member.connected = True
+        member.browser_audio_usable = False
+        outcome = self._complete_songmaster_recovery(
+            recovery,
+            SongmasterRecoveryResolution.ORIGINAL_RECONNECTED,
+            token,
+        )
+        self._validate_state_invariants(self._state)
+        return outcome
+
+    def expire_songmaster_recovery(
+        self,
+        game_session_id: UUID,
+        recovery_id: UUID,
+        observed_at_monotonic: float,
+        replacement_browser_token: str | None,
+    ) -> SongmasterRecovery | SongmasterRecoveryOutcome:
+        """Expire one authoritative grace generation and elect or suspend."""
+
+        game = self._active_game
+        recovery = game.songmaster_recovery if game is not None else None
+        if (
+            game is None
+            or game.game_session_id != game_session_id
+            or recovery is None
+            or recovery.recovery_id != recovery_id
+            or recovery.status is not SongmasterRecoveryStatus.RECONNECT_GRACE
+        ):
+            raise SongmasterRecoveryInapplicableError(
+                "grace expiry targets a stale Songmaster recovery"
+            )
+        observed = self._validated_monotonic_timestamp(
+            observed_at_monotonic,
+            error_type=SongmasterRecoveryInapplicableError,
+            name="Songmaster grace expiry observation",
+        )
+        deadline = recovery.grace_deadline_monotonic
+        if deadline is None or observed < deadline:
+            raise SongmasterRecoveryInapplicableError(
+                "Songmaster grace expiry arrived before its deadline"
+            )
+
+        if replacement_browser_token is not None:
+            replacement = game.members.get(replacement_browser_token)
+            if (
+                replacement is None
+                or not replacement.connected
+                or replacement.browser_token
+                == recovery.original_songmaster_browser_token
+            ):
+                raise SongmasterRecoveryInapplicableError(
+                    "automatic failover requires a connected eligible contestant"
+                )
+            game.songmaster_browser_token = replacement.browser_token
+            outcome = self._complete_songmaster_recovery(
+                recovery,
+                SongmasterRecoveryResolution.AUTOMATIC_FAILOVER,
+                replacement.browser_token,
+            )
+            self._validate_state_invariants(self._state)
+            return outcome
+
+        if any(member.connected for member in game.members.values()):
+            raise SongmasterRecoveryInapplicableError(
+                "indefinite suspension requires no connected members"
+            )
+        indefinite = SongmasterRecovery(
+            recovery_id=recovery.recovery_id,
+            status=SongmasterRecoveryStatus.INDEFINITE_SUSPENSION,
+            original_songmaster_browser_token=(
+                recovery.original_songmaster_browser_token
+            ),
+            interrupted_state=recovery.interrupted_state,
+            normalized_state=recovery.normalized_state,
+            started_at_monotonic=recovery.started_at_monotonic,
+            grace_deadline_monotonic=None,
+            preparation_discarded=recovery.preparation_discarded,
+            voided_round_id=recovery.voided_round_id,
+        )
+        game.songmaster_recovery = indefinite
+        self._validate_state_invariants(self._state)
+        return indefinite
+
+    def resume_indefinite_songmaster_recovery(
+        self,
+        browser_token: str,
+    ) -> SongmasterRecoveryOutcome:
+        """Promote the first successfully connected member after abandonment."""
+
+        game = self._active_game
+        recovery = game.songmaster_recovery if game is not None else None
+        if (
+            game is None
+            or recovery is None
+            or recovery.status
+            is not SongmasterRecoveryStatus.INDEFINITE_SUSPENSION
+        ):
+            raise SongmasterRecoveryInapplicableError(
+                "the game is not indefinitely suspended"
+            )
+        token = self._validate_browser_token(
+            browser_token,
+            error_type=SongmasterRecoveryInapplicableError,
+        )
+        member = game.members.get(token)
+        if member is None or not member.connected:
+            raise SongmasterRecoveryInapplicableError(
+                "indefinite recovery requires a connected game member"
+            )
+        game.songmaster_browser_token = token
+        outcome = self._complete_songmaster_recovery(
+            recovery,
+            SongmasterRecoveryResolution.RESUMED_AFTER_INDEFINITE_SUSPENSION,
+            token,
+        )
+        self._validate_state_invariants(self._state)
+        return outcome
+
+    def _complete_songmaster_recovery(
+        self,
+        recovery: SongmasterRecovery,
+        resolution: SongmasterRecoveryResolution,
+        resulting_songmaster_browser_token: str,
+    ) -> SongmasterRecoveryOutcome:
+        game = self._active_game
+        if game is None or game.songmaster_recovery is not recovery:
+            raise DomainInvariantError(
+                "only the active recovery generation can be completed"
+            )
+        outcome = SongmasterRecoveryOutcome(
+            recovery_id=recovery.recovery_id,
+            resolution=resolution,
+            original_songmaster_browser_token=(
+                recovery.original_songmaster_browser_token
+            ),
+            resulting_songmaster_browser_token=(
+                resulting_songmaster_browser_token
+            ),
+            interrupted_state=recovery.interrupted_state,
+            resumed_state=recovery.normalized_state,
+            voided_round_id=recovery.voided_round_id,
+        )
+        game.songmaster_recovery = None
+        game.last_songmaster_recovery_outcome = outcome
+        return outcome
+
+    def _void_round_for_songmaster_loss(self, source_state: GameState) -> UUID:
+        game = self._active_game
+        active_round = game.active_round if game is not None else None
+        if game is None or not isinstance(active_round, ActiveRound):
+            raise DomainInvariantError(
+                "Songmaster round normalization requires an actual round"
+            )
+        game.last_voided_round = VoidedRound(
+            active_round=active_round,
+            reason=RoundVoidReason.SONGMASTER_DISCONNECTED,
+            termination=game.round_termination,
+            answer_revealed=source_state is GameState.SCORING,
+        )
+        game.deck_pointer += 1
+        game.active_round = None
+        game.round_termination = None
+        game.buzzing_enabled = False
+        if source_state is not GameState.SCORING:
+            self._restore_completed_round_display(game)
+        return active_round.round_id
+
+    def _reject_if_songmaster_recovery_active(self, operation: str) -> None:
+        game = self._active_game
+        if game is not None and game.songmaster_recovery is not None:
+            raise GameSuspendedForSongmasterRecoveryError(
+                f"{operation} is suspended during Songmaster recovery"
+            )
 
     def _current_playing_round_for_event(
         self,
@@ -1413,6 +1813,7 @@ class GameEngine:
         display_name: str | None = None,
         *,
         connection_changed: bool = True,
+        resume_indefinite_as_songmaster: bool = False,
     ) -> GameMember:
         """Join or reconnect to a lobby or started game.
 
@@ -1445,6 +1846,8 @@ class GameEngine:
             existing_member.browser_audio_usable = False
             if token != game.songmaster_browser_token:
                 self._void_round_for_playback_client_loss(token)
+            if resume_indefinite_as_songmaster:
+                self.resume_indefinite_songmaster_recovery(token)
             try:
                 self._validate_state_invariants(self._state)
             except Exception:
@@ -1470,11 +1873,18 @@ class GameEngine:
             browser_token=token,
             display_name=normalized_name,
             name_uniqueness_key=name_key,
+            join_order=max(
+                (member.join_order for member in game.members.values()),
+                default=-1,
+            )
+            + 1,
             committed_score=0,
             connected=True,
         )
         game.members[token] = new_member
         try:
+            if resume_indefinite_as_songmaster:
+                self.resume_indefinite_songmaster_recovery(token)
             self._validate_state_invariants(self._state)
         except Exception:
             del game.members[token]
@@ -1482,12 +1892,10 @@ class GameEngine:
         return new_member
 
     def disconnect_member(self, browser_token: str) -> GameMember:
-        """Mark a non-Songmaster member disconnected without removing it.
+        """Mark a contestant disconnected without removing membership.
 
-        Unexpected Songmaster loss is deliberately rejected here because it
-        requires the section-37 reconnect-grace/failover overlay. This lower-
-        level operation must not claim to have handled that global behavior.
-        Repeated disconnect notifications for another member are idempotent.
+        Songmaster loss is handled by :meth:`begin_songmaster_recovery`, which
+        also receives the authoritative grace timing facts.
         """
 
         game = self._game_for_membership_operation(allow_finished=True)
@@ -1500,8 +1908,8 @@ class GameEngine:
                 "browser_token does not belong to the active game"
             )
         if token == game.songmaster_browser_token:
-            raise SongmasterDisconnectRequiresFailoverError(
-                "Songmaster disconnect requires the reconnect-grace/failover overlay"
+            raise SongmasterRecoveryInapplicableError(
+                "use begin_songmaster_recovery for the current Songmaster"
             )
 
         was_connected = member.connected
@@ -1522,6 +1930,7 @@ class GameEngine:
         browser_token: str,
         *,
         connection_changed: bool,
+        resume_indefinite_as_songmaster: bool = False,
     ) -> GameMember:
         """Apply domain connection facts after trusted registry validation."""
 
@@ -1548,6 +1957,8 @@ class GameEngine:
         member.browser_audio_usable = False
         if token != game.songmaster_browser_token:
             self._void_round_for_playback_client_loss(token)
+        if resume_indefinite_as_songmaster:
+            self.resume_indefinite_songmaster_recovery(token)
         try:
             self._validate_state_invariants(self._state)
         except Exception:
@@ -1580,6 +1991,14 @@ class GameEngine:
         game.round_termination = None
         game.buzzing_enabled = False
 
+        self._restore_completed_round_display(game)
+
+        self._transition_to(GameState.ROUND_COMPLETE)
+        return True
+
+    def _restore_completed_round_display(self, game: GameSession) -> None:
+        """Restore the last finalized answer after an unrevealed void."""
+
         completed = game.last_completed_round
         if completed is None:
             game.displayed_deck_position = None
@@ -1590,9 +2009,6 @@ class GameEngine:
             artist, title = self._answer_for_reveal(completed.active_round)
             game.displayed_artist = artist
             game.displayed_title = title
-
-        self._transition_to(GameState.ROUND_COMPLETE)
-        return True
 
     def validate_invariants(self) -> None:
         """Validate the invariants for the engine's current executable state."""
@@ -2062,6 +2478,7 @@ class GameEngine:
         if any(token != member.browser_token for token, member in game.members.items()):
             raise DomainInvariantError("game membership keys must be browser tokens")
         name_keys: set[str] = set()
+        join_orders: set[int] = set()
         for member in game.members.values():
             try:
                 normalized_name = normalize_player_name(member.display_name)
@@ -2081,6 +2498,16 @@ class GameEngine:
             if member.name_uniqueness_key in name_keys:
                 raise DomainInvariantError("game member display names must be unique")
             name_keys.add(member.name_uniqueness_key)
+            if (
+                isinstance(member.join_order, bool)
+                or not isinstance(member.join_order, int)
+                or member.join_order < 0
+                or member.join_order in join_orders
+            ):
+                raise DomainInvariantError(
+                    "game member join orders must be unique non-negative integers"
+                )
+            join_orders.add(member.join_order)
             if not isinstance(member.connected, bool):
                 raise DomainInvariantError(
                     "game member connection state must be boolean"
@@ -2113,10 +2540,86 @@ class GameEngine:
             raise DomainInvariantError(
                 f"{state_name} requires exactly one member as Songmaster"
             )
-        if not game.songmaster.connected:
+        recovery = game.songmaster_recovery
+        if recovery is None and not game.songmaster.connected:
             raise DomainInvariantError(
-                f"{state_name} requires a connected Songmaster until the "
-                "disconnect overlay exists"
+                f"{state_name} requires a connected Songmaster"
+            )
+        GameEngine._validate_songmaster_recovery(game, state_name=state_name)
+
+    @staticmethod
+    def _validate_songmaster_recovery(
+        game: GameSession,
+        *,
+        state_name: str,
+    ) -> None:
+        recovery = game.songmaster_recovery
+        if recovery is None:
+            return
+        if not isinstance(recovery, SongmasterRecovery):
+            raise DomainInvariantError(
+                "Songmaster recovery must be an immutable overlay snapshot"
+            )
+        if recovery.normalized_state.value != state_name.lower():
+            raise DomainInvariantError(
+                "Songmaster recovery must identify the current normalized state"
+            )
+        if recovery.normalized_state not in {
+            GameState.LOBBY,
+            GameState.ROUND_COMPLETE,
+            GameState.FINISHED,
+        }:
+            raise DomainInvariantError(
+                "Songmaster recovery requires a stable normalized state"
+            )
+        if (
+            not isinstance(recovery.recovery_id, UUID)
+            or recovery.original_songmaster_browser_token not in game.members
+            or recovery.original_songmaster_browser_token
+            != game.songmaster_browser_token
+            or game.songmaster.connected
+        ):
+            raise DomainInvariantError(
+                "active recovery must retain one disconnected incumbent Songmaster"
+            )
+        started = GameEngine._validated_monotonic_timestamp(
+            recovery.started_at_monotonic,
+            error_type=DomainInvariantError,
+            name="Songmaster recovery start",
+        )
+        if recovery.status is SongmasterRecoveryStatus.RECONNECT_GRACE:
+            deadline = GameEngine._validated_monotonic_timestamp(
+                recovery.grace_deadline_monotonic,
+                error_type=DomainInvariantError,
+                name="Songmaster recovery deadline",
+            )
+            if deadline <= started:
+                raise DomainInvariantError(
+                    "Songmaster recovery deadline must follow its start"
+                )
+        elif recovery.status is SongmasterRecoveryStatus.INDEFINITE_SUSPENSION:
+            if recovery.grace_deadline_monotonic is not None or any(
+                member.connected for member in game.members.values()
+            ):
+                raise DomainInvariantError(
+                    "indefinite suspension requires no deadline or connected member"
+                )
+        else:
+            raise DomainInvariantError("Songmaster recovery status is unsupported")
+        if recovery.preparation_discarded is not (
+            recovery.interrupted_state is GameState.AUDIO_PREPARING
+        ):
+            raise DomainInvariantError(
+                "preparation recovery facts must match the interrupted state"
+            )
+        round_was_unresolved = recovery.interrupted_state in {
+            GameState.PLAYING,
+            GameState.AWAITING_REVEAL,
+            GameState.SCORING,
+        }
+        if (recovery.voided_round_id is not None) is not round_was_unresolved:
+            raise DomainInvariantError(
+                "round recovery facts must match the interrupted state"
             )
 
     def _validate_started_game_facts(
@@ -2357,9 +2860,12 @@ class GameEngine:
             raise DomainInvariantError("ROUND_COMPLETE cannot have an active round")
         if game.last_voided_round is not None:
             self._validate_last_voided_round(game, deck)
-            if game.last_voided_round.reason is not RoundVoidReason.PLAYBACK_CLIENT_LOST:
+            if game.last_voided_round.reason not in {
+                RoundVoidReason.PLAYBACK_CLIENT_LOST,
+                RoundVoidReason.SONGMASTER_DISCONNECTED,
+            }:
                 raise DomainInvariantError(
-                    "ROUND_COMPLETE may retain only a playback-loss void"
+                    "ROUND_COMPLETE may retain only a connection-loss void"
                 )
         if game.round_termination is not None:
             raise DomainInvariantError(
@@ -2395,10 +2901,16 @@ class GameEngine:
             raise DomainInvariantError(
                 "score correction eligibility must identify the completed buzz round"
             )
-        self._validate_completed_round_display(
-            game,
-            state_name="ROUND_COMPLETE",
-        )
+        if not (
+            game.last_voided_round is not None
+            and game.last_voided_round.reason
+            is RoundVoidReason.SONGMASTER_DISCONNECTED
+            and game.last_voided_round.answer_revealed
+        ):
+            self._validate_completed_round_display(
+                game,
+                state_name="ROUND_COMPLETE",
+            )
         if not isinstance(game.deck_exhausted, bool):
             raise DomainInvariantError("deck exhaustion must be boolean")
         selection = select_deck_candidate(
@@ -2813,10 +3325,13 @@ class GameEngine:
                 self._validate_last_voided_round(game, deck)
                 if (
                     game.last_voided_round.reason
-                    is not RoundVoidReason.PLAYBACK_CLIENT_LOST
+                    not in {
+                        RoundVoidReason.PLAYBACK_CLIENT_LOST,
+                        RoundVoidReason.SONGMASTER_DISCONNECTED,
+                    }
                 ):
                     raise DomainInvariantError(
-                        "natural completion may retain only a playback-loss void"
+                        "natural completion may retain only a connection-loss void"
                     )
         elif game.end_reason is GameEndReason.SONGMASTER_ENDED_GAME:
             if game.last_voided_round is not None:
@@ -2863,10 +3378,13 @@ class GameEngine:
                 raise DomainInvariantError(
                     "a voluntarily voided round must remain under the deck pointer"
                 )
-        elif voided.reason is RoundVoidReason.PLAYBACK_CLIENT_LOST:
+        elif voided.reason in {
+            RoundVoidReason.PLAYBACK_CLIENT_LOST,
+            RoundVoidReason.SONGMASTER_DISCONNECTED,
+        }:
             if game.deck_pointer < position:
                 raise DomainInvariantError(
-                    "a playback-loss void must consume its deck entry"
+                    "a connection-loss void must consume its deck entry"
                 )
         else:
             raise DomainInvariantError("voided-round reason is not supported")
@@ -2998,18 +3516,42 @@ class GameEngine:
             raise DomainInvariantError(
                 "FINISHED must preserve the voided round's displayed position"
             )
-        if voided.reason is RoundVoidReason.PLAYBACK_CLIENT_LOST:
-            if game.last_completed_round is None and any(
-                value is not None
-                for value in (
-                    game.displayed_deck_position,
-                    game.displayed_artist,
-                    game.displayed_title,
+        if voided.reason in {
+            RoundVoidReason.PLAYBACK_CLIENT_LOST,
+            RoundVoidReason.SONGMASTER_DISCONNECTED,
+        }:
+            if (
+                game.last_completed_round is None
+                and any(
+                    value is not None
+                    for value in (
+                        game.displayed_deck_position,
+                        game.displayed_artist,
+                        game.displayed_title,
+                    )
+                )
+                and not (
+                    voided.reason is RoundVoidReason.SONGMASTER_DISCONNECTED
+                    and voided.answer_revealed
                 )
             ):
                 raise DomainInvariantError(
-                    "a first-round playback void must leave the display blank"
+                    "a first-round unrevealed connection-loss void must leave "
+                    "the display blank"
                 )
+            if (
+                voided.reason is RoundVoidReason.SONGMASTER_DISCONNECTED
+                and voided.answer_revealed
+            ):
+                artist, title = self._answer_for_reveal(active_round)
+                if (
+                    game.displayed_deck_position != position
+                    or game.displayed_artist != artist
+                    or game.displayed_title != title
+                ):
+                    raise DomainInvariantError(
+                        "a revealed Songmaster-loss void must preserve its answer"
+                    )
         elif voided.answer_revealed:
             artist, title = self._answer_for_reveal(active_round)
             if game.displayed_artist != artist or game.displayed_title != title:

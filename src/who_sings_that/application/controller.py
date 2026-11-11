@@ -28,6 +28,8 @@ from who_sings_that.domain import (
     PendingAudioPreparation,
     PreparationEventResult,
     PreparationOutcome,
+    SongmasterRecovery,
+    SongmasterRecoveryStatus,
     UnknownGameMemberError,
 )
 
@@ -61,8 +63,10 @@ from .messages import (
     RevealRequest,
     SelectPlaylistRequest,
     SetAudioPreferenceRequest,
+    SongmasterReconnectGraceExpiredEvent,
     StartGameRequest,
     SystemEvent,
+    TransferSongmasterRequest,
 )
 from .start_game import (
     InvalidMusicRootError,
@@ -128,9 +132,21 @@ class _TrustedBuzzSubmission:
     received_at_monotonic: float
 
 
+@dataclass(frozen=True, slots=True)
+class _TrustedConnectionSubmission:
+    """Trusted ingress time for connection establishment and grace ordering."""
+
+    request: JoinGameRequest | RegisterConnectionRequest
+    received_at_monotonic: float
+
+
 @dataclass(slots=True)
 class _QueuedMessage:
-    message: AuthoritativeMessage | _TrustedBuzzSubmission
+    message: (
+        AuthoritativeMessage
+        | _TrustedBuzzSubmission
+        | _TrustedConnectionSubmission
+    )
     response: asyncio.Future[Any] | None
 
 
@@ -140,6 +156,7 @@ class _StopConsumer:
 
 _STOP_CONSUMER: Final = _StopConsumer()
 DEFAULT_PREPARATION_TIMEOUT_SECONDS: Final = 5.0
+DEFAULT_SONGMASTER_RECONNECT_GRACE_SECONDS: Final = 10.0
 _EXPECTED_APPLICATION_ERRORS: Final = (
     InvalidMusicRootError,
     InvalidSelectedPlaylistIdsError,
@@ -173,6 +190,12 @@ class GameController:
         preparation_timeout_seconds: float = DEFAULT_PREPARATION_TIMEOUT_SECONDS,
         preparation_timeout_sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         playback_timeout_sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        songmaster_reconnect_grace_seconds: float = (
+            DEFAULT_SONGMASTER_RECONNECT_GRACE_SECONDS
+        ),
+        songmaster_reconnect_grace_sleep: Callable[
+            [float], Awaitable[None]
+        ] = asyncio.sleep,
     ) -> None:
         if (
             isinstance(preparation_timeout_seconds, bool)
@@ -183,6 +206,15 @@ class GameController:
             raise ValueError(
                 "preparation_timeout_seconds must be a positive finite number"
             )
+        if (
+            isinstance(songmaster_reconnect_grace_seconds, bool)
+            or not isinstance(songmaster_reconnect_grace_seconds, Real)
+            or not isfinite(songmaster_reconnect_grace_seconds)
+            or songmaster_reconnect_grace_seconds <= 0
+        ):
+            raise ValueError(
+                "songmaster_reconnect_grace_seconds must be a positive finite number"
+            )
         self._game_engine = game_engine if game_engine is not None else GameEngine()
         self._database_engine = database_engine
         self._music_root = music_root
@@ -190,6 +222,12 @@ class GameController:
         self._preparation_timeout_seconds = float(preparation_timeout_seconds)
         self._preparation_timeout_sleep = preparation_timeout_sleep
         self._playback_timeout_sleep = playback_timeout_sleep
+        self._songmaster_reconnect_grace_seconds = float(
+            songmaster_reconnect_grace_seconds
+        )
+        self._songmaster_reconnect_grace_sleep = (
+            songmaster_reconnect_grace_sleep
+        )
         self._queue: asyncio.Queue[_QueuedMessage | _StopConsumer] = asyncio.Queue()
         self._consumer_task: asyncio.Task[None] | None = None
         self._consumer_ready: asyncio.Event | None = None
@@ -199,6 +237,7 @@ class GameController:
         self._connection_registry = ConnectionRegistry()
         self._preparation_timeout_task: asyncio.Task[None] | None = None
         self._playback_timeout_task: asyncio.Task[None] | None = None
+        self._songmaster_reconnect_grace_task: asyncio.Task[None] | None = None
         self._owned_timer_tasks: set[asyncio.Task[None]] = set()
 
     @property
@@ -246,6 +285,13 @@ class GameController:
         task = self._playback_timeout_task
         return task is not None and not task.done()
 
+    @property
+    def songmaster_reconnect_grace_active(self) -> bool:
+        """Return whether the controller owns a live reconnect-grace timer."""
+
+        task = self._songmaster_reconnect_grace_task
+        return task is not None and not task.done()
+
     async def start(self) -> None:
         """Start exactly one consumer and wait until it is ready for work."""
 
@@ -279,10 +325,12 @@ class GameController:
             self._accepting_messages = False
             self._retire_preparation_timeout()
             self._retire_playback_timeout()
+            self._retire_songmaster_reconnect_grace()
             self._queue.put_nowait(_STOP_CONSUMER)
         await task
         self._retire_preparation_timeout()
         self._retire_playback_timeout()
+        self._retire_songmaster_reconnect_grace()
         await self._await_timer_cleanup()
         self._consumer_task = None
         self._consumer_ready = None
@@ -312,6 +360,11 @@ class GameController:
             # integration must perform this capture promptly when the message
             # reaches authoritative server code, before any queue wait.
             queued_request = _TrustedBuzzSubmission(
+                request=request,
+                received_at_monotonic=self._game_engine.monotonic_time(),
+            )
+        elif isinstance(request, (JoinGameRequest, RegisterConnectionRequest)):
+            queued_request = _TrustedConnectionSubmission(
                 request=request,
                 received_at_monotonic=self._game_engine.monotonic_time(),
             )
@@ -358,7 +411,12 @@ class GameController:
                 self._queue.task_done()
 
     def _dispatch(
-        self, message: AuthoritativeMessage | _TrustedBuzzSubmission
+        self,
+        message: (
+            AuthoritativeMessage
+            | _TrustedBuzzSubmission
+            | _TrustedConnectionSubmission
+        ),
     ) -> object:
         """Route one message to existing application or domain operations."""
 
@@ -377,6 +435,18 @@ class GameController:
             )
             self._retire_playback_timeout()
             return result
+
+        if isinstance(message, _TrustedConnectionSubmission):
+            request = message.request
+            if isinstance(request, JoinGameRequest):
+                return self._join_game_from_connection(
+                    request,
+                    message.received_at_monotonic,
+                )
+            return self._register_member_connection(
+                request,
+                message.received_at_monotonic,
+            )
 
         if isinstance(message, CreateGameRequest):
             self._connection_registry.validate_connection_id(
@@ -406,32 +476,10 @@ class GameController:
             self._retire_playback_timeout()
             self._connection_registry.clear_game(message.game_session_id)
             return result
-        if isinstance(message, JoinGameRequest):
-            self._require_target_game(message.game_session_id)
-            status = self._connection_registry.registration_status(
-                message.game_session_id,
-                message.browser_token,
-                message.source_connection_id,
+        if isinstance(message, (JoinGameRequest, RegisterConnectionRequest)):
+            raise DomainInvariantError(
+                "connection requests require trusted ingress metadata"
             )
-            was_playing = self._game_engine.state is GameState.PLAYING
-            member = self._game_engine.join_game(
-                message.browser_token,
-                message.display_name,
-                connection_changed=(
-                    status is not ConnectionRegistrationStatus.UNCHANGED
-                ),
-            )
-            self._connection_registry.register(
-                message.game_session_id,
-                message.browser_token,
-                message.source_connection_id,
-            )
-            if was_playing and self._game_engine.state is GameState.ROUND_COMPLETE:
-                self._retire_playback_timeout()
-            return member
-        if isinstance(message, RegisterConnectionRequest):
-            self._require_target_game(message.game_session_id)
-            return self._register_member_connection(message)
         if isinstance(message, SelectPlaylistRequest):
             self._require_target_game(message.game_session_id)
             return self._game_engine.select_playlist(
@@ -458,6 +506,12 @@ class GameController:
             return self._game_engine.set_audio_preference(
                 message.requesting_browser_token,
                 message.audio_enabled,
+            )
+        if isinstance(message, TransferSongmasterRequest):
+            self._require_target_game(message.game_session_id)
+            return self._game_engine.transfer_songmaster(
+                message.requesting_browser_token,
+                message.recipient_browser_token,
             )
         if isinstance(message, PlaySongRequest):
             self._require_target_game(message.game_session_id)
@@ -532,6 +586,14 @@ class GameController:
             )
             self._retire_playback_timeout()
             return result
+        if isinstance(message, SongmasterReconnectGraceExpiredEvent):
+            result = self._expire_songmaster_recovery(
+                message.game_session_id,
+                message.recovery_id,
+                self._game_engine.monotonic_time(),
+            )
+            self._retire_songmaster_reconnect_grace()
+            return result
         if isinstance(message, RevealRequest):
             self._require_target_game(message.game_session_id)
             return self._game_engine.reveal_answer(
@@ -567,8 +629,21 @@ class GameController:
                 message.browser_token,
                 message.source_connection_id,
             )
+            game = self._game_engine.active_game
+            if game is None:  # pragma: no cover - current connection established it
+                raise DomainInvariantError("disconnect requires an active game")
             was_playing = self._game_engine.state is GameState.PLAYING
-            member = self._game_engine.disconnect_member(message.browser_token)
+            if message.browser_token == game.songmaster_browser_token:
+                started = self._game_engine.monotonic_time()
+                recovery = self._game_engine.begin_songmaster_recovery(
+                    message.browser_token,
+                    started,
+                    started + self._songmaster_reconnect_grace_seconds,
+                )
+                member = game.members[message.browser_token]
+            else:
+                recovery = None
+                member = self._game_engine.disconnect_member(message.browser_token)
             if not self._connection_registry.mark_disconnected(
                 message.game_session_id,
                 message.browser_token,
@@ -579,6 +654,13 @@ class GameController:
                 )
             if was_playing and self._game_engine.state is GameState.ROUND_COMPLETE:
                 self._retire_playback_timeout()
+            if recovery is not None:
+                self._retire_preparation_timeout()
+                self._retire_playback_timeout()
+                self._schedule_songmaster_reconnect_grace(
+                    message.game_session_id,
+                    recovery,
+                )
             return member
         if isinstance(message, BrowserAudioCapabilityChangedEvent):
             self._require_current_connection(
@@ -601,8 +683,57 @@ class GameController:
                 "message does not target the active game session"
             )
 
+    def _join_game_from_connection(
+        self,
+        message: JoinGameRequest,
+        received_at_monotonic: float,
+    ) -> object:
+        self._require_target_game(message.game_session_id)
+        status = self._connection_registry.registration_status(
+            message.game_session_id,
+            message.browser_token,
+            message.source_connection_id,
+        )
+        prior_state = self._game_engine.state
+        handled = self._prepare_songmaster_connection(
+            message.game_session_id,
+            message.browser_token,
+            status,
+            received_at_monotonic,
+        )
+        game = self._game_engine.active_game
+        if game is None:  # pragma: no cover - target validation established it
+            raise DomainInvariantError("Join Game requires an active game")
+        resume_indefinite = (
+            game.songmaster_recovery is not None
+            and game.songmaster_recovery.status
+            is SongmasterRecoveryStatus.INDEFINITE_SUSPENSION
+        )
+        if handled:
+            member = game.members[message.browser_token]
+        else:
+            member = self._game_engine.join_game(
+                message.browser_token,
+                message.display_name,
+                connection_changed=(
+                    status is not ConnectionRegistrationStatus.UNCHANGED
+                ),
+                resume_indefinite_as_songmaster=resume_indefinite,
+            )
+        self._connection_registry.register(
+            message.game_session_id,
+            message.browser_token,
+            message.source_connection_id,
+        )
+        self._retire_interrupted_normal_timers(prior_state)
+        if game.songmaster_recovery is None:
+            self._retire_songmaster_reconnect_grace()
+        return member
+
     def _register_member_connection(
-        self, message: RegisterConnectionRequest
+        self,
+        message: RegisterConnectionRequest,
+        received_at_monotonic: float,
     ) -> ConnectionRegistration:
         game = self._game_engine.active_game
         if game is None or message.browser_token not in game.members:
@@ -614,21 +745,139 @@ class GameController:
             message.browser_token,
             message.connection_id,
         )
-        was_playing = self._game_engine.state is GameState.PLAYING
-        self._game_engine.record_connection_established(
+        prior_state = self._game_engine.state
+        handled = self._prepare_songmaster_connection(
+            message.game_session_id,
             message.browser_token,
-            connection_changed=(
-                status is not ConnectionRegistrationStatus.UNCHANGED
-            ),
+            status,
+            received_at_monotonic,
         )
+        recovery = game.songmaster_recovery
+        if not handled:
+            self._game_engine.record_connection_established(
+                message.browser_token,
+                connection_changed=(
+                    status is not ConnectionRegistrationStatus.UNCHANGED
+                ),
+                resume_indefinite_as_songmaster=(
+                    recovery is not None
+                    and recovery.status
+                    is SongmasterRecoveryStatus.INDEFINITE_SUSPENSION
+                ),
+            )
         registration = self._connection_registry.register(
             message.game_session_id,
             message.browser_token,
             message.connection_id,
         )
-        if was_playing and self._game_engine.state is GameState.ROUND_COMPLETE:
-            self._retire_playback_timeout()
+        self._retire_interrupted_normal_timers(prior_state)
+        if game.songmaster_recovery is None:
+            self._retire_songmaster_reconnect_grace()
         return registration
+
+    def _prepare_songmaster_connection(
+        self,
+        game_session_id: UUID,
+        browser_token: str,
+        status: ConnectionRegistrationStatus,
+        received_at_monotonic: float,
+    ) -> bool:
+        """Apply grace ordering or instantaneous replacement normalization."""
+
+        game = self._game_engine.active_game
+        if game is None:
+            raise DomainInvariantError("connection establishment requires a game")
+        recovery = game.songmaster_recovery
+        if (
+            recovery is not None
+            and recovery.status is SongmasterRecoveryStatus.RECONNECT_GRACE
+        ):
+            deadline = recovery.grace_deadline_monotonic
+            if deadline is None:  # pragma: no cover - domain invariant
+                raise DomainInvariantError("reconnect grace requires a deadline")
+            if received_at_monotonic >= deadline:
+                self._expire_songmaster_recovery(
+                    game_session_id,
+                    recovery.recovery_id,
+                    received_at_monotonic,
+                )
+                self._retire_songmaster_reconnect_grace()
+                recovery = game.songmaster_recovery
+            elif browser_token == recovery.original_songmaster_browser_token:
+                self._game_engine.recover_original_songmaster(
+                    browser_token,
+                    received_at_monotonic,
+                )
+                return True
+
+        if (
+            game.songmaster_recovery is None
+            and browser_token == game.songmaster_browser_token
+            and status is ConnectionRegistrationStatus.REPLACED
+        ):
+            started = received_at_monotonic
+            self._game_engine.begin_songmaster_recovery(
+                browser_token,
+                started,
+                started + self._songmaster_reconnect_grace_seconds,
+            )
+            self._game_engine.recover_original_songmaster(
+                browser_token,
+                received_at_monotonic,
+            )
+            return True
+        return False
+
+    def _expire_songmaster_recovery(
+        self,
+        game_session_id: UUID,
+        recovery_id: UUID,
+        observed_at_monotonic: float,
+    ) -> object:
+        game = self._game_engine.active_game
+        recovery = game.songmaster_recovery if game is not None else None
+        if game is None or recovery is None:
+            return self._game_engine.expire_songmaster_recovery(
+                game_session_id,
+                recovery_id,
+                observed_at_monotonic,
+                None,
+            )
+        connected = dict(
+            self._connection_registry.connected_members(game_session_id)
+        )
+        candidates = tuple(
+            member
+            for member in game.members.values()
+            if member.connected
+            and member.browser_token
+            != recovery.original_songmaster_browser_token
+            and member.browser_token in connected
+        )
+        replacement = min(
+            candidates,
+            key=lambda member: (
+                connected[member.browser_token],
+                member.join_order,
+            ),
+            default=None,
+        )
+        return self._game_engine.expire_songmaster_recovery(
+            game_session_id,
+            recovery_id,
+            observed_at_monotonic,
+            None if replacement is None else replacement.browser_token,
+        )
+
+    def _retire_interrupted_normal_timers(self, prior_state: GameState) -> None:
+        if prior_state is GameState.AUDIO_PREPARING and (
+            self._game_engine.state is not GameState.AUDIO_PREPARING
+        ):
+            self._retire_preparation_timeout()
+        if prior_state is GameState.PLAYING and (
+            self._game_engine.state is not GameState.PLAYING
+        ):
+            self._retire_playback_timeout()
 
     def _require_current_connection(
         self,
@@ -762,6 +1011,62 @@ class GameController:
         if task is not None and not task.done():
             task.cancel()
 
+    def _schedule_songmaster_reconnect_grace(
+        self,
+        game_session_id: UUID,
+        recovery: SongmasterRecovery,
+    ) -> None:
+        deadline = recovery.grace_deadline_monotonic
+        if (
+            recovery.status is not SongmasterRecoveryStatus.RECONNECT_GRACE
+            or deadline is None
+        ):
+            raise DomainInvariantError(
+                "a reconnect-grace timer requires authoritative deadline facts"
+            )
+        self._retire_songmaster_reconnect_grace()
+        task = asyncio.create_task(
+            self._post_songmaster_reconnect_grace_expiry(
+                game_session_id,
+                recovery.recovery_id,
+                deadline,
+            ),
+            name="wst-songmaster-reconnect-grace",
+        )
+        self._songmaster_reconnect_grace_task = task
+        self._owned_timer_tasks.add(task)
+        task.add_done_callback(self._timer_task_done)
+
+    async def _post_songmaster_reconnect_grace_expiry(
+        self,
+        game_session_id: UUID,
+        recovery_id: UUID,
+        deadline_monotonic: float,
+    ) -> None:
+        remaining_seconds = max(
+            0.0,
+            deadline_monotonic - self._game_engine.monotonic_time(),
+        )
+        try:
+            await self._songmaster_reconnect_grace_sleep(remaining_seconds)
+        except asyncio.CancelledError:
+            return
+        try:
+            self.post_system_event(
+                SongmasterReconnectGraceExpiredEvent(
+                    game_session_id=game_session_id,
+                    recovery_id=recovery_id,
+                )
+            )
+        except (ControllerNotRunningError, ControllerFailedError):
+            return
+
+    def _retire_songmaster_reconnect_grace(self) -> None:
+        task = self._songmaster_reconnect_grace_task
+        self._songmaster_reconnect_grace_task = None
+        if task is not None and not task.done():
+            task.cancel()
+
     def _timer_task_done(self, task: asyncio.Task[None]) -> None:
         self._owned_timer_tasks.discard(task)
         if task.cancelled():
@@ -813,6 +1118,7 @@ class GameController:
         self._accepting_messages = False
         self._retire_preparation_timeout()
         self._retire_playback_timeout()
+        self._retire_songmaster_reconnect_grace()
         if queued.response is not None:
             self._complete_response(queued.response, error=error)
 
@@ -854,6 +1160,7 @@ def _observe_response_exception(response: asyncio.Future[Any]) -> None:
 
 __all__ = [
     "DEFAULT_PREPARATION_TIMEOUT_SECONDS",
+    "DEFAULT_SONGMASTER_RECONNECT_GRACE_SECONDS",
     "ConsumerAlreadyRunningError",
     "ConsumerSelfRequestError",
     "ControllerFailedError",

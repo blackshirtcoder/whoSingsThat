@@ -1076,13 +1076,11 @@ exhausted `ROUND_COMPLETE` for an explicit Songmaster transition K request.
 
 If the lost playback client is also the Songmaster, process the Songmaster-disconnect overlay as the controlling failure path and do not independently consume/void the round a second time.
 
-Songmaster playback-client loss remains deferred with the complete
-reconnect-grace/failover overlay. The temporary fail-closed Songmaster
-disconnect rejection remains in force, and trusted Songmaster connection
-replacement follows existing registration semantics without invoking the
-contestant void path. Future notification work should tell the Songmaster which
-contestant lost audio and that the current song was discarded; no notification
-framework is introduced in this phase.
+Songmaster playback-client loss is handled by the reconnect-grace overlay. Its
+normalization owns the one void, one deck advance, playback-timer retirement,
+and recovery process; the ordinary contestant playback-loss path does not run
+in parallel. Future notification work should tell clients that Songmaster loss
+discarded the song; no notification framework is introduced in this phase.
 
 Connection loss outside `PLAYING` does not retroactively void a round:
 `AUDIO_PREPARING` still resolves through preparation responses/timeout,
@@ -1434,47 +1432,137 @@ of an unresolved played round creates a void with no scoring decision or award.
 
 ## 37. Global Overlay: Songmaster Disconnect / Failover
 
-Unexpected Songmaster disconnect uses an implementation state such as:
+Unexpected Songmaster disconnect is represented without adding a ninth normal
+state. `GameSession.songmaster_recovery` is either absent or contains an
+immutable recovery generation with status:
 
 ```text
 SM_RECONNECT_GRACE
+SM_INDEFINITE_SUSPENSION
 ```
 
-This state is intentionally omitted from the normal-flow diagram.
+The snapshot retains the recovery UUID, disconnected incumbent token,
+interrupted and normalized normal states, monotonic start/deadline,
+preparation-discarded flag, and voided-round identity when applicable. The
+normal `GameState` remains the normalized stable state. A completed recovery is
+retained separately as `last_songmaster_recovery_outcome`, including whether the
+incumbent returned, automatic failover occurred, or an indefinite suspension
+was resumed and which member became Songmaster. These facts are domain/application
+inspection data for future notifications, not a transport payload.
 
-Placeholder grace period:
+The application-owned grace period is:
 
 ```text
 10 seconds
 ```
 
-All connected clients must be informed that the Songmaster disconnected and that the game is waiting for reconnect/failover. The UI should show the grace-period countdown or equivalent status.
+The `GameController` captures a trusted monotonic start, computes the deadline,
+and owns one timer. The timer only posts a generation- and game-scoped
+`SongmasterReconnectGraceExpiredEvent` to the global FIFO queue. It never
+mutates the engine. Reconnect/registration ingress also captures trusted
+monotonic receipt time before queue waiting. A reconnect is timely exactly when
+`receipt < deadline`; receipt at the deadline is late. FIFO order remains
+authoritative, while this strict timestamp rule prevents queue delay from
+changing whether the incumbent met grace.
 
-While in reconnect grace, gameplay commands are suspended.
+While either recovery status is active, normal gameplay, setting, lifecycle,
+scoring, and final-close commands are rejected rather than queued for later.
+Join/reconnect, current-connection replacement, contestant disconnect, and
+connection capability operations remain available. No preparation or playback
+context, buzzing, or normal gameplay timer may remain active. The disconnected
+incumbent remains the one assigned Songmaster during grace and indefinite
+suspension until recovery formally resolves.
 
 Source-specific normalization:
 
 - From `LOBBY`: nothing to void; resume `LOBBY`.
-- From `ROUND_COMPLETE`: nothing to void; resume `ROUND_COMPLETE`.
-- From `AUDIO_PREPARING`: cancel preparation; discard pending context; **do not consume selected song**; resume `ROUND_COMPLETE`.
-- From `PLAYING`: stop audio, disable buzzing, mark round void with `songmaster_disconnected`, consume current song by advancing deck pointer exactly once; resume `ROUND_COMPLETE`.
-- From `AWAITING_REVEAL`: mark the unresolved round void and resolve its still-current
-  entry exactly once before resuming `ROUND_COMPLETE` (future overlay work).
-- From `SCORING`: discard provisional score, mark the round void, and avoid a
-  second consumption if a later transition has already resolved the entry.
-- From `FINISHED`: nothing competitive remains to void; remain/resume in `FINISHED`.
+- From `ROUND_COMPLETE`: preserve scores, completed display, correction facts,
+  skips, and pointer; resume `ROUND_COMPLETE`.
+- From `AUDIO_PREPARING`: retire preparation timing and discard prospective
+  context without creating a round or consuming the candidate, then enter
+  `ROUND_COMPLETE` through its ordinary candidate scan.
+- From `PLAYING`: disable buzzing, retire playback timing, retain one
+  `VoidedRound` with `songmaster_disconnected`, consume the current entry once,
+  restore the last completed-song display (or blank), and enter
+  `ROUND_COMPLETE`. This is the same controlling path whether or not the
+  Songmaster belongs to `playback_clients`.
+- From `AWAITING_REVEAL`: retain the already-established buzz/timeout termination
+  in a `songmaster_disconnected` void, resolve the entry exactly once under the
+  current unconsumed-pointer implementation, restore the prior completed-song
+  display, and enter `ROUND_COMPLETE` without points.
+- From `SCORING`: retain the buzz termination and already-revealed answer in the
+  void, discard unaccepted/provisional scoring, resolve the entry exactly once,
+  preserve committed scores, and enter `ROUND_COMPLETE`.
+- From `FINISHED`: preserve frozen standings, end facts, and history and remain
+  in `FINISHED`; recovery restores only authority to Close Game.
 
-If the original Songmaster reconnects within grace, preserve the role, announce reconnect, and resume the stored stable state.
+Normalizing a played unresolved entry always creates a `VoidedRound`, never a
+zero-point `CompletedRound`. Deck advancement is based on the established
+unconsumed pointer and occurs once. Old preparation READY/FAILED/timeout,
+playback timeout, and buzz events retain their original preparation/round IDs
+and are stale after normalization. Exhaustion discovered on
+`ROUND_COMPLETE` entry still waits for an authorized later transition K.
 
-If grace expires and one or more other players are connected, deterministically choose a replacement Songmaster (e.g. longest-connected), announce the transfer, and resume the stored stable state.
+If the original Songmaster reconnects within grace, the new connection becomes
+authoritative, connection-specific browser-audio capability resets to false,
+the role and all membership/score/preference facts remain, the timer is retired,
+and the overlay clears. Normalization is not undone: voided audio is not replayed
+and discarded scoring is not restored. A queued old expiry is rejected by game
+and recovery UUID validation.
 
-If the old Songmaster later reconnects after failover, they return as an ordinary player unless the current Songmaster voluntarily transfers the role back in a state where transfer is legal.
+Replacing a still-live authoritative Songmaster connection is treated as an
+instantaneous interruption and verified reconnect: source-state normalization
+runs once, the replacement connection becomes authoritative, browser-audio
+capability resets, and the same Songmaster resumes immediately without a grace
+timer. Re-registering the unchanged live connection is idempotent. A delayed
+loss or capability event from the superseded connection is stale. In
+particular, a replacement during `PLAYING` cannot create both a playback-client
+void and a Songmaster-loss void, and a replacement after `PLAYING` uses only the
+applicable unresolved-state normalization above.
 
-If grace expires with nobody connected, **do not end the game**. Leave the game suspended indefinitely in memory. No timers or gameplay continue.
+If grace expires and connected contestants exist, the replacement is the
+longest-continuously-connected eligible contestant. The registry assigns a
+monotonic server connection-establishment sequence to every establish,
+reconnect, or replacement; unchanged registration retains its sequence. The
+lowest current sequence wins, with immutable original game join order as the
+final deterministic tie-breaker. The disconnected incumbent is excluded.
+Failover changes the one Songmaster token atomically, preserves both members'
+names, preferences, scores, and identities, retires grace, clears the overlay,
+and resumes the normalized state.
 
-When any player subsequently becomes connected — either an existing member reconnecting or a brand-new player joining the still-active game — normal failover completes: the first available connected player becomes Songmaster and the game resumes from the stored stable state.
+If the old Songmaster later reconnects after failover, they return as an
+ordinary player with reset connection-specific browser-audio capability. They
+have no automatic role-reclamation privilege; ordinary voluntary transfer rules
+remain limited to `LOBBY` and `ROUND_COMPLETE`.
+
+If grace expires with nobody connected, **do not end or close the game**. Change
+the recovery snapshot to `SM_INDEFINITE_SUSPENSION`, remove its deadline, retire
+the one grace timer, and retain the normalized game, deck, scores, membership,
+and live history in memory. There is no polling or repeated expiry timer.
+
+When the first eligible connection is subsequently established—an existing
+member reconnecting or a permitted brand-new member joining—that same FIFO
+operation promotes the member, clears suspension, and resumes the normalized
+state. The original Songmaster participates on equal terms and may regain the
+role only by being that first successful connection. A late connection cannot
+reverse a failover or expiry event already processed ahead of it.
 
 This avoids a dead-end in which an abandoned game can exist but nobody present is allowed to control it. It also allows a solo player to leave a running game at `ROUND_COMPLETE` and later continue from the same deck position, provided the server process has not restarted.
+
+Recovery invariants require a stable normalized normal state, exactly one role
+assignment, a disconnected incumbent while the overlay is active, no active
+round/preparation/buzzing, valid generation/deadline facts, and zero connected
+members during indefinite suspension. Controller timer cancellation is an
+efficiency only: game ID, recovery UUID, state, connection ID, preparation ID,
+and round ID checks make duplicate, superseded, cross-game, and late queued
+events harmless expected rejections.
+
+Future transport/UI work must notify clients when grace starts, a round is
+voided, the incumbent returns, authority transfers, indefinite suspension
+begins, and a later connection resumes the game. It must project the structured
+recovery facts without exposing pre-reveal track metadata. No WebSocket,
+browser, audio-stop message, or generic notification infrastructure is part of
+this implementation.
 
 V1 does not persist active-game state across server restart/crash.
 
@@ -1626,14 +1714,10 @@ connection loss, capability updates, and buzz ingress. Real transport remains
 responsible for creating authenticated connection IDs; no WebSocket layer is
 implemented yet.
 
-Active-state new membership, contestant disconnect, same-token reconnect, and
-contestant playback-client connection-loss voiding are implemented. Songmaster
-disconnect grace/failover is still deferred:
-until that overlay exists, an observed Songmaster disconnect is safely rejected,
-the domain keeps the Songmaster connected, and the registry retains the current
-association. A later trusted replacement registration can still supersede that
-connection. This fail-closed temporary policy avoids partially applying the
-future suspension/failover state machine.
+Active-state new membership, contestant disconnect, same-token reconnect,
+contestant playback-client connection-loss voiding, and Songmaster
+disconnect/reconnect/failover are implemented. All connection lifecycle changes
+and recovery timer events use the same serialized controller queue as gameplay.
 
 ## 45. Browser Autoplay
 
@@ -1837,6 +1921,23 @@ min multiplier: 1.0x
     restore local audio playback.
 75. Cancel Game and transition L clear the former game's connection registry
     associations; FINISHED retains them until Close Game.
+76. Songmaster recovery is an explicit overlay on `LOBBY`, `ROUND_COMPLETE`, or
+    `FINISHED`, not a ninth normal-flow state.
+77. Reconnect grace retains the disconnected incumbent as the one assigned
+    Songmaster until timely recovery or formal replacement.
+78. A Songmaster-loss normalization retires preparation/playback timing and
+    leaves no unresolved active round, pending preparation, or enabled buzzing.
+79. A played unresolved round interrupted by Songmaster loss creates one
+    `songmaster_disconnected` void and consumes its entry exactly once.
+80. Grace reconnect is timely only for trusted monotonic receipt strictly before
+    the deadline; game/recovery generation identity makes stale expiry harmless.
+81. Automatic failover chooses the lowest current continuous-connection
+    sequence, with original join order as the final deterministic tie-breaker.
+82. Indefinite suspension has no deadline or timer and no connected member; the
+    first later eligible connection is promoted in its serialized lifecycle
+    operation.
+83. Once failover completes, the old Songmaster is an ordinary contestant and
+    later reconnect does not reclaim authority.
 
 ## 49. Future Directions
 

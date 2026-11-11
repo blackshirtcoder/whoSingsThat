@@ -31,11 +31,12 @@ from who_sings_that.domain import (
     GameSettings,
     GameState,
     MembershipOperationNotAllowedError,
+    PreparationEventInapplicableError,
     ResolvedPlaylist,
     RoundTerminationReason,
     RoundVoidReason,
     SelectedPlaylistSnapshot,
-    SongmasterDisconnectRequiresFailoverError,
+    SongmasterRecoveryResolution,
     TrackReference,
     UnknownGameMemberError,
 )
@@ -564,14 +565,18 @@ async def test_current_connection_preparation_event_and_stale_predecessor(
         )
     )
 
-    assert len(controller.system_event_rejections) == 1
+    assert len(controller.system_event_rejections) == 2
     assert isinstance(controller.system_event_rejections[0].error, StaleConnectionError)
-    assert engine.state is GameState.PLAYING
+    assert isinstance(
+        controller.system_event_rejections[1].error,
+        PreparationEventInapplicableError,
+    )
+    assert engine.state is GameState.ROUND_COMPLETE
     await controller.stop()
 
 
 @pytest.mark.asyncio
-async def test_songmaster_disconnect_is_deferred_without_retiring_connection(
+async def test_songmaster_disconnect_and_timely_reconnect_restore_authority(
     controller_storage: tuple[Engine, Path],
 ) -> None:
     engine, _ = started_engine()
@@ -592,14 +597,17 @@ async def test_songmaster_disconnect_is_deferred_without_retiring_connection(
     )
 
     assert game.songmaster.connected is True
+    assert game.songmaster_recovery is None
+    assert game.last_songmaster_recovery_outcome is not None
+    assert (
+        game.last_songmaster_recovery_outcome.resolution
+        is SongmasterRecoveryResolution.ORIGINAL_RECONNECTED
+    )
     assert controller.connection_registry.is_current(
         GAME_IDS[0], "songmaster-token", "songmaster-connection"
     )
-    assert len(controller.system_event_rejections) == 1
-    assert isinstance(
-        controller.system_event_rejections[0].error,
-        SongmasterDisconnectRequiresFailoverError,
-    )
+    assert controller.system_event_rejections == ()
+    assert controller.songmaster_reconnect_grace_active is False
     await controller.stop()
 
 

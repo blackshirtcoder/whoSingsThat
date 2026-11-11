@@ -26,6 +26,7 @@ class ConnectionRegistration:
     browser_token: str
     connection_id: str
     status: ConnectionRegistrationStatus
+    continuous_connection_sequence: int
 
     @property
     def connection_changed(self) -> bool:
@@ -38,6 +39,7 @@ class ConnectionRegistration:
 class _ConnectionRecord:
     connection_id: str
     connected: bool
+    continuous_connection_sequence: int
 
 
 class ConnectionRegistry:
@@ -50,6 +52,7 @@ class ConnectionRegistry:
 
     def __init__(self) -> None:
         self._records: dict[tuple[UUID, str], _ConnectionRecord] = {}
+        self._next_connection_sequence = 0
 
     @staticmethod
     def validate_connection_id(connection_id: str) -> str:
@@ -93,15 +96,38 @@ class ConnectionRegistry:
             browser_token,
             validated_id,
         )
-        self._records[(game_session_id, browser_token)] = _ConnectionRecord(
+        key = (game_session_id, browser_token)
+        existing = self._records.get(key)
+        if status is ConnectionRegistrationStatus.UNCHANGED:
+            if existing is None:  # pragma: no cover - established by status
+                raise RuntimeError("unchanged registration requires a record")
+            sequence = existing.continuous_connection_sequence
+        else:
+            sequence = self._next_connection_sequence
+            self._next_connection_sequence += 1
+        self._records[key] = _ConnectionRecord(
             connection_id=validated_id,
             connected=True,
+            continuous_connection_sequence=sequence,
         )
         return ConnectionRegistration(
             game_session_id=game_session_id,
             browser_token=browser_token,
             connection_id=validated_id,
             status=status,
+            continuous_connection_sequence=sequence,
+        )
+
+    def connected_members(
+        self,
+        game_session_id: UUID,
+    ) -> tuple[tuple[str, int], ...]:
+        """Return connected member tokens with continuous-connection order."""
+
+        return tuple(
+            (browser_token, record.continuous_connection_sequence)
+            for (record_game_id, browser_token), record in self._records.items()
+            if record_game_id == game_session_id and record.connected
         )
 
     def is_current(
