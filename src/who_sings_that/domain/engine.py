@@ -2,12 +2,17 @@
 
 from collections.abc import Callable, Iterable
 from copy import deepcopy
+from dataclasses import dataclass
 from datetime import UTC, datetime
+from enum import Enum
 from random import shuffle as random_shuffle
 from uuid import UUID, uuid4
 
 from .deck import Deck, DeckEntry, Shuffle, TrackReference, build_deck
 from .models import (
+    ActiveRound,
+    AudioPreparationResponseState,
+    AudioPreparationStatus,
     DeckSkipReason,
     FinalStanding,
     GameEndReason,
@@ -134,6 +139,38 @@ class NoValidAudioTargetError(GameEngineError):
     """Expected rejection when no connected, enabled, usable target exists."""
 
 
+class PreparationEventInapplicableError(GameEngineError):
+    """Raised for stale, duplicate, late, or non-target preparation events."""
+
+
+class PreparationFailureAcknowledgementNotAllowedError(GameEngineError):
+    """Raised when transition D acknowledgement preconditions are absent."""
+
+
+class UnauthorizedPreparationFailureAcknowledgementError(GameEngineError):
+    """Raised when someone other than the connected Songmaster acknowledges."""
+
+
+class PreparationOutcome(Enum):
+    """Outcome exposed internally after applying one preparation event."""
+
+    COLLECTING = "collecting"
+    FAILURE_PENDING_ACKNOWLEDGEMENT = "failure_pending_acknowledgement"
+    PLAYING = "playing"
+
+
+@dataclass(frozen=True, slots=True)
+class PreparationEventResult:
+    """Internal result for future preparation/playback notifications."""
+
+    preparation_id: UUID
+    outcome: PreparationOutcome
+    ready_browser_tokens: frozenset[str]
+    failed_browser_tokens: frozenset[str]
+    pending_browser_tokens: frozenset[str]
+    active_round: ActiveRound | None = None
+
+
 class GameEngine:
     """Own the single authoritative live game and its normal-flow state."""
 
@@ -144,6 +181,7 @@ class GameEngine:
         clock: Callable[[], datetime] | None = None,
         game_id_factory: Callable[[], UUID] | None = None,
         preparation_id_factory: Callable[[], UUID] | None = None,
+        round_id_factory: Callable[[], UUID] | None = None,
         shuffle: Shuffle | None = None,
     ) -> None:
         self._installation_defaults = deepcopy(
@@ -159,6 +197,9 @@ class GameEngine:
             preparation_id_factory
             if preparation_id_factory is not None
             else uuid4
+        )
+        self._round_id_factory = (
+            round_id_factory if round_id_factory is not None else uuid4
         )
         self._shuffle = shuffle if shuffle is not None else random_shuffle
         self._state = GameState.NO_GAME
@@ -515,8 +556,273 @@ class GameEngine:
         )
 
         game.pending_audio_preparation = pending
+        game.audio_preparation_responses = AudioPreparationResponseState(
+            preparation_id=preparation_id,
+            target_statuses={
+                token: AudioPreparationStatus.PENDING for token in audio_targets
+            },
+        )
         self._transition_to(GameState.AUDIO_PREPARING)
         return pending
+
+    def record_audio_preparation_ready(
+        self,
+        game_session_id: UUID,
+        preparation_id: UUID,
+        browser_token: str,
+    ) -> PreparationEventResult:
+        """Accept a target's first READY response and evaluate when complete."""
+
+        return self._record_audio_preparation_response(
+            game_session_id,
+            preparation_id,
+            browser_token,
+            AudioPreparationStatus.READY,
+        )
+
+    def record_audio_preparation_failed(
+        self,
+        game_session_id: UUID,
+        preparation_id: UUID,
+        browser_token: str,
+    ) -> PreparationEventResult:
+        """Accept a target's first FAILED response and evaluate when complete."""
+
+        return self._record_audio_preparation_response(
+            game_session_id,
+            preparation_id,
+            browser_token,
+            AudioPreparationStatus.FAILED,
+        )
+
+    def audio_preparation_timed_out(
+        self,
+        game_session_id: UUID,
+        preparation_id: UUID,
+    ) -> PreparationEventResult:
+        """Finalize response collection when its application timer expires."""
+
+        _, responses = self._current_preparation_for_event(
+            game_session_id,
+            preparation_id,
+        )
+        return self._evaluate_preparation_outcome(responses)
+
+    def acknowledge_audio_preparation_failure(
+        self,
+        game_session_id: UUID,
+        preparation_id: UUID,
+        requesting_browser_token: str,
+    ) -> GameSession:
+        """Apply transition D after the connected Songmaster acknowledges failure."""
+
+        if self._state is not GameState.AUDIO_PREPARING:
+            raise PreparationFailureAcknowledgementNotAllowedError(
+                "preparation failure acknowledgement requires AUDIO_PREPARING"
+            )
+        game = self._active_game
+        if game is None or game.game_session_id != game_session_id:
+            raise PreparationFailureAcknowledgementNotAllowedError(
+                "preparation failure acknowledgement targets a stale game"
+            )
+        pending = game.pending_audio_preparation
+        responses = game.audio_preparation_responses
+        if not isinstance(pending, PendingAudioPreparation) or not isinstance(
+            responses, AudioPreparationResponseState
+        ):
+            raise DomainInvariantError(
+                "AUDIO_PREPARING requires pending preparation response state"
+            )
+        if pending.preparation_id != preparation_id:
+            raise PreparationFailureAcknowledgementNotAllowedError(
+                "preparation failure acknowledgement targets a stale preparation"
+            )
+        if responses.preparation_id != pending.preparation_id:
+            raise DomainInvariantError(
+                "preparation responses must bind the pending preparation"
+            )
+        if not isinstance(responses.target_statuses, dict):
+            raise DomainInvariantError(
+                "preparation target statuses must be a mutable mapping"
+            )
+        self._validate_state_invariants(GameState.AUDIO_PREPARING)
+
+        token = self._validate_browser_token(
+            requesting_browser_token,
+            error_type=UnauthorizedPreparationFailureAcknowledgementError,
+        )
+        if token != game.songmaster_browser_token or not game.songmaster.connected:
+            raise UnauthorizedPreparationFailureAcknowledgementError(
+                "only the current connected Songmaster may acknowledge failure"
+            )
+        if (
+            not responses.outcome_determined
+            or not responses.failure_acknowledgement_pending
+            or responses.ready_browser_tokens
+        ):
+            raise PreparationFailureAcknowledgementNotAllowedError(
+                "preparation failure is not pending acknowledgement"
+            )
+
+        entry = pending.deck_entry
+        game.skipped_deck_entries += (
+            SkippedDeckEntry(
+                original_position=entry.original_position,
+                track_id=entry.track.track_id,
+                reason=DeckSkipReason.AUDIO_PREPARATION_FAILED,
+            ),
+        )
+        game.deck_pointer += 1
+        game.pending_audio_preparation = None
+        game.audio_preparation_responses = None
+        self._transition_to(GameState.ROUND_COMPLETE)
+        return game
+
+    def _record_audio_preparation_response(
+        self,
+        game_session_id: UUID,
+        preparation_id: UUID,
+        browser_token: str,
+        status: AudioPreparationStatus,
+    ) -> PreparationEventResult:
+        _, responses = self._current_preparation_for_event(
+            game_session_id,
+            preparation_id,
+        )
+        if browser_token not in responses.target_statuses:
+            raise PreparationEventInapplicableError(
+                "preparation response did not come from a targeted member"
+            )
+        current_status = responses.target_statuses[browser_token]
+        if current_status is not AudioPreparationStatus.PENDING:
+            raise PreparationEventInapplicableError(
+                "a target's first accepted terminal response is final"
+            )
+
+        responses.target_statuses[browser_token] = status
+        if responses.pending_browser_tokens:
+            self._validate_state_invariants(GameState.AUDIO_PREPARING)
+            return self._preparation_event_result(
+                responses,
+                PreparationOutcome.COLLECTING,
+            )
+        return self._evaluate_preparation_outcome(responses)
+
+    def _current_preparation_for_event(
+        self,
+        game_session_id: UUID,
+        preparation_id: UUID,
+    ) -> tuple[PendingAudioPreparation, AudioPreparationResponseState]:
+        game = self._active_game
+        if (
+            self._state is not GameState.AUDIO_PREPARING
+            or game is None
+            or game.game_session_id != game_session_id
+        ):
+            raise PreparationEventInapplicableError(
+                "preparation event does not target the active preparation"
+            )
+        pending = game.pending_audio_preparation
+        responses = game.audio_preparation_responses
+        if not isinstance(pending, PendingAudioPreparation) or not isinstance(
+            responses, AudioPreparationResponseState
+        ):
+            raise DomainInvariantError(
+                "AUDIO_PREPARING requires pending preparation response state"
+            )
+        if pending.preparation_id != preparation_id:
+            raise PreparationEventInapplicableError(
+                "preparation event targets a stale preparation"
+            )
+        if responses.preparation_id != pending.preparation_id:
+            raise DomainInvariantError(
+                "preparation responses must bind the pending preparation"
+            )
+        self._validate_state_invariants(GameState.AUDIO_PREPARING)
+        if responses.outcome_determined:
+            raise PreparationEventInapplicableError(
+                "preparation response collection has already completed"
+            )
+        return pending, responses
+
+    def _evaluate_preparation_outcome(
+        self,
+        responses: AudioPreparationResponseState,
+    ) -> PreparationEventResult:
+        responses.outcome_determined = True
+        ready_tokens = responses.ready_browser_tokens
+        if ready_tokens:
+            return self._take_transition_e(responses, ready_tokens)
+
+        responses.failure_acknowledgement_pending = True
+        self._validate_state_invariants(GameState.AUDIO_PREPARING)
+        return self._preparation_event_result(
+            responses,
+            PreparationOutcome.FAILURE_PENDING_ACKNOWLEDGEMENT,
+        )
+
+    def _take_transition_e(
+        self,
+        responses: AudioPreparationResponseState,
+        ready_tokens: frozenset[str],
+    ) -> PreparationEventResult:
+        game = self._active_game
+        pending = game.pending_audio_preparation if game is not None else None
+        if game is None or pending is None or not ready_tokens:
+            raise DomainInvariantError(
+                "transition E requires a pending preparation with READY targets"
+            )
+        round_id = self._round_id_factory()
+        if not isinstance(round_id, UUID):
+            raise DomainInvariantError("the round ID factory must return a UUID")
+        playback_started_at = self._clock()
+        if not isinstance(playback_started_at, datetime):
+            raise DomainInvariantError("the engine clock must return a datetime")
+
+        active_round = ActiveRound(
+            round_id=round_id,
+            preparation_id=pending.preparation_id,
+            deck_entry=pending.deck_entry,
+            original_deck_position=pending.deck_entry.original_position,
+            track_id=pending.deck_entry.track.track_id,
+            configured_playback_offset_seconds=(
+                pending.configured_playback_offset_seconds
+            ),
+            effective_playback_offset_seconds=(
+                pending.effective_playback_offset_seconds
+            ),
+            playback_duration_seconds=pending.playback_duration_seconds,
+            speed_bonus_plateau_percent=pending.speed_bonus_plateau_percent,
+            buzz_eligible_browser_tokens=pending.buzz_eligible_browser_tokens,
+            playback_clients=ready_tokens,
+            playback_started_at=playback_started_at,
+        )
+        result = self._preparation_event_result(
+            responses,
+            PreparationOutcome.PLAYING,
+            active_round=active_round,
+        )
+        game.active_round = active_round
+        game.pending_audio_preparation = None
+        game.audio_preparation_responses = None
+        self._transition_to(GameState.PLAYING)
+        return result
+
+    @staticmethod
+    def _preparation_event_result(
+        responses: AudioPreparationResponseState,
+        outcome: PreparationOutcome,
+        *,
+        active_round: ActiveRound | None = None,
+    ) -> PreparationEventResult:
+        return PreparationEventResult(
+            preparation_id=responses.preparation_id,
+            outcome=outcome,
+            ready_browser_tokens=responses.ready_browser_tokens,
+            failed_browser_tokens=responses.failed_browser_tokens,
+            pending_browser_tokens=responses.pending_browser_tokens,
+            active_round=active_round,
+        )
 
     def join_game(
         self, browser_token: str, display_name: str | None = None
@@ -818,6 +1124,8 @@ class GameEngine:
                 self._enter_round_complete()
             case GameState.AUDIO_PREPARING:
                 self._enter_audio_preparing()
+            case GameState.PLAYING:
+                self._enter_playing()
             case GameState.FINISHED:
                 self._enter_finished()
             case _:
@@ -864,6 +1172,17 @@ class GameEngine:
                 "AUDIO_PREPARING entry requires a pending preparation"
             )
 
+    def _enter_playing(self) -> None:
+        """Establish player-facing and buzz state for an actual round."""
+
+        game = self._active_game
+        if game is None or game.active_round is None:
+            raise DomainInvariantError("PLAYING entry requires an actual round")
+        game.displayed_deck_position = game.active_round.original_deck_position
+        game.displayed_artist = None
+        game.displayed_title = None
+        game.buzzing_enabled = True
+
     def _take_transition_k(self) -> None:
         """Apply transition K after established deck exhaustion."""
 
@@ -896,6 +1215,7 @@ class GameEngine:
         game.final_standings = self._calculate_final_standings(game)
         game.active_round = None
         game.pending_audio_preparation = None
+        game.audio_preparation_responses = None
         game.buzzing_enabled = False
 
     @staticmethod
@@ -934,6 +1254,8 @@ class GameEngine:
                 self._validate_round_complete_invariants()
             case GameState.AUDIO_PREPARING:
                 self._validate_audio_preparing_invariants()
+            case GameState.PLAYING:
+                self._validate_playing_invariants()
             case GameState.FINISHED:
                 self._validate_finished_invariants()
             case _:
@@ -979,6 +1301,8 @@ class GameEngine:
             raise DomainInvariantError("LOBBY cannot have an active round")
         if game.pending_audio_preparation is not None:
             raise DomainInvariantError("LOBBY cannot have a pending preparation")
+        if game.audio_preparation_responses is not None:
+            raise DomainInvariantError("LOBBY cannot have preparation responses")
         if game.buzzing_enabled is not False:
             raise DomainInvariantError("buzzing must be disabled in LOBBY")
         if game.playlist_selection_editable is not True:
@@ -1147,7 +1471,10 @@ class GameEngine:
                 raise DomainInvariantError(
                     "skipped entry identity must match its original deck position"
                 )
-            if skipped.reason is not DeckSkipReason.DURATION_INELIGIBLE:
+            if skipped.reason not in {
+                DeckSkipReason.DURATION_INELIGIBLE,
+                DeckSkipReason.AUDIO_PREPARATION_FAILED,
+            }:
                 raise DomainInvariantError("skipped entry reason is not supported")
             skipped_positions.add(skipped.original_position)
 
@@ -1181,6 +1508,10 @@ class GameEngine:
         if game.pending_audio_preparation is not None:
             raise DomainInvariantError(
                 "ROUND_COMPLETE cannot have a pending preparation"
+            )
+        if game.audio_preparation_responses is not None:
+            raise DomainInvariantError(
+                "ROUND_COMPLETE cannot have preparation responses"
             )
         if game.buzzing_enabled is not False:
             raise DomainInvariantError(
@@ -1241,6 +1572,51 @@ class GameEngine:
         if not isinstance(pending, PendingAudioPreparation):
             raise DomainInvariantError(
                 "AUDIO_PREPARING requires an immutable pending preparation"
+            )
+        responses = game.audio_preparation_responses
+        if not isinstance(responses, AudioPreparationResponseState):
+            raise DomainInvariantError(
+                "AUDIO_PREPARING requires preparation response bookkeeping"
+            )
+        if responses.preparation_id != pending.preparation_id:
+            raise DomainInvariantError(
+                "preparation responses must bind the pending preparation"
+            )
+        if not isinstance(responses.target_statuses, dict):
+            raise DomainInvariantError(
+                "preparation target statuses must be a mutable mapping"
+            )
+        if set(responses.target_statuses) != set(
+            pending.audio_target_browser_tokens
+        ):
+            raise DomainInvariantError(
+                "preparation response targets must match the immutable snapshot"
+            )
+        if any(
+            not isinstance(status, AudioPreparationStatus)
+            for status in responses.target_statuses.values()
+        ):
+            raise DomainInvariantError("preparation target statuses are invalid")
+        if not isinstance(responses.outcome_determined, bool) or not isinstance(
+            responses.failure_acknowledgement_pending, bool
+        ):
+            raise DomainInvariantError("preparation outcome flags must be boolean")
+        if responses.outcome_determined:
+            if (
+                not responses.failure_acknowledgement_pending
+                or responses.ready_browser_tokens
+            ):
+                raise DomainInvariantError(
+                    "a determined preparation remaining in AUDIO_PREPARING must "
+                    "await acknowledgement with zero READY targets"
+                )
+        elif responses.failure_acknowledgement_pending:
+            raise DomainInvariantError(
+                "failure acknowledgement cannot precede outcome determination"
+            )
+        elif not responses.pending_browser_tokens:
+            raise DomainInvariantError(
+                "all terminal responses must determine the preparation outcome"
             )
         if not isinstance(pending.preparation_id, UUID):
             raise DomainInvariantError("preparation identity must be a UUID")
@@ -1307,6 +1683,79 @@ class GameEngine:
                 "audio target snapshot must contain only valid audio targets"
             )
 
+    def _validate_playing_invariants(self) -> None:
+        game = self._active_game
+        if game is None:
+            raise DomainInvariantError("PLAYING requires an active game")
+        deck = self._validate_started_game_facts(game, state_name="PLAYING")
+        if game.deck_exhausted is not False or game.deck_pointer >= len(deck):
+            raise DomainInvariantError(
+                "PLAYING requires a non-exhausted entry under the pointer"
+            )
+        active_round = game.active_round
+        if not isinstance(active_round, ActiveRound):
+            raise DomainInvariantError("PLAYING requires an actual round")
+        if active_round.deck_entry is not deck[game.deck_pointer]:
+            raise DomainInvariantError(
+                "the active round must bind the deck entry under the pointer"
+            )
+        if active_round.original_deck_position != active_round.deck_entry.original_position:
+            raise DomainInvariantError("active round deck position is inconsistent")
+        if active_round.track_id != active_round.deck_entry.track.track_id:
+            raise DomainInvariantError("active round track identity is inconsistent")
+        if not isinstance(active_round.round_id, UUID) or not isinstance(
+            active_round.preparation_id, UUID
+        ):
+            raise DomainInvariantError("round and preparation identities must be UUIDs")
+        if not isinstance(active_round.playback_started_at, datetime):
+            raise DomainInvariantError("PLAYING requires a playback start timestamp")
+        if (
+            active_round.configured_playback_offset_seconds
+            != game.settings.playback_offset_seconds
+            or active_round.playback_duration_seconds
+            != game.settings.playback_duration_seconds
+            or active_round.speed_bonus_plateau_percent
+            != game.settings.speed_bonus_plateau_percent
+        ):
+            raise DomainInvariantError(
+                "active round settings must preserve the preparation snapshot"
+            )
+        expected_effective_offset = calculate_effective_playback_offset(
+            active_round.deck_entry.track,
+            active_round.configured_playback_offset_seconds,
+            active_round.playback_duration_seconds,
+        )
+        if active_round.effective_playback_offset_seconds != expected_effective_offset:
+            raise DomainInvariantError("active round effective offset is inconsistent")
+        if not isinstance(
+            active_round.buzz_eligible_browser_tokens, frozenset
+        ) or not isinstance(active_round.playback_clients, frozenset):
+            raise DomainInvariantError(
+                "round eligibility and playback client snapshots must be immutable"
+            )
+        if not active_round.playback_clients:
+            raise DomainInvariantError("PLAYING requires at least one playback client")
+        if not active_round.playback_clients <= active_round.buzz_eligible_browser_tokens:
+            raise DomainInvariantError(
+                "playback clients must belong to the frozen eligible player set"
+            )
+        if not active_round.buzz_eligible_browser_tokens <= frozenset(game.members):
+            raise DomainInvariantError("round eligibility must contain only members")
+        if game.pending_audio_preparation is not None:
+            raise DomainInvariantError("PLAYING cannot retain a pending preparation")
+        if game.audio_preparation_responses is not None:
+            raise DomainInvariantError("PLAYING cannot retain preparation responses")
+        if game.buzzing_enabled is not True:
+            raise DomainInvariantError("buzzing must be enabled in PLAYING")
+        if game.displayed_deck_position != active_round.original_deck_position:
+            raise DomainInvariantError("PLAYING must display the active deck position")
+        if game.displayed_artist is not None or game.displayed_title is not None:
+            raise DomainInvariantError("PLAYING answer display must remain blank")
+        if game.ended_at is not None or game.end_reason is not None:
+            raise DomainInvariantError("PLAYING cannot have game finalization facts")
+        if game.final_standings != ():
+            raise DomainInvariantError("PLAYING cannot have final standings")
+
     def _validate_finished_invariants(self) -> None:
         game = self._active_game
         if game is None:
@@ -1316,6 +1765,8 @@ class GameEngine:
             raise DomainInvariantError("FINISHED cannot have an active round")
         if game.pending_audio_preparation is not None:
             raise DomainInvariantError("FINISHED cannot have a pending preparation")
+        if game.audio_preparation_responses is not None:
+            raise DomainInvariantError("FINISHED cannot have preparation responses")
         if game.buzzing_enabled is not False:
             raise DomainInvariantError("buzzing must be disabled in FINISHED")
         if game.deck_pointer != len(deck) or game.deck_exhausted is not True:

@@ -7,9 +7,13 @@ while persistent playlist and media inspection is in progress.
 """
 
 import asyncio
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from math import isfinite
+from numbers import Real
 from os import PathLike
 from typing import Any, Final
+from uuid import UUID
 
 from sqlalchemy import Engine
 
@@ -19,9 +23,15 @@ from who_sings_that.domain import (
     GameEngine,
     GameEngineError,
     InvalidPlayerNameError,
+    PreparationEventResult,
+    PreparationOutcome,
 )
 
 from .messages import (
+    AcknowledgeAudioPreparationFailureRequest,
+    AudioPreparationFailedEvent,
+    AudioPreparationReadyEvent,
+    AudioPreparationTimeoutEvent,
     AuthoritativeMessage,
     BrowserAudioCapabilityChangedEvent,
     ClientRequest,
@@ -98,6 +108,7 @@ class _StopConsumer:
 
 
 _STOP_CONSUMER: Final = _StopConsumer()
+DEFAULT_PREPARATION_TIMEOUT_SECONDS: Final = 5.0
 _EXPECTED_APPLICATION_ERRORS: Final = (
     InvalidMusicRootError,
     InvalidSelectedPlaylistIdsError,
@@ -126,17 +137,32 @@ class GameController:
         *,
         game_engine: GameEngine | None = None,
         inspect_media: MediaInspector = extract_track_metadata,
+        preparation_timeout_seconds: float = DEFAULT_PREPARATION_TIMEOUT_SECONDS,
+        preparation_timeout_sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
+        if (
+            isinstance(preparation_timeout_seconds, bool)
+            or not isinstance(preparation_timeout_seconds, Real)
+            or not isfinite(preparation_timeout_seconds)
+            or preparation_timeout_seconds <= 0
+        ):
+            raise ValueError(
+                "preparation_timeout_seconds must be a positive finite number"
+            )
         self._game_engine = game_engine if game_engine is not None else GameEngine()
         self._database_engine = database_engine
         self._music_root = music_root
         self._inspect_media = inspect_media
+        self._preparation_timeout_seconds = float(preparation_timeout_seconds)
+        self._preparation_timeout_sleep = preparation_timeout_sleep
         self._queue: asyncio.Queue[_QueuedMessage | _StopConsumer] = asyncio.Queue()
         self._consumer_task: asyncio.Task[None] | None = None
         self._consumer_ready: asyncio.Event | None = None
         self._accepting_messages = False
         self._failure: BaseException | None = None
         self._system_event_rejections: list[SystemEventRejection] = []
+        self._preparation_timeout_task: asyncio.Task[None] | None = None
+        self._owned_timer_tasks: set[asyncio.Task[None]] = set()
 
     @property
     def game_engine(self) -> GameEngine:
@@ -162,6 +188,13 @@ class GameController:
         """Return expected event rejections observed since construction."""
 
         return tuple(self._system_event_rejections)
+
+    @property
+    def preparation_timeout_active(self) -> bool:
+        """Return whether a live preparation timeout task is currently owned."""
+
+        task = self._preparation_timeout_task
+        return task is not None and not task.done()
 
     async def start(self) -> None:
         """Start exactly one consumer and wait until it is ready for work."""
@@ -194,8 +227,11 @@ class GameController:
 
         if self._accepting_messages:
             self._accepting_messages = False
+            self._retire_preparation_timeout()
             self._queue.put_nowait(_STOP_CONSUMER)
         await task
+        self._retire_preparation_timeout()
+        await self._await_timer_cleanup()
         self._consumer_task = None
         self._consumer_ready = None
         if self._failure is not None:
@@ -303,7 +339,43 @@ class GameController:
             )
         if isinstance(message, PlaySongRequest):
             self._require_target_game(message.game_session_id)
-            return self._game_engine.play_song(message.requesting_browser_token)
+            pending = self._game_engine.play_song(message.requesting_browser_token)
+            self._schedule_preparation_timeout(
+                message.game_session_id,
+                pending.preparation_id,
+            )
+            return pending
+        if isinstance(message, AudioPreparationReadyEvent):
+            result = self._game_engine.record_audio_preparation_ready(
+                message.game_session_id,
+                message.preparation_id,
+                message.browser_token,
+            )
+            self._retire_timeout_if_collection_completed(result)
+            return result
+        if isinstance(message, AudioPreparationFailedEvent):
+            result = self._game_engine.record_audio_preparation_failed(
+                message.game_session_id,
+                message.preparation_id,
+                message.browser_token,
+            )
+            self._retire_timeout_if_collection_completed(result)
+            return result
+        if isinstance(message, AudioPreparationTimeoutEvent):
+            result = self._game_engine.audio_preparation_timed_out(
+                message.game_session_id,
+                message.preparation_id,
+            )
+            self._retire_timeout_if_collection_completed(result)
+            return result
+        if isinstance(message, AcknowledgeAudioPreparationFailureRequest):
+            result = self._game_engine.acknowledge_audio_preparation_failure(
+                message.game_session_id,
+                message.preparation_id,
+                message.requesting_browser_token,
+            )
+            self._retire_preparation_timeout()
+            return result
         if isinstance(message, MemberDisconnectedEvent):
             self._require_target_game(message.game_session_id)
             return self._game_engine.disconnect_member(message.browser_token)
@@ -323,6 +395,74 @@ class GameController:
             raise StaleGameSessionError(
                 "message does not target the active game session"
             )
+
+    def _schedule_preparation_timeout(
+        self,
+        game_session_id: UUID,
+        preparation_id: UUID,
+    ) -> None:
+        self._retire_preparation_timeout()
+        task = asyncio.create_task(
+            self._post_preparation_timeout(game_session_id, preparation_id),
+            name="wst-audio-preparation-timeout",
+        )
+        self._preparation_timeout_task = task
+        self._owned_timer_tasks.add(task)
+        task.add_done_callback(self._timer_task_done)
+
+    async def _post_preparation_timeout(
+        self,
+        game_session_id: UUID,
+        preparation_id: UUID,
+    ) -> None:
+        try:
+            await self._preparation_timeout_sleep(
+                self._preparation_timeout_seconds
+            )
+        except asyncio.CancelledError:
+            return
+        try:
+            self.post_system_event(
+                AudioPreparationTimeoutEvent(
+                    game_session_id=game_session_id,
+                    preparation_id=preparation_id,
+                )
+            )
+        except (ControllerNotRunningError, ControllerFailedError):
+            # Shutdown/failure retires owned timers; a racing expiry is harmless.
+            return
+
+    def _retire_timeout_if_collection_completed(
+        self,
+        result: PreparationEventResult,
+    ) -> None:
+        if result.outcome is not PreparationOutcome.COLLECTING:
+            self._retire_preparation_timeout()
+
+    def _retire_preparation_timeout(self) -> None:
+        task = self._preparation_timeout_task
+        self._preparation_timeout_task = None
+        if task is not None and not task.done():
+            task.cancel()
+
+    def _timer_task_done(self, task: asyncio.Task[None]) -> None:
+        self._owned_timer_tasks.discard(task)
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is not None:
+            task.get_loop().call_exception_handler(
+                {
+                    "message": "WST preparation timeout task failed",
+                    "exception": error,
+                    "task": task,
+                }
+            )
+
+    async def _await_timer_cleanup(self) -> None:
+        tasks = tuple(self._owned_timer_tasks)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     @staticmethod
     def _is_expected_operational_error(error: Exception) -> bool:
@@ -354,6 +494,7 @@ class GameController:
     ) -> None:
         self._failure = error
         self._accepting_messages = False
+        self._retire_preparation_timeout()
         if queued.response is not None:
             self._complete_response(queued.response, error=error)
 
@@ -394,6 +535,7 @@ def _observe_response_exception(response: asyncio.Future[Any]) -> None:
 
 
 __all__ = [
+    "DEFAULT_PREPARATION_TIMEOUT_SECONDS",
     "ConsumerAlreadyRunningError",
     "ConsumerSelfRequestError",
     "ControllerFailedError",

@@ -73,6 +73,15 @@ class PlaySongRequest(ClientRequest):
 
 
 @dataclass(frozen=True, slots=True)
+class AcknowledgeAudioPreparationFailureRequest(ClientRequest):
+    """Request transition D for a finalized unsuccessful preparation."""
+
+    game_session_id: UUID
+    preparation_id: UUID
+    requesting_browser_token: str
+
+
+@dataclass(frozen=True, slots=True)
 class MemberDisconnectedEvent(SystemEvent):
     """Trusted observation that a particular browser connection was lost."""
 
@@ -91,10 +100,42 @@ class BrowserAudioCapabilityChangedEvent(SystemEvent):
     browser_audio_usable: bool
 
 
+@dataclass(frozen=True, slots=True)
+class AudioPreparationReadyEvent(SystemEvent):
+    """Trusted client-originated READY notification for one target."""
+
+    game_session_id: UUID
+    preparation_id: UUID
+    browser_token: str
+    source_connection_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class AudioPreparationFailedEvent(SystemEvent):
+    """Trusted client-originated FAILED notification for one target."""
+
+    game_session_id: UUID
+    preparation_id: UUID
+    browser_token: str
+    source_connection_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class AudioPreparationTimeoutEvent(SystemEvent):
+    """Application timer expiry for one specific preparation attempt."""
+
+    game_session_id: UUID
+    preparation_id: UUID
+
+
 AuthoritativeMessage = ClientRequest | SystemEvent
 
 
 __all__ = [
+    "AcknowledgeAudioPreparationFailureRequest",
+    "AudioPreparationFailedEvent",
+    "AudioPreparationReadyEvent",
+    "AudioPreparationTimeoutEvent",
     "AuthoritativeMessage",
     "BrowserAudioCapabilityChangedEvent",
     "ClientRequest",

@@ -569,7 +569,7 @@ End Game and Songmaster disconnect/failover are global overlays and are intentio
 | B | `LOBBY` | `ROUND_COMPLETE` | Songmaster requests Start Game and deck can be built |
 | C | `ROUND_COMPLETE` | `AUDIO_PREPARING` | Play Song requested, deck not exhausted, valid audio target exists |
 | D | `AUDIO_PREPARING` | `ROUND_COMPLETE` | No audio target can prepare selected song; SM acknowledges failure |
-| E | `AUDIO_PREPARING` | `PLAYING` | At least one audio target is ready |
+| E | `AUDIO_PREPARING` | `PLAYING` | Preparation evaluation finds at least one READY target |
 | F | `PLAYING` | `AWAITING_REVEAL` | First valid buzz wins before timeout |
 | G | `PLAYING` | `AWAITING_REVEAL` | Playback duration expires before valid buzz |
 | H | `AWAITING_REVEAL` | `SCORING` | Reveal requested and round ended by buzz |
@@ -729,6 +729,18 @@ Internal work:
 
 A pending preparation context is allowed, but this is not yet a played round. The prospective round's buzz-eligible player set is already frozen from transition C; players joining or reconnecting during preparation are observers for this round.
 
+Every targeted client begins with status `PENDING`. A target's first accepted
+`READY` or `FAILED` response is terminal and cannot be replaced. Evaluate the
+preparation when every target has reached a terminal status or when the
+application-owned preparation timeout expires. The initial timeout is five
+seconds.
+
+At evaluation, take transition E immediately if one or more targets are READY;
+only those READY targets become `playback_clients`. If none are READY, record
+that failure acknowledgement is pending and remain in `AUDIO_PREPARING`. A late
+response cannot change a finalized outcome. In particular, a late READY cannot
+resurrect a failure awaiting acknowledgement.
+
 ### Transition D — preparation failure
 
 Condition:
@@ -749,7 +761,8 @@ Target: `ROUND_COMPLETE`.
 
 Condition:
 
-- at least one audio target reports READY.
+- response evaluation occurs after every target responds or timeout expires;
+- at least one target is READY at that evaluation.
 
 Actions:
 
@@ -764,6 +777,12 @@ Actions:
 9. enable buzzing for the player set snapshotted on transition C.
 
 Target: `PLAYING`.
+
+The authoritative transition and round/timing facts are implemented before
+browser playback delivery. Actual preload commands, playback-start commands,
+and playback-duration timer scheduling remain transport/application work for a
+later increment. Internal deck entries, track IDs, paths, and answer metadata
+must not be serialized into pre-reveal client notifications.
 
 ## 31. State: `PLAYING`
 
@@ -1205,13 +1224,32 @@ V1 readiness rule:
 
 > At least one audio-enabled client must successfully prepare the track before playback can begin.
 
-If several clients are enabled and one succeeds while another fails, one ready client is sufficient to begin a V1 round. Only READY clients actually commanded to start belong to that round's `playback_clients` set.
+Preparation collection waits until every targeted client reports READY/FAILED or
+the five-second preparation timeout expires. The first READY response does not
+start playback while another target remains pending. If several clients are
+enabled and evaluation finds at least one READY target, that is sufficient to
+begin a V1 round. Only targets that are READY at evaluation belong to that
+round's `playback_clients`; FAILED and still-PENDING targets do not.
+
+With zero READY targets, the outcome becomes final but remains in
+`AUDIO_PREPARING` until the connected Songmaster acknowledges the failure. The
+selected entry is not consumed before acknowledgement.
 
 Once `PLAYING` begins, loss of **any** member of `playback_clients` voids and consumes the round as specified in the `PLAYING` state. V1 does not attempt to continue with a reduced playback-client set.
 
 Future remote multi-location play may require one designated playback client per physical location, per-location readiness, and synchronized future-start timestamps.
 
-Exact readiness timeout length is an implementation/configuration detail.
+The preparation timeout is application-level configuration, initially five
+seconds, rather than a player-facing game setting. Its timer may only post a
+typed timeout event to the global authoritative queue; it must not invoke the
+game engine directly.
+
+READY/FAILED events identify the reporting member and source connection. Until
+the browser connection registry exists, trusted application producers retain
+responsibility for that source assertion. Real transport integration must
+validate that an event came from the member's current connection so an old
+connection cannot affect a newer one. Full active-state join, reconnect,
+disconnect, and capability-loss behavior remains unimplemented.
 
 ## 45. Browser Autoplay
 
@@ -1250,6 +1288,7 @@ Playback offset:             30 seconds
 Playback duration:           30 seconds
 Speed plateau:               10%
 Songmaster reconnect grace:  10 seconds
+Audio preparation timeout:    5 seconds (application-level)
 ```
 
 Scoring constants:
@@ -1312,6 +1351,10 @@ min multiplier: 1.0x
 44. Active games need not survive server restart in V1.
 45. Completed game history persists indefinitely.
 46. Closing a finished live session never deletes historical record or browser-local identity.
+47. Preparation waits for all targets or timeout before evaluating READY targets.
+48. A target's first accepted READY/FAILED result is terminal for that preparation.
+49. Preparation failure does not consume the selected entry until Songmaster acknowledgement.
+50. Transition E creates the actual round and includes only READY targets as playback clients.
 
 ## 49. Future Directions
 

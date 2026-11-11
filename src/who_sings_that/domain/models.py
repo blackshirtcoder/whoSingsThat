@@ -31,6 +31,7 @@ class DeckSkipReason(Enum):
     """Permanent reasons that a structural deck entry was not played."""
 
     DURATION_INELIGIBLE = "duration_ineligible"
+    AUDIO_PREPARATION_FAILED = "audio_preparation_failed"
 
 
 class GameEndReason(Enum):
@@ -134,6 +135,72 @@ class PendingAudioPreparation:
     audio_target_browser_tokens: frozenset[str]
 
 
+class AudioPreparationStatus(Enum):
+    """One target's authoritative response to a preparation attempt."""
+
+    PENDING = "pending"
+    READY = "ready"
+    FAILED = "failed"
+
+
+@dataclass(slots=True)
+class AudioPreparationResponseState:
+    """Mutable response ledger bound to one immutable preparation snapshot."""
+
+    preparation_id: UUID
+    target_statuses: dict[str, AudioPreparationStatus]
+    outcome_determined: bool = False
+    failure_acknowledgement_pending: bool = False
+
+    @property
+    def ready_browser_tokens(self) -> frozenset[str]:
+        """Return targets whose first accepted terminal response was READY."""
+
+        return frozenset(
+            token
+            for token, status in self.target_statuses.items()
+            if status is AudioPreparationStatus.READY
+        )
+
+    @property
+    def failed_browser_tokens(self) -> frozenset[str]:
+        """Return targets whose first accepted terminal response was FAILED."""
+
+        return frozenset(
+            token
+            for token, status in self.target_statuses.items()
+            if status is AudioPreparationStatus.FAILED
+        )
+
+    @property
+    def pending_browser_tokens(self) -> frozenset[str]:
+        """Return targets that had not responded when inspected or finalized."""
+
+        return frozenset(
+            token
+            for token, status in self.target_statuses.items()
+            if status is AudioPreparationStatus.PENDING
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ActiveRound:
+    """Authoritative immutable facts for the currently playing round."""
+
+    round_id: UUID
+    preparation_id: UUID
+    deck_entry: DeckEntry
+    original_deck_position: int
+    track_id: int
+    configured_playback_offset_seconds: int
+    effective_playback_offset_seconds: Decimal
+    playback_duration_seconds: int
+    speed_bonus_plateau_percent: Decimal
+    buzz_eligible_browser_tokens: frozenset[str]
+    playback_clients: frozenset[str]
+    playback_started_at: datetime
+
+
 @dataclass(frozen=True, slots=True)
 class SelectedPlaylistSnapshot:
     """Immutable playlist metadata captured when a game starts."""
@@ -197,8 +264,9 @@ class GameSession:
     ended_at: datetime | None = None
     end_reason: GameEndReason | None = None
     final_standings: tuple[FinalStanding, ...] = ()
-    active_round: object | None = None
+    active_round: ActiveRound | None = None
     pending_audio_preparation: PendingAudioPreparation | None = None
+    audio_preparation_responses: AudioPreparationResponseState | None = None
     buzzing_enabled: bool = False
     displayed_deck_position: int | None = None
     displayed_artist: str | None = None

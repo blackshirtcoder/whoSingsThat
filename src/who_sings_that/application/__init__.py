@@ -1,6 +1,7 @@
 """Application operations connecting persistence and the game domain."""
 
 from .controller import (
+    DEFAULT_PREPARATION_TIMEOUT_SECONDS,
     ConsumerAlreadyRunningError,
     ConsumerSelfRequestError,
     ControllerFailedError,
@@ -12,6 +13,10 @@ from .controller import (
     UnsupportedMessageError,
 )
 from .messages import (
+    AcknowledgeAudioPreparationFailureRequest,
+    AudioPreparationFailedEvent,
+    AudioPreparationReadyEvent,
+    AudioPreparationTimeoutEvent,
     AuthoritativeMessage,
     BrowserAudioCapabilityChangedEvent,
     ClientRequest,
@@ -39,6 +44,11 @@ from .start_game import (
 )
 
 __all__ = [
+    "DEFAULT_PREPARATION_TIMEOUT_SECONDS",
+    "AcknowledgeAudioPreparationFailureRequest",
+    "AudioPreparationFailedEvent",
+    "AudioPreparationReadyEvent",
+    "AudioPreparationTimeoutEvent",
     "AuthoritativeMessage",
     "BrowserAudioCapabilityChangedEvent",
     "ClientRequest",
