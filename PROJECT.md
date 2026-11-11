@@ -529,6 +529,12 @@ Because filenames themselves contain artist/title, audio delivery must not expos
 
 Use an opaque audio/preparation identifier or equivalent mechanism.
 
+Start Game retains artist/title internally in each immutable game-deck track
+snapshot so Reveal remains a synchronous domain operation and later catalog
+changes cannot rewrite the answer for the active game. These internal deck,
+preparation, and actual-round objects are not player-facing response payloads
+and must not be serialized by a future transport before Reveal.
+
 ## 24. Player-Facing Song Display vs Deck Pointer
 
 The deck pointer and the currently displayed round are distinct concepts.
@@ -898,10 +904,10 @@ Meaning:
 
 > Playback has ended, but the answer remains hidden while players may discuss it.
 
-For the currently implemented F/G boundary, the played entry remains the
-current unconsumed deck entry. Consumption is intentionally deferred to a later
-reveal/completion increment so F/G do not implement H, I, J, or played-round
-history semantics prematurely.
+The played entry remains current and unconsumed throughout this state. Reveal
+then selects one of two implemented paths: H keeps the buzzed entry current
+through `SCORING` for later transition J, while I completes and consumes a
+timeout entry before entering `ROUND_COMPLETE`.
 
 ### Entry actions
 
@@ -929,7 +935,7 @@ The termination outcome invariants are:
 - scores and playback-setting snapshots remain unchanged; and
 - artist/title remain hidden.
 
-Future post-play display behavior is:
+Post-play display behavior after Reveal is:
 
 - buzz case: show buzzer and buzz time;
 - timeout case: indicate play interval expired;
@@ -950,11 +956,17 @@ Reveal requested
 AND round_end_reason == BUZZ
 ```
 
+The request must identify the current game and actual round and must come from
+the current connected Songmaster. Reveal is never automatic.
+
 Actions:
 
 - reveal authoritative artist/title;
 - update player-facing round snapshot;
-- preserve buzzer/buzz-time/multiplier.
+- preserve the actual-round identity, settings snapshot, buzzer, and trusted
+  buzz elapsed time;
+- preserve the deck pointer on the current unconsumed entry;
+- preserve all committed scores.
 
 Target: `SCORING`.
 
@@ -967,11 +979,20 @@ Reveal requested
 AND round_end_reason == TIMEOUT
 ```
 
+The same current-game, current-round, and connected-Songmaster authorization
+requirements apply.
+
 Actions:
 
 - reveal artist/title;
 - update player-facing snapshot;
-- record round completed with no buzzer and zero points.
+- record the round completed with no buzzer and zero points in the live
+  most-recent-completed-round snapshot;
+- consume the bound played entry exactly once by incrementing the zero-based
+  deck pointer;
+- clear the active-round and live termination fields;
+- enter normal `ROUND_COMPLETE` candidate scanning, including immediate K when
+  the deck is exhausted.
 
 Target: `ROUND_COMPLETE`.
 
@@ -980,6 +1001,12 @@ Target: `ROUND_COMPLETE`.
 Meaning:
 
 > The answer is visible after a buzz and the Songmaster is adjudicating the round. Any displayed scoring choice remains provisional until explicitly accepted.
+
+Entry invariants require the still-current actual round, a valid BUZZ
+termination with eligible winner and trusted elapsed time, the revealed answer,
+disabled buzzing, no pending preparation, unchanged committed scores, and no
+completed snapshot for this current round. The entry does not consume the deck
+entry or assign points.
 
 Internal work:
 
@@ -995,6 +1022,10 @@ Neither
 Each selection replaces the prior provisional choice, recalculates provisional points, updates the displayed provisional scoreboard, and remains changeable.
 
 `Accept Score` is visible immediately but disabled until the first scoring option is selected.
+
+The current implementation stops at SCORING entry. Provisional adjudication,
+point assignment, acceptance, transition J, and buzz-round consumption remain
+the next domain increment.
 
 ### Transition J — accept score
 
@@ -1401,9 +1432,8 @@ min multiplier: 1.0x
 17. Round buzz eligibility is snapshotted on transition C before `AUDIO_PREPARING`; joins/reconnects after that snapshot are observers for that round.
 18. First valid buzz wins.
 19. Buzz and timeout are mutually exclusive terminating events.
-20. In the implemented F/G boundary, `AWAITING_REVEAL` disables buzzing and
-    preserves the played entry under the current unconsumed deck pointer;
-    physical audio stop and later consumption remain future work.
+20. `AWAITING_REVEAL` disables buzzing and preserves the played entry under the
+    current unconsumed deck pointer until the Songmaster explicitly reveals.
 21. Reveal is always manual.
 22. Timeout rounds go from reveal directly to `ROUND_COMPLETE`.
 23. Buzz rounds go from reveal to `SCORING`.
@@ -1443,6 +1473,17 @@ min multiplier: 1.0x
     enqueue system events.
 55. F/G preserve the winner/elapsed-or-timeout outcome without assigning points,
     revealing answer metadata, or consuming the played entry.
+56. Reveal is accepted only from the current connected Songmaster for the
+    current game and actual round in `AWAITING_REVEAL`.
+57. H reveals a buzz round and enters `SCORING` without consuming its entry or
+    changing committed scores.
+58. I reveals a timeout round, records zero awarded points, consumes its entry
+    exactly once, and enters normal `ROUND_COMPLETE` scanning.
+59. Revealed previous-song display survives `ROUND_COMPLETE`, preparation, and
+    deck exhaustion; transition E alone replaces its position and hides the
+    answer for the next actual round.
+60. The internal Python controller/domain results are not transport payloads;
+    future player-facing serialization must project only state-appropriate data.
 
 ## 49. Future Directions
 

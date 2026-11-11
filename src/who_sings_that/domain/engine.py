@@ -16,6 +16,7 @@ from .models import (
     ActiveRound,
     AudioPreparationResponseState,
     AudioPreparationStatus,
+    CompletedRound,
     DeckSkipReason,
     FinalStanding,
     GameEndReason,
@@ -162,6 +163,14 @@ class BuzzNotAllowedError(GameEngineError):
 
 class PlaybackTimeoutInapplicableError(GameEngineError):
     """Expected discard of an early or stale playback timeout event."""
+
+
+class RevealNotAllowedError(GameEngineError):
+    """Raised when Reveal does not target the current revealable round."""
+
+
+class UnauthorizedRevealError(GameEngineError):
+    """Raised when Reveal is not requested by the connected Songmaster."""
 
 
 class PreparationOutcome(Enum):
@@ -793,6 +802,84 @@ class GameEngine:
         self._transition_to(GameState.AWAITING_REVEAL)
         return termination
 
+    def reveal_answer(
+        self,
+        game_session_id: UUID,
+        round_id: UUID,
+        requesting_browser_token: str,
+    ) -> GameSession:
+        """Apply transition H or I according to the recorded termination."""
+
+        if self._state is not GameState.AWAITING_REVEAL:
+            raise RevealNotAllowedError(
+                "Reveal is only allowed in AWAITING_REVEAL"
+            )
+        game = self._active_game
+        if game is None or game.game_session_id != game_session_id:
+            raise RevealNotAllowedError("Reveal targets a stale game")
+
+        token = self._validate_browser_token(
+            requesting_browser_token,
+            error_type=UnauthorizedRevealError,
+        )
+        if token != game.songmaster_browser_token or not game.songmaster.connected:
+            raise UnauthorizedRevealError(
+                "only the current connected Songmaster may reveal the answer"
+            )
+
+        active_round = game.active_round
+        if not isinstance(active_round, ActiveRound):
+            raise DomainInvariantError(
+                "AWAITING_REVEAL requires an actual played round"
+            )
+        if active_round.round_id != round_id:
+            raise RevealNotAllowedError("Reveal targets a stale round")
+        self._validate_state_invariants(GameState.AWAITING_REVEAL)
+
+        artist, title = self._answer_for_reveal(active_round)
+        termination = game.round_termination
+        if not isinstance(termination, RoundTermination):
+            raise DomainInvariantError(
+                "AWAITING_REVEAL requires a termination outcome"
+            )
+
+        # Revealing the answer is transition-specific work shared by H and I.
+        # The established display position already identifies this actual round.
+        game.displayed_artist = artist
+        game.displayed_title = title
+
+        if termination.reason is RoundTerminationReason.BUZZ:
+            self._transition_to(GameState.SCORING)
+            return game
+        if termination.reason is RoundTerminationReason.PLAYBACK_TIMEOUT:
+            # Transition I finalizes the zero-point round and consumes its bound
+            # entry before normal ROUND_COMPLETE candidate scanning runs.
+            game.last_completed_round = CompletedRound(
+                active_round=active_round,
+                termination=termination,
+                awarded_points=0,
+            )
+            game.deck_pointer += 1
+            game.active_round = None
+            game.round_termination = None
+            self._transition_to(GameState.ROUND_COMPLETE)
+            return game
+        raise DomainInvariantError("round termination reason is not supported")
+
+    @staticmethod
+    def _answer_for_reveal(active_round: ActiveRound) -> tuple[str, str]:
+        track = active_round.deck_entry.track
+        if (
+            not isinstance(track.artist, str)
+            or not track.artist
+            or not isinstance(track.title, str)
+            or not track.title
+        ):
+            raise DomainInvariantError(
+                "an actual round must retain artist and title for reveal"
+            )
+        return track.artist, track.title
+
     def _current_playing_round_for_event(
         self,
         game_session_id: UUID,
@@ -1288,6 +1375,8 @@ class GameEngine:
                 self._enter_playing()
             case GameState.AWAITING_REVEAL:
                 self._enter_awaiting_reveal()
+            case GameState.SCORING:
+                self._enter_scoring()
             case GameState.FINISHED:
                 self._enter_finished()
             case _:
@@ -1359,6 +1448,14 @@ class GameEngine:
             )
         # Physical audio stop and browser notification remain transport work.
         # The application controller retires its playback timer after dispatch.
+        game.buzzing_enabled = False
+
+    def _enter_scoring(self) -> None:
+        """Establish state-wide behavior after a buzz answer is revealed."""
+
+        game = self._active_game
+        if game is None or game.active_round is None:
+            raise DomainInvariantError("SCORING entry requires an actual round")
         game.buzzing_enabled = False
 
     def _take_transition_k(self) -> None:
@@ -1437,6 +1534,8 @@ class GameEngine:
                 self._validate_playing_invariants()
             case GameState.AWAITING_REVEAL:
                 self._validate_awaiting_reveal_invariants()
+            case GameState.SCORING:
+                self._validate_scoring_invariants()
             case GameState.FINISHED:
                 self._validate_finished_invariants()
             case _:
@@ -1482,6 +1581,8 @@ class GameEngine:
             raise DomainInvariantError("LOBBY cannot have an active round")
         if game.round_termination is not None:
             raise DomainInvariantError("LOBBY cannot have round termination facts")
+        if game.last_completed_round is not None:
+            raise DomainInvariantError("LOBBY cannot have a completed round")
         if game.pending_audio_preparation is not None:
             raise DomainInvariantError("LOBBY cannot have a pending preparation")
         if game.audio_preparation_responses is not None:
@@ -1677,7 +1778,100 @@ class GameEngine:
             game.displayed_title, str
         ):
             raise DomainInvariantError("displayed title must be text or blank")
+        self._validate_last_completed_round(game, deck)
         return deck
+
+    def _validate_last_completed_round(
+        self,
+        game: GameSession,
+        deck: Deck,
+    ) -> None:
+        completed = game.last_completed_round
+        if completed is None:
+            return
+        if not isinstance(completed, CompletedRound):
+            raise DomainInvariantError(
+                "the last completed round must be an immutable snapshot"
+            )
+        active_round = completed.active_round
+        if not isinstance(active_round, ActiveRound):
+            raise DomainInvariantError(
+                "a completed round must retain its actual-round facts"
+            )
+        position = active_round.original_deck_position
+        if not 1 <= position <= len(deck) or active_round.deck_entry is not deck[position - 1]:
+            raise DomainInvariantError(
+                "a completed round must retain its original deck entry"
+            )
+        if game.deck_pointer < position:
+            raise DomainInvariantError(
+                "the pointer cannot precede the last completed round"
+            )
+        if (
+            isinstance(completed.awarded_points, bool)
+            or not isinstance(completed.awarded_points, int)
+            or completed.awarded_points < 0
+        ):
+            raise DomainInvariantError(
+                "completed-round points must be a non-negative integer"
+            )
+        termination = completed.termination
+        if not isinstance(termination, RoundTermination):
+            raise DomainInvariantError(
+                "a completed round must retain its termination outcome"
+            )
+        if termination.reason is RoundTerminationReason.PLAYBACK_TIMEOUT:
+            if (
+                termination.winning_browser_token is not None
+                or termination.buzz_elapsed_seconds is not None
+                or completed.awarded_points != 0
+            ):
+                raise DomainInvariantError(
+                    "a completed timeout round must have no winner and zero points"
+                )
+        elif termination.reason is RoundTerminationReason.BUZZ:
+            winner = termination.winning_browser_token
+            if (
+                winner not in game.members
+                or winner not in active_round.buzz_eligible_browser_tokens
+            ):
+                raise DomainInvariantError(
+                    "a completed buzz round must retain an eligible winner"
+                )
+            elapsed = self._validated_monotonic_timestamp(
+                termination.buzz_elapsed_seconds,
+                error_type=DomainInvariantError,
+                name="completed buzz elapsed time",
+            )
+            if not 0 <= elapsed < active_round.playback_duration_seconds:
+                raise DomainInvariantError(
+                    "completed buzz elapsed time must be within playback"
+                )
+        else:
+            raise DomainInvariantError(
+                "completed-round termination reason is not supported"
+            )
+        self._answer_for_reveal(active_round)
+
+    def _validate_completed_round_display(
+        self,
+        game: GameSession,
+        *,
+        state_name: str,
+    ) -> None:
+        completed = game.last_completed_round
+        if completed is None:
+            return
+        active_round = completed.active_round
+        artist, title = self._answer_for_reveal(active_round)
+        if (
+            game.displayed_deck_position != active_round.original_deck_position
+            or game.displayed_artist != artist
+            or game.displayed_title != title
+        ):
+            raise DomainInvariantError(
+                f"{state_name} must preserve the last completed answer display"
+            )
 
     def _validate_round_complete_invariants(self) -> None:
         game = self._active_game
@@ -1710,6 +1904,10 @@ class GameEngine:
             )
         if game.final_standings != ():
             raise DomainInvariantError("ROUND_COMPLETE cannot have final standings")
+        self._validate_completed_round_display(
+            game,
+            state_name="ROUND_COMPLETE",
+        )
         if not isinstance(game.deck_exhausted, bool):
             raise DomainInvariantError("deck exhaustion must be boolean")
         selection = select_deck_candidate(
@@ -1873,9 +2071,17 @@ class GameEngine:
             raise DomainInvariantError(
                 "audio target snapshot must contain only valid audio targets"
             )
+        self._validate_completed_round_display(
+            game,
+            state_name="AUDIO_PREPARING",
+        )
 
     def _validate_actual_round_facts(
-        self, game: GameSession, *, state_name: str
+        self,
+        game: GameSession,
+        *,
+        state_name: str,
+        answer_revealed: bool = False,
     ) -> ActiveRound:
         deck = self._validate_started_game_facts(game, state_name=state_name)
         if game.deck_exhausted is not False or game.deck_pointer >= len(deck):
@@ -1963,7 +2169,16 @@ class GameEngine:
             raise DomainInvariantError(
                 f"{state_name} must display the actual deck position"
             )
-        if game.displayed_artist is not None or game.displayed_title is not None:
+        if answer_revealed:
+            artist, title = self._answer_for_reveal(active_round)
+            if (
+                game.displayed_artist != artist
+                or game.displayed_title != title
+            ):
+                raise DomainInvariantError(
+                    f"{state_name} must display the actual round answer"
+                )
+        elif game.displayed_artist is not None or game.displayed_title is not None:
             raise DomainInvariantError(
                 f"{state_name} answer display must remain blank"
             )
@@ -2030,6 +2245,50 @@ class GameEngine:
         else:
             raise DomainInvariantError("round termination reason is not supported")
 
+    def _validate_scoring_invariants(self) -> None:
+        game = self._active_game
+        if game is None:
+            raise DomainInvariantError("SCORING requires an active game")
+        active_round = self._validate_actual_round_facts(
+            game,
+            state_name="SCORING",
+            answer_revealed=True,
+        )
+        if game.buzzing_enabled is not False:
+            raise DomainInvariantError("buzzing must be disabled in SCORING")
+        termination = game.round_termination
+        if not isinstance(termination, RoundTermination) or (
+            termination.reason is not RoundTerminationReason.BUZZ
+        ):
+            raise DomainInvariantError(
+                "SCORING requires a buzz termination outcome"
+            )
+        winner = termination.winning_browser_token
+        if (
+            winner not in game.members
+            or winner not in active_round.buzz_eligible_browser_tokens
+        ):
+            raise DomainInvariantError(
+                "SCORING requires an eligible winning member"
+            )
+        elapsed = self._validated_monotonic_timestamp(
+            termination.buzz_elapsed_seconds,
+            error_type=DomainInvariantError,
+            name="buzz elapsed time",
+        )
+        if not 0 <= elapsed < active_round.playback_duration_seconds:
+            raise DomainInvariantError(
+                "SCORING requires elapsed time within the playback interval"
+            )
+        if (
+            game.last_completed_round is not None
+            and game.last_completed_round.active_round.round_id
+            == active_round.round_id
+        ):
+            raise DomainInvariantError(
+                "the current scoring round cannot already be completed"
+            )
+
     def _validate_finished_invariants(self) -> None:
         game = self._active_game
         if game is None:
@@ -2057,6 +2316,10 @@ class GameEngine:
             raise DomainInvariantError("FINISHED requires a game end timestamp")
         if not isinstance(game.final_standings, tuple):
             raise DomainInvariantError("final standings must be immutable")
+        self._validate_completed_round_display(
+            game,
+            state_name="FINISHED",
+        )
         expected_standings = self._calculate_final_standings(game)
         if game.final_standings != expected_standings:
             raise DomainInvariantError(

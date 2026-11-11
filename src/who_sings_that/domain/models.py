@@ -192,7 +192,7 @@ class AudioPreparationResponseState:
 
 @dataclass(frozen=True, slots=True)
 class ActiveRound:
-    """Authoritative immutable facts for the currently playing round."""
+    """Authoritative immutable start facts for one actual played round."""
 
     round_id: UUID
     preparation_id: UUID
@@ -217,6 +217,19 @@ class RoundTermination:
     reason: RoundTerminationReason
     winning_browser_token: str | None = None
     buzz_elapsed_seconds: float | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class CompletedRound:
+    """The most recently completed played round retained in live memory.
+
+    This is the minimal lifecycle snapshot needed after transition I, not the
+    durable completed-game history schema planned for a later increment.
+    """
+
+    active_round: ActiveRound
+    termination: RoundTermination
+    awarded_points: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -284,6 +297,7 @@ class GameSession:
     final_standings: tuple[FinalStanding, ...] = ()
     active_round: ActiveRound | None = None
     round_termination: RoundTermination | None = None
+    last_completed_round: CompletedRound | None = None
     pending_audio_preparation: PendingAudioPreparation | None = None
     audio_preparation_responses: AudioPreparationResponseState | None = None
     buzzing_enabled: bool = False

@@ -12,10 +12,17 @@ class EmptyDeckError(ValueError):
 
 @dataclass(frozen=True, slots=True)
 class TrackReference:
-    """A resolved catalog track identified by its stable catalog identity."""
+    """An internal immutable track snapshot used by the game deck.
+
+    Artist and title are retained for authoritative reveal but must never be
+    serialized to clients before that transition. ``None`` remains supported
+    for lower-level synthetic playback/deck tests that do not exercise reveal.
+    """
 
     track_id: int
     duration_seconds: float | Decimal
+    artist: str | None = None
+    title: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

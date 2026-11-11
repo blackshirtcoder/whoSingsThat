@@ -86,6 +86,15 @@ class BuzzRequest(ClientRequest):
 
 
 @dataclass(frozen=True, slots=True)
+class RevealRequest(ClientRequest):
+    """Request transition H or I for the current actual round."""
+
+    game_session_id: UUID
+    round_id: UUID
+    requesting_browser_token: str
+
+
+@dataclass(frozen=True, slots=True)
 class AcknowledgeAudioPreparationFailureRequest(ClientRequest):
     """Request transition D for a finalized unsuccessful preparation."""
 
@@ -167,6 +176,7 @@ __all__ = [
     "MemberDisconnectedEvent",
     "PlaySongRequest",
     "PlaybackTimeoutEvent",
+    "RevealRequest",
     "SelectPlaylistRequest",
     "SetAudioPreferenceRequest",
     "StartGameRequest",

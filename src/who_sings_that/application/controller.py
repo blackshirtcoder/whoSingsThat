@@ -42,6 +42,7 @@ from .messages import (
     MemberDisconnectedEvent,
     PlaybackTimeoutEvent,
     PlaySongRequest,
+    RevealRequest,
     SelectPlaylistRequest,
     SetAudioPreferenceRequest,
     StartGameRequest,
@@ -420,6 +421,13 @@ class GameController:
             )
             self._retire_playback_timeout()
             return result
+        if isinstance(message, RevealRequest):
+            self._require_target_game(message.game_session_id)
+            return self._game_engine.reveal_answer(
+                message.game_session_id,
+                message.round_id,
+                message.requesting_browser_token,
+            )
         if isinstance(message, AcknowledgeAudioPreparationFailureRequest):
             result = self._game_engine.acknowledge_audio_preparation_failure(
                 message.game_session_id,

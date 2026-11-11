@@ -224,6 +224,8 @@ def test_resolves_persistent_snapshots_and_overlaps_with_one_inspection_per_trac
     second_tracks = {track.track_id: track for track in second.tracks}
     assert first_tracks[shared_id] is second_tracks[shared_id]
     assert first_tracks[first_only_id].duration_seconds == 102.0
+    assert first_tracks[first_only_id].artist == "Stored Artist"
+    assert first_tracks[first_only_id].title == "Stored Title"
     assert second_tracks[second_only_id].duration_seconds == 103.0
     assert sorted(calls) == [
         "Rock/A - Shared.mp3",

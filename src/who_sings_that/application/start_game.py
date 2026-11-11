@@ -341,7 +341,16 @@ def _resolve_candidate(
             reason=TrackExclusionReason.UNUSABLE_DURATION,
             detail="structural inspection did not provide a positive finite duration",
         )
-    return _CandidateResult(TrackReference(track.track_id, duration))
+    if not isinstance(track.artist, str) or not isinstance(track.title, str):
+        raise TypeError("catalog-eligible tracks must have artist and title")
+    return _CandidateResult(
+        TrackReference(
+            track.track_id,
+            duration,
+            artist=track.artist,
+            title=track.title,
+        )
+    )
 
 
 def _inspection_detail(inspected: TrackMetadata) -> str:
