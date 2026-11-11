@@ -1443,6 +1443,8 @@ class GameEngine:
             # A new connection must initialize/unlock audio for itself; a prior
             # connection's capability assertion is never inherited.
             existing_member.browser_audio_usable = False
+            if token != game.songmaster_browser_token:
+                self._void_round_for_playback_client_loss(token)
             try:
                 self._validate_state_invariants(self._state)
             except Exception:
@@ -1506,6 +1508,7 @@ class GameEngine:
         was_audio_usable = member.browser_audio_usable
         member.connected = False
         member.browser_audio_usable = False
+        self._void_round_for_playback_client_loss(token)
         try:
             self._validate_state_invariants(self._state)
         except Exception:
@@ -1543,6 +1546,8 @@ class GameEngine:
         was_audio_usable = member.browser_audio_usable
         member.connected = True
         member.browser_audio_usable = False
+        if token != game.songmaster_browser_token:
+            self._void_round_for_playback_client_loss(token)
         try:
             self._validate_state_invariants(self._state)
         except Exception:
@@ -1550,6 +1555,44 @@ class GameEngine:
             member.browser_audio_usable = was_audio_usable
             raise
         return member
+
+    def _void_round_for_playback_client_loss(self, browser_token: str) -> bool:
+        """Consume and retain a PLAYING round interrupted at a playback client."""
+
+        game = self._active_game
+        if self._state is not GameState.PLAYING or game is None:
+            return False
+        active_round = game.active_round
+        if not isinstance(active_round, ActiveRound):  # pragma: no cover
+            raise DomainInvariantError("PLAYING requires an actual round")
+        if browser_token not in active_round.playback_clients:
+            return False
+
+        game.last_voided_round = VoidedRound(
+            active_round=active_round,
+            reason=RoundVoidReason.PLAYBACK_CLIENT_LOST,
+            termination=None,
+            answer_revealed=False,
+            lost_playback_client_browser_token=browser_token,
+        )
+        game.deck_pointer += 1
+        game.active_round = None
+        game.round_termination = None
+        game.buzzing_enabled = False
+
+        completed = game.last_completed_round
+        if completed is None:
+            game.displayed_deck_position = None
+            game.displayed_artist = None
+            game.displayed_title = None
+        else:
+            game.displayed_deck_position = completed.active_round.original_deck_position
+            artist, title = self._answer_for_reveal(completed.active_round)
+            game.displayed_artist = artist
+            game.displayed_title = title
+
+        self._transition_to(GameState.ROUND_COMPLETE)
+        return True
 
     def validate_invariants(self) -> None:
         """Validate the invariants for the engine's current executable state."""
@@ -2313,7 +2356,11 @@ class GameEngine:
         if game.active_round is not None:
             raise DomainInvariantError("ROUND_COMPLETE cannot have an active round")
         if game.last_voided_round is not None:
-            raise DomainInvariantError("ROUND_COMPLETE cannot have a voided round")
+            self._validate_last_voided_round(game, deck)
+            if game.last_voided_round.reason is not RoundVoidReason.PLAYBACK_CLIENT_LOST:
+                raise DomainInvariantError(
+                    "ROUND_COMPLETE may retain only a playback-loss void"
+                )
         if game.round_termination is not None:
             raise DomainInvariantError(
                 "ROUND_COMPLETE cannot have round termination facts"
@@ -2763,9 +2810,14 @@ class GameEngine:
                     "deck-exhausted FINISHED requires the pointer at deck end"
                 )
             if game.last_voided_round is not None:
-                raise DomainInvariantError(
-                    "natural completion cannot retain a voided round"
-                )
+                self._validate_last_voided_round(game, deck)
+                if (
+                    game.last_voided_round.reason
+                    is not RoundVoidReason.PLAYBACK_CLIENT_LOST
+                ):
+                    raise DomainInvariantError(
+                        "natural completion may retain only a playback-loss void"
+                    )
         elif game.end_reason is GameEndReason.SONGMASTER_ENDED_GAME:
             if game.last_voided_round is not None:
                 self._validate_last_voided_round(game, deck)
@@ -2787,7 +2839,7 @@ class GameEngine:
             )
 
     def _validate_last_voided_round(self, game: GameSession, deck: Deck) -> None:
-        """Validate the bounded unfinished-round snapshot retained in FINISHED."""
+        """Validate the bounded immutable unfinished-round snapshot."""
 
         voided = game.last_voided_round
         if not isinstance(voided, VoidedRound):
@@ -2806,10 +2858,18 @@ class GameEngine:
             raise DomainInvariantError(
                 "a voided round must retain its original deck entry"
             )
-        if game.deck_pointer != position - 1 or game.deck_exhausted is not False:
-            raise DomainInvariantError(
-                "a voluntarily voided round must remain under the deck pointer"
-            )
+        if voided.reason is RoundVoidReason.GAME_ENDED:
+            if game.deck_pointer != position - 1 or game.deck_exhausted is not False:
+                raise DomainInvariantError(
+                    "a voluntarily voided round must remain under the deck pointer"
+                )
+        elif voided.reason is RoundVoidReason.PLAYBACK_CLIENT_LOST:
+            if game.deck_pointer < position:
+                raise DomainInvariantError(
+                    "a playback-loss void must consume its deck entry"
+                )
+        else:
+            raise DomainInvariantError("voided-round reason is not supported")
         if not isinstance(active_round.round_id, UUID) or not isinstance(
             active_round.preparation_id, UUID
         ):
@@ -2870,8 +2930,20 @@ class GameEngine:
             raise DomainInvariantError(
                 "voided playback clients and eligibility are inconsistent"
             )
-        if voided.reason is not RoundVoidReason.GAME_ENDED:
-            raise DomainInvariantError("voided-round reason is not supported")
+        lost_token = voided.lost_playback_client_browser_token
+        if voided.reason is RoundVoidReason.PLAYBACK_CLIENT_LOST:
+            if (
+                lost_token not in active_round.playback_clients
+                or voided.termination is not None
+                or voided.answer_revealed
+            ):
+                raise DomainInvariantError(
+                    "a playback-loss void requires its lost client and no termination"
+                )
+        elif lost_token is not None:
+            raise DomainInvariantError(
+                "a non-playback-loss void cannot identify a lost playback client"
+            )
         if not isinstance(voided.answer_revealed, bool):
             raise DomainInvariantError("voided answer-reveal status must be boolean")
 
@@ -2919,11 +2991,26 @@ class GameEngine:
                 "a revealed void requires the prior buzz termination"
             )
 
-        if game.displayed_deck_position != position:
+        if (
+            voided.reason is RoundVoidReason.GAME_ENDED
+            and game.displayed_deck_position != position
+        ):
             raise DomainInvariantError(
                 "FINISHED must preserve the voided round's displayed position"
             )
-        if voided.answer_revealed:
+        if voided.reason is RoundVoidReason.PLAYBACK_CLIENT_LOST:
+            if game.last_completed_round is None and any(
+                value is not None
+                for value in (
+                    game.displayed_deck_position,
+                    game.displayed_artist,
+                    game.displayed_title,
+                )
+            ):
+                raise DomainInvariantError(
+                    "a first-round playback void must leave the display blank"
+                )
+        elif voided.answer_revealed:
             artist, title = self._answer_for_reveal(active_round)
             if game.displayed_artist != artist or game.displayed_title != title:
                 raise DomainInvariantError(

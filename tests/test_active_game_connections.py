@@ -1,3 +1,4 @@
+import asyncio
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -18,18 +19,21 @@ from who_sings_that.application import (
     GameController,
     JoinGameRequest,
     MemberDisconnectedEvent,
+    PlaybackTimeoutEvent,
     RegisterConnectionRequest,
     StaleConnectionError,
 )
 from who_sings_that.database import create_sqlite_engine, upgrade_database
 from who_sings_that.domain import (
     BuzzNotAllowedError,
+    GameEndReason,
     GameEngine,
     GameSettings,
     GameState,
     MembershipOperationNotAllowedError,
     ResolvedPlaylist,
     RoundTerminationReason,
+    RoundVoidReason,
     SelectedPlaylistSnapshot,
     SongmasterDisconnectRequiresFailoverError,
     TrackReference,
@@ -495,7 +499,7 @@ async def test_disconnect_during_preparation_leaves_timeout_resolution_available
 
 
 @pytest.mark.asyncio
-async def test_contestant_disconnect_does_not_yet_void_playing_round(
+async def test_buzz_only_contestant_disconnect_does_not_void_playing_round(
     controller_storage: tuple[Engine, Path],
 ) -> None:
     engine, _ = playing_engine()
@@ -647,5 +651,371 @@ async def test_unknown_registration_and_cancel_cleanup_do_not_leak_to_new_game(
     assert second.songmaster.committed_score == 0
     assert second.songmaster.browser_audio_usable is False
     assert len(controller.system_event_rejections) == 1
+    await controller.stop()
+
+
+def contestant_playback_engine() -> tuple[GameEngine, MutableMonotonicClock]:
+    engine, monotonic_clock = started_engine()
+    engine.set_audio_preference("songmaster-token", False)
+    engine.set_audio_preference("player-token", True)
+    engine.set_browser_audio_capability("player-token", True)
+    pending = engine.play_song("songmaster-token")
+    engine.record_audio_preparation_ready(
+        GAME_IDS[0], pending.preparation_id, "player-token"
+    )
+    return engine, monotonic_clock
+
+
+def test_domain_playback_client_disconnect_voids_and_consumes_once() -> None:
+    engine, _ = contestant_playback_engine()
+    game = engine.active_game
+    assert game is not None and game.active_round is not None
+    active_round = game.active_round
+    prior_scores = {
+        token: member.committed_score for token, member in game.members.items()
+    }
+
+    member = engine.disconnect_member("player-token")
+
+    assert member.connected is False
+    assert engine.state is GameState.ROUND_COMPLETE
+    assert game.deck_pointer == 1
+    assert game.active_round is None
+    assert game.buzzing_enabled is False
+    assert game.last_voided_round is not None
+    assert game.last_voided_round.active_round is active_round
+    assert game.last_voided_round.reason is RoundVoidReason.PLAYBACK_CLIENT_LOST
+    assert (
+        game.last_voided_round.lost_playback_client_browser_token
+        == "player-token"
+    )
+    assert game.last_voided_round.termination is None
+    assert game.last_voided_round.answer_revealed is False
+    assert {
+        token: member.committed_score for token, member in game.members.items()
+    } == prior_scores
+
+    engine.record_connection_established("player-token", connection_changed=True)
+    assert engine.state is GameState.ROUND_COMPLETE
+    assert game.deck_pointer == 1
+    assert game.active_round is None
+
+
+@pytest.mark.asyncio
+async def test_playback_client_replacement_voids_and_rejects_predecessor(
+    controller_storage: tuple[Engine, Path],
+) -> None:
+    engine, _ = contestant_playback_engine()
+    game = engine.active_game
+    assert game is not None and game.active_round is not None
+    active_round = game.active_round
+    player = game.members["player-token"]
+    player.committed_score = 41
+    controller = controller_for_engine(controller_storage, engine)
+    controller._schedule_playback_timeout(
+        GAME_IDS[0], active_round.round_id, active_round.playback_deadline_monotonic
+    )
+    timer = controller._playback_timeout_task
+    await controller.start()
+
+    replacement = await controller.submit_request(
+        RegisterConnectionRequest(
+            GAME_IDS[0], "player-token", "player-connection-b"
+        )
+    )
+    await asyncio.sleep(0)
+
+    assert replacement.status is ConnectionRegistrationStatus.REPLACED
+    assert controller.connection_registry.is_current(
+        GAME_IDS[0], "player-token", "player-connection-b"
+    )
+    assert engine.state is GameState.ROUND_COMPLETE
+    assert game.deck_pointer == 1
+    assert player.connected is True
+    assert player.audio_enabled is True
+    assert player.browser_audio_usable is False
+    assert player.committed_score == 41
+    assert timer is not None and timer.done()
+    assert controller._playback_timeout_task is None
+
+    controller.post_system_event(
+        MemberDisconnectedEvent(
+            GAME_IDS[0], "player-token", "player-connection-a"
+        )
+    )
+    duplicate = await controller.submit_request(
+        RegisterConnectionRequest(
+            GAME_IDS[0], "player-token", "player-connection-b"
+        )
+    )
+    assert duplicate.status is ConnectionRegistrationStatus.UNCHANGED
+    assert game.deck_pointer == 1
+    assert len(controller.system_event_rejections) == 1
+    assert isinstance(
+        controller.system_event_rejections[0].error, StaleConnectionError
+    )
+    await controller.stop()
+
+
+@pytest.mark.asyncio
+async def test_playback_client_duplicate_disconnect_consumes_only_once(
+    controller_storage: tuple[Engine, Path],
+) -> None:
+    engine, _ = contestant_playback_engine()
+    game = engine.active_game
+    assert game is not None and game.active_round is not None
+    controller = controller_for_engine(controller_storage, engine)
+    controller._schedule_playback_timeout(
+        GAME_IDS[0],
+        game.active_round.round_id,
+        game.active_round.playback_deadline_monotonic,
+    )
+    timer = controller._playback_timeout_task
+    await controller.start()
+
+    loss = MemberDisconnectedEvent(
+        GAME_IDS[0], "player-token", "player-connection-a"
+    )
+    controller.post_system_event(loss)
+    controller.post_system_event(loss)
+    await controller.submit_request(
+        RegisterConnectionRequest(
+            GAME_IDS[0], "songmaster-token", "songmaster-connection"
+        )
+    )
+    await asyncio.sleep(0)
+
+    assert engine.state is GameState.ROUND_COMPLETE
+    assert game.deck_pointer == 1
+    assert timer is not None and timer.done()
+    assert controller._playback_timeout_task is None
+    assert len(controller.system_event_rejections) == 1
+    assert isinstance(
+        controller.system_event_rejections[0].error, StaleConnectionError
+    )
+    await controller.stop()
+
+
+def test_playback_loss_restores_previous_completed_song_display() -> None:
+    engine, monotonic_clock = contestant_playback_engine()
+    game = engine.active_game
+    assert game is not None and game.active_round is not None
+    first_round = game.active_round
+    monotonic_clock.value = first_round.playback_deadline_monotonic
+    engine.playback_timed_out(
+        GAME_IDS[0], first_round.round_id, monotonic_clock.value
+    )
+    engine.reveal_answer(GAME_IDS[0], first_round.round_id, "songmaster-token")
+    expected_display = (1, "Artist One", "Title One")
+    assert (
+        game.displayed_deck_position,
+        game.displayed_artist,
+        game.displayed_title,
+    ) == expected_display
+
+    pending = engine.play_song("songmaster-token")
+    engine.record_audio_preparation_ready(
+        GAME_IDS[0], pending.preparation_id, "player-token"
+    )
+    assert game.displayed_deck_position == 2
+    assert game.displayed_artist is None
+    assert game.displayed_title is None
+
+    engine.disconnect_member("player-token")
+
+    assert engine.state is GameState.ROUND_COMPLETE
+    assert (
+        game.displayed_deck_position,
+        game.displayed_artist,
+        game.displayed_title,
+    ) == expected_display
+    assert game.last_voided_round is not None
+    assert game.last_voided_round.answer_revealed is False
+
+
+def test_final_song_playback_loss_waits_for_explicit_transition_k() -> None:
+    monotonic_clock = MutableMonotonicClock()
+    engine = GameEngine(
+        GameSettings(playback_duration_seconds=30),
+        clock=AdvancingClock(),
+        monotonic_clock=monotonic_clock,
+        game_id_factory=ValueFactory(GAME_IDS),
+        preparation_id_factory=ValueFactory(PREPARATION_IDS),
+        round_id_factory=ValueFactory(ROUND_IDS),
+        shuffle=lambda values: None,
+    )
+    engine.create_game("songmaster-token", "Songmaster")
+    engine.join_game("player-token", "Player")
+    engine.set_audio_preference("songmaster-token", False)
+    engine.set_audio_preference("player-token", True)
+    engine.set_browser_audio_capability("player-token", True)
+    engine.select_playlist("songmaster-token", "playlist")
+    playlist = resolved_playlist()
+    engine.start_game(
+        "songmaster-token",
+        [
+            ResolvedPlaylist(
+                snapshot=SelectedPlaylistSnapshot(
+                    playlist_id=playlist.snapshot.playlist_id,
+                    playlist_name=playlist.snapshot.playlist_name,
+                    playlist_created_at=playlist.snapshot.playlist_created_at,
+                    playlist_song_count=1,
+                ),
+                tracks=playlist.tracks[:1],
+            )
+        ],
+    )
+    pending = engine.play_song("songmaster-token")
+    engine.record_audio_preparation_ready(
+        GAME_IDS[0], pending.preparation_id, "player-token"
+    )
+
+    engine.disconnect_member("player-token")
+    game = engine.active_game
+    assert game is not None
+    assert engine.state is GameState.ROUND_COMPLETE
+    assert game.deck_pointer == 1
+    assert game.deck_exhausted is True
+    assert game.end_reason is None
+    assert game.final_standings == ()
+
+    result = engine.play_song("songmaster-token")
+    assert result.end_reason is GameEndReason.DECK_EXHAUSTED
+    assert engine.state is GameState.FINISHED
+
+
+@pytest.mark.asyncio
+async def test_fifo_playback_loss_before_buzz_rejects_later_buzz(
+    controller_storage: tuple[Engine, Path],
+) -> None:
+    engine, monotonic_clock = contestant_playback_engine()
+    game = engine.active_game
+    assert game is not None and game.active_round is not None
+    active_round = game.active_round
+    monotonic_clock.value = active_round.playback_started_monotonic + 1
+    controller = controller_for_engine(controller_storage, engine)
+    await controller.start()
+
+    controller.post_system_event(
+        MemberDisconnectedEvent(
+            GAME_IDS[0], "player-token", "player-connection-a"
+        )
+    )
+    with pytest.raises(StaleConnectionError):
+        await controller.submit_request(
+            BuzzRequest(
+                GAME_IDS[0],
+                active_round.round_id,
+                "player-token",
+                "player-connection-a",
+            )
+        )
+
+    assert engine.state is GameState.ROUND_COMPLETE
+    assert game.deck_pointer == 1
+    await controller.stop()
+
+
+@pytest.mark.asyncio
+async def test_fifo_buzz_before_playback_loss_prevents_retroactive_void(
+    controller_storage: tuple[Engine, Path],
+) -> None:
+    engine, monotonic_clock = contestant_playback_engine()
+    game = engine.active_game
+    assert game is not None and game.active_round is not None
+    active_round = game.active_round
+    monotonic_clock.value = active_round.playback_started_monotonic + 1
+    controller = controller_for_engine(controller_storage, engine)
+    await controller.start()
+
+    termination = await controller.submit_request(
+        BuzzRequest(
+            GAME_IDS[0],
+            active_round.round_id,
+            "player-token",
+            "player-connection-a",
+        )
+    )
+    controller.post_system_event(
+        MemberDisconnectedEvent(
+            GAME_IDS[0], "player-token", "player-connection-a"
+        )
+    )
+    await controller.submit_request(
+        RegisterConnectionRequest(
+            GAME_IDS[0], "songmaster-token", "songmaster-connection"
+        )
+    )
+
+    assert termination.reason is RoundTerminationReason.BUZZ
+    assert engine.state is GameState.AWAITING_REVEAL
+    assert game.deck_pointer == 0
+    assert game.last_voided_round is None
+    assert game.members["player-token"].connected is False
+    await controller.stop()
+
+
+@pytest.mark.asyncio
+async def test_fifo_playback_loss_before_timeout_makes_timeout_stale(
+    controller_storage: tuple[Engine, Path],
+) -> None:
+    engine, monotonic_clock = contestant_playback_engine()
+    game = engine.active_game
+    assert game is not None and game.active_round is not None
+    active_round = game.active_round
+    monotonic_clock.value = active_round.playback_deadline_monotonic
+    controller = controller_for_engine(controller_storage, engine)
+    await controller.start()
+
+    controller.post_system_event(
+        MemberDisconnectedEvent(
+            GAME_IDS[0], "player-token", "player-connection-a"
+        )
+    )
+    controller.post_system_event(
+        PlaybackTimeoutEvent(GAME_IDS[0], active_round.round_id)
+    )
+    await controller.submit_request(
+        RegisterConnectionRequest(
+            GAME_IDS[0], "songmaster-token", "songmaster-connection"
+        )
+    )
+
+    assert engine.state is GameState.ROUND_COMPLETE
+    assert game.deck_pointer == 1
+    assert len(controller.system_event_rejections) == 1
+    await controller.stop()
+
+
+@pytest.mark.asyncio
+async def test_fifo_timeout_before_playback_loss_prevents_retroactive_void(
+    controller_storage: tuple[Engine, Path],
+) -> None:
+    engine, monotonic_clock = contestant_playback_engine()
+    game = engine.active_game
+    assert game is not None and game.active_round is not None
+    active_round = game.active_round
+    monotonic_clock.value = active_round.playback_deadline_monotonic
+    controller = controller_for_engine(controller_storage, engine)
+    await controller.start()
+
+    controller.post_system_event(
+        PlaybackTimeoutEvent(GAME_IDS[0], active_round.round_id)
+    )
+    controller.post_system_event(
+        MemberDisconnectedEvent(
+            GAME_IDS[0], "player-token", "player-connection-a"
+        )
+    )
+    await controller.submit_request(
+        RegisterConnectionRequest(
+            GAME_IDS[0], "songmaster-token", "songmaster-connection"
+        )
+    )
+
+    assert engine.state is GameState.AWAITING_REVEAL
+    assert game.deck_pointer == 0
+    assert game.last_voided_round is None
+    assert game.members["player-token"].connected is False
     await controller.stop()
 

@@ -401,6 +401,14 @@ connection's initialized/unlocked browser-audio capability to false. It does
 not restore local audio playback, make the new connection READY for preparation,
 or change the immutable preparation-target or playback-client snapshots.
 
+During `PLAYING`, however, replacing the current authoritative connection of a
+contestant in the transition-E `playback_clients` snapshot is itself an
+irreversible playback-path interruption. The replacement becomes authoritative,
+but the interrupted round is voided and consumed atomically; reconnection cannot
+resume it. A same-live-connection registration is idempotent. A delayed loss or
+capability event from the superseded connection is stale and cannot void the
+same or a later round.
+
 A duplicate registration of the exact same live connection changes no domain
 fact and does not change buzz eligibility. A legitimate replacement or
 reconnection changes the authoritative connection but does not change the
@@ -1035,13 +1043,14 @@ game/round/state checks make an already queued timeout harmless.
 
 ### Playback-client loss during `PLAYING`
 
-If **any** client in the current round's `playback_clients` set disconnects or otherwise loses its playback capability during `PLAYING`:
+If **any** contestant in the current round's `playback_clients` set disconnects
+or has their current authoritative connection replaced during `PLAYING`:
 
 - stop/cancel the authoritative round timer;
 - disable buzzing;
 - stop remaining playback clients as appropriate;
 - mark the round void;
-- set `void_reason = audio_target_lost`;
+- set `void_reason = playback_client_lost` and retain the lost member identity;
 - award zero points;
 - consume the current song by advancing the deck pointer exactly once;
 - preserve the voided round in history;
@@ -1049,15 +1058,36 @@ If **any** client in the current round's `playback_clients` set disconnects or o
 
 Do not wait for an audio reconnect grace period and do not replay the song. Some participants may already have heard part of it.
 
+For this increment, the implemented loss triggers are disconnect or replacement
+of the current authoritative browser connection. A browser-audio capability
+update alone is not treated as connection loss. Membership in the immutable
+transition-E `playback_clients` snapshot is authoritative; current audio
+preference/capability is not. A buzz-eligible contestant absent from that
+snapshot may disconnect without voiding or consuming the round and may regain
+their original transition-C buzz eligibility after reconnecting while the same
+round remains `PLAYING`.
+
+The accepted contestant loss, membership update, void record, single deck
+advance, live-round cleanup, and `ROUND_COMPLETE` entry scan occur in the same
+global FIFO event. The application then retires its playback timer. The most
+recent completed song display and all committed scores remain unchanged; the
+voided answer is not revealed. If the scan exhausts the deck, the game waits in
+exhausted `ROUND_COMPLETE` for an explicit Songmaster transition K request.
+
 If the lost playback client is also the Songmaster, process the Songmaster-disconnect overlay as the controlling failure path and do not independently consume/void the round a second time.
 
-The connection registry and active contestant disconnect facts are implemented,
-but the playback-client-loss void/consume behavior in this subsection remains
-deferred to the next round-loss increment. For now a contestant playback-client
-disconnect is recorded without automatically voiding a `PLAYING` round. This is
-an explicit temporary implementation boundary; the immutable
-`playback_clients` snapshot and current-connection registry provide the facts
-needed for the later behavior.
+Songmaster playback-client loss remains deferred with the complete
+reconnect-grace/failover overlay. The temporary fail-closed Songmaster
+disconnect rejection remains in force, and trusted Songmaster connection
+replacement follows existing registration semantics without invoking the
+contestant void path. Future notification work should tell the Songmaster which
+contestant lost audio and that the current song was discarded; no notification
+framework is introduced in this phase.
+
+Connection loss outside `PLAYING` does not retroactively void a round:
+`AUDIO_PREPARING` still resolves through preparation responses/timeout,
+`AWAITING_REVEAL` and `SCORING` preserve their established termination outcome,
+and `ROUND_COMPLETE`/`FINISHED` consume nothing.
 
 ## 32. State: `AWAITING_REVEAL`
 
@@ -1596,9 +1626,9 @@ connection loss, capability updates, and buzz ingress. Real transport remains
 responsible for creating authenticated connection IDs; no WebSocket layer is
 implemented yet.
 
-Active-state new membership, contestant disconnect, and same-token reconnect
-are implemented. Playback-client-loss consequences remain deferred as noted in
-the `PLAYING` section. Songmaster disconnect grace/failover is also deferred:
+Active-state new membership, contestant disconnect, same-token reconnect, and
+contestant playback-client connection-loss voiding are implemented. Songmaster
+disconnect grace/failover is still deferred:
 until that overlay exists, an observed Songmaster disconnect is safely rejected,
 the domain keeps the Songmaster connected, and the registry retains the current
 association. A later trusted replacement registration can still supersede that

@@ -23,6 +23,7 @@ from who_sings_that.domain import (
     GameEngine,
     GameEngineError,
     GameFinalizationResult,
+    GameState,
     InvalidPlayerNameError,
     PendingAudioPreparation,
     PreparationEventResult,
@@ -412,6 +413,7 @@ class GameController:
                 message.browser_token,
                 message.source_connection_id,
             )
+            was_playing = self._game_engine.state is GameState.PLAYING
             member = self._game_engine.join_game(
                 message.browser_token,
                 message.display_name,
@@ -424,6 +426,8 @@ class GameController:
                 message.browser_token,
                 message.source_connection_id,
             )
+            if was_playing and self._game_engine.state is GameState.ROUND_COMPLETE:
+                self._retire_playback_timeout()
             return member
         if isinstance(message, RegisterConnectionRequest):
             self._require_target_game(message.game_session_id)
@@ -563,6 +567,7 @@ class GameController:
                 message.browser_token,
                 message.source_connection_id,
             )
+            was_playing = self._game_engine.state is GameState.PLAYING
             member = self._game_engine.disconnect_member(message.browser_token)
             if not self._connection_registry.mark_disconnected(
                 message.game_session_id,
@@ -572,6 +577,8 @@ class GameController:
                 raise DomainInvariantError(
                     "validated current connection could not be retired"
                 )
+            if was_playing and self._game_engine.state is GameState.ROUND_COMPLETE:
+                self._retire_playback_timeout()
             return member
         if isinstance(message, BrowserAudioCapabilityChangedEvent):
             self._require_current_connection(
@@ -607,17 +614,21 @@ class GameController:
             message.browser_token,
             message.connection_id,
         )
+        was_playing = self._game_engine.state is GameState.PLAYING
         self._game_engine.record_connection_established(
             message.browser_token,
             connection_changed=(
                 status is not ConnectionRegistrationStatus.UNCHANGED
             ),
         )
-        return self._connection_registry.register(
+        registration = self._connection_registry.register(
             message.game_session_id,
             message.browser_token,
             message.connection_id,
         )
+        if was_playing and self._game_engine.state is GameState.ROUND_COMPLETE:
+            self._retire_playback_timeout()
+        return registration
 
     def _require_current_connection(
         self,

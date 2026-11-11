@@ -46,6 +46,7 @@ class RoundVoidReason(Enum):
     """Authoritative reasons an actual played round was left unfinished."""
 
     GAME_ENDED = "game_ended"
+    PLAYBACK_CLIENT_LOST = "playback_client_lost"
 
 
 class RoundTerminationReason(Enum):
@@ -249,6 +250,7 @@ class VoidedRound:
     reason: RoundVoidReason
     termination: RoundTermination | None
     answer_revealed: bool
+    lost_playback_client_browser_token: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
