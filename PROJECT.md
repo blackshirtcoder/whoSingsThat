@@ -110,6 +110,29 @@ synchronously inside the serialized handler. This preserves message atomicity
 but can block other asyncio loop work until that handler completes; no thread
 pool or generalized asynchronous job system is introduced yet.
 
+Buzz timing uses a trusted server-side receipt timestamp captured at the
+authoritative application ingress boundary before the request waits in the
+global queue. The public client request contains no timestamp, elapsed time,
+playback position, or speed claim. The current ingress boundary is
+`GameController.submit_request`; future WebSocket transport integration must
+capture the timestamp promptly when a received message first reaches trusted
+server code.
+
+Playback start, playback deadline, buzz receipt, elapsed buzz time, and timer
+scheduling use one monotonic clock domain. The UTC playback-start timestamp is
+retained for diagnostics/history only. For monotonic start `S` and snapshotted
+duration `D`, the deadline is `S + D`, and a buzz is time-eligible exactly when
+`S <= receipt < S + D`. A buzz at the deadline is late. Eligibility never
+depends on whether the timer task happened to run or on when the queue consumer
+eventually processes the request.
+
+Buzz requests and playback-timeout events retain ordinary FIFO ordering in the
+one global queue. A pre-deadline buzz queued before the timeout can therefore
+win even if processed after the deadline; its trusted receipt timestamp is used
+for elapsed time. A post-deadline buzz is rejected even if queued before the
+timeout event. Once either transition F or G completes, the later queued event
+is stale and harmless. Messages are not reordered by timestamp or priority.
+
 ## 5. Music Storage
 
 ### 5.1 Configured music root
@@ -779,10 +802,12 @@ Actions:
 Target: `PLAYING`.
 
 The authoritative transition and round/timing facts are implemented before
-browser playback delivery. Actual preload commands, playback-start commands,
-and playback-duration timer scheduling remain transport/application work for a
-later increment. Internal deck entries, track IDs, paths, and answer metadata
-must not be serialized into pre-reveal client notifications.
+browser playback delivery. The application controller now schedules the
+playback-duration timer from the authoritative monotonic deadline. The timer
+only posts a typed `PlaybackTimeoutEvent` to the global FIFO queue; it never
+invokes the domain engine directly. Actual preload and playback-start commands
+remain transport work. Internal deck entries, track IDs, paths, and answer
+metadata must not be serialized into pre-reveal client notifications.
 
 ## 31. State: `PLAYING`
 
@@ -804,14 +829,26 @@ Internal work:
 
 Condition:
 
-- first valid buzz is the first terminating event processed before timeout.
+- the game and actual-round identities match;
+- state is `PLAYING` and buzzing is enabled;
+- the requesting member is currently connected and belongs to the frozen
+  transition-C buzz-eligible set;
+- the trusted server receipt timestamp is within the strict monotonic playback
+  interval; and
+- no earlier terminating event has completed.
 
 Actions:
 
 - set `round_end_reason = BUZZ`;
 - record buzzer;
 - record authoritative buzz elapsed time;
-- calculate/store speed multiplier.
+- disable buzzing while preserving the bound entry, settings, scores, and deck
+  pointer.
+
+The Songmaster is eligible on the same basis as every other eligible player. A
+player does not need to be a `playback_client` to buzz. Speed multiplier and
+points remain later scoring work; the stored winner and trusted elapsed time are
+sufficient inputs without reconstructing timing from wall-clock timestamps.
 
 Target: `AWAITING_REVEAL`.
 
@@ -819,16 +856,23 @@ Target: `AWAITING_REVEAL`.
 
 Condition:
 
-- playback duration expires before a valid buzz is accepted.
+- the event identifies the current game and actual round;
+- state remains `PLAYING`; and
+- the authoritative monotonic deadline has been reached without an accepted
+  buzz.
 
 Actions:
 
 - set `round_end_reason = TIMEOUT`;
-- record timeout-specific round data.
+- record that there is no winner or buzz elapsed time;
+- disable buzzing while preserving the bound entry, settings, scores, and deck
+  pointer.
 
 Target: `AWAITING_REVEAL`.
 
-Whichever terminating event the authoritative server processes first wins.
+The queue establishes processing order, while the trusted receipt timestamp
+establishes buzz deadline eligibility. A canceled timer is only an efficiency;
+game/round/state checks make an already queued timeout harmless.
 
 ### Playback-client loss during `PLAYING`
 
@@ -852,19 +896,44 @@ If the lost playback client is also the Songmaster, process the Songmaster-disco
 
 Meaning:
 
-> Playback has ended and the current song is consumed, but the answer remains hidden while players may discuss it.
+> Playback has ended, but the answer remains hidden while players may discuss it.
+
+For the currently implemented F/G boundary, the played entry remains the
+current unconsumed deck entry. Consumption is intentionally deferred to a later
+reveal/completion increment so F/G do not implement H, I, J, or played-round
+history semantics prematurely.
 
 ### Entry actions
 
 1. stop audio;
 2. disable buzzing;
 3. cancel/clear playback timer;
-4. increment deck pointer exactly once;
-5. preserve just-played round information;
-6. update post-play display:
-   - buzz case: show buzzer and buzz time;
-   - timeout case: indicate play interval expired;
-   - artist/title remain hidden.
+4. preserve the deck pointer on the bound current entry;
+5. preserve immutable round-start facts and the authoritative termination
+   outcome;
+6. keep artist/title hidden and retain enough outcome data for a later UI to
+   show the buzzer/time or playback expiry.
+
+The implemented domain entry behavior performs the authoritative state and
+buzz-disable work. The application controller retires its playback timer.
+Physical audio-stop commands and browser notifications are not implemented
+because transport and playback do not yet exist.
+
+The termination outcome invariants are:
+
+- buzz termination has one eligible winning member and a trusted elapsed time
+  within the strict playback interval;
+- timeout termination has neither a winner nor buzz elapsed time;
+- no pending audio preparation exists;
+- the bound entry remains under the unconsumed deck pointer;
+- scores and playback-setting snapshots remain unchanged; and
+- artist/title remain hidden.
+
+Future post-play display behavior is:
+
+- buzz case: show buzzer and buzz time;
+- timeout case: indicate play interval expired;
+- artist/title remain hidden.
 
 Internal work:
 
@@ -1092,8 +1161,10 @@ Source-specific normalization:
 - From `ROUND_COMPLETE`: nothing to void; resume `ROUND_COMPLETE`.
 - From `AUDIO_PREPARING`: cancel preparation; discard pending context; **do not consume selected song**; resume `ROUND_COMPLETE`.
 - From `PLAYING`: stop audio, disable buzzing, mark round void with `songmaster_disconnected`, consume current song by advancing deck pointer exactly once; resume `ROUND_COMPLETE`.
-- From `AWAITING_REVEAL`: mark unresolved round void; pointer already advanced; do not advance again; resume `ROUND_COMPLETE`.
-- From `SCORING`: discard provisional score, mark round void; pointer already advanced; resume `ROUND_COMPLETE`.
+- From `AWAITING_REVEAL`: mark the unresolved round void and resolve its still-current
+  entry exactly once before resuming `ROUND_COMPLETE` (future overlay work).
+- From `SCORING`: discard provisional score, mark the round void, and avoid a
+  second consumption if a later transition has already resolved the entry.
 - From `FINISHED`: nothing competitive remains to void; remain/resume in `FINISHED`.
 
 If the original Songmaster reconnects within grace, preserve the role, announce reconnect, and resume the stored stable state.
@@ -1251,6 +1322,12 @@ validate that an event came from the member's current connection so an old
 connection cannot affect a newer one. Full active-state join, reconnect,
 disconnect, and capability-loss behavior remains unimplemented.
 
+The same limitation applies to buzz transport. Current domain validation uses
+the member's connected flag plus the immutable transition-C eligibility
+snapshot. Future connection-registry integration must reject stale browser
+connections and must not grant eligibility to a member who joins or reconnects
+after transition C merely because that member appears in the live session.
+
 ## 45. Browser Autoplay
 
 Browsers may restrict programmatic audio until the user interacts with the page.
@@ -1324,7 +1401,9 @@ min multiplier: 1.0x
 17. Round buzz eligibility is snapshotted on transition C before `AUDIO_PREPARING`; joins/reconnects after that snapshot are observers for that round.
 18. First valid buzz wins.
 19. Buzz and timeout are mutually exclusive terminating events.
-20. `AWAITING_REVEAL` entry stops audio, disables buzzing, and consumes the played deck entry.
+20. In the implemented F/G boundary, `AWAITING_REVEAL` disables buzzing and
+    preserves the played entry under the current unconsumed deck pointer;
+    physical audio stop and later consumption remain future work.
 21. Reveal is always manual.
 22. Timeout rounds go from reveal directly to `ROUND_COMPLETE`.
 23. Buzz rounds go from reveal to `SCORING`.
@@ -1355,6 +1434,15 @@ min multiplier: 1.0x
 48. A target's first accepted READY/FAILED result is terminal for that preparation.
 49. Preparation failure does not consume the selected entry until Songmaster acknowledgement.
 50. Transition E creates the actual round and includes only READY targets as playback clients.
+51. Playback start, deadline, buzz receipt, elapsed time, and timeout scheduling
+    use one authoritative monotonic clock domain; UTC is diagnostic only.
+52. A buzz is deadline-eligible only at or after monotonic playback start and
+    strictly before the deadline.
+53. Client requests cannot supply authoritative buzz timing metadata.
+54. Buzz and timeout races retain global FIFO processing order; timers only
+    enqueue system events.
+55. F/G preserve the winner/elapsed-or-timeout outcome without assigning points,
+    revealing answer metadata, or consuming the played entry.
 
 ## 49. Future Directions
 

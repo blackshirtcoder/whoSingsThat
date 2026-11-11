@@ -34,11 +34,13 @@ from .messages import (
     AudioPreparationTimeoutEvent,
     AuthoritativeMessage,
     BrowserAudioCapabilityChangedEvent,
+    BuzzRequest,
     ClientRequest,
     CreateGameRequest,
     DeselectPlaylistRequest,
     JoinGameRequest,
     MemberDisconnectedEvent,
+    PlaybackTimeoutEvent,
     PlaySongRequest,
     SelectPlaylistRequest,
     SetAudioPreferenceRequest,
@@ -97,9 +99,17 @@ class SystemEventRejection:
     error: Exception
 
 
+@dataclass(frozen=True, slots=True)
+class _TrustedBuzzSubmission:
+    """Application-owned metadata attached at authoritative request ingress."""
+
+    request: BuzzRequest
+    received_at_monotonic: float
+
+
 @dataclass(slots=True)
 class _QueuedMessage:
-    message: AuthoritativeMessage
+    message: AuthoritativeMessage | _TrustedBuzzSubmission
     response: asyncio.Future[Any] | None
 
 
@@ -139,6 +149,7 @@ class GameController:
         inspect_media: MediaInspector = extract_track_metadata,
         preparation_timeout_seconds: float = DEFAULT_PREPARATION_TIMEOUT_SECONDS,
         preparation_timeout_sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        playback_timeout_sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
         if (
             isinstance(preparation_timeout_seconds, bool)
@@ -155,6 +166,7 @@ class GameController:
         self._inspect_media = inspect_media
         self._preparation_timeout_seconds = float(preparation_timeout_seconds)
         self._preparation_timeout_sleep = preparation_timeout_sleep
+        self._playback_timeout_sleep = playback_timeout_sleep
         self._queue: asyncio.Queue[_QueuedMessage | _StopConsumer] = asyncio.Queue()
         self._consumer_task: asyncio.Task[None] | None = None
         self._consumer_ready: asyncio.Event | None = None
@@ -162,6 +174,7 @@ class GameController:
         self._failure: BaseException | None = None
         self._system_event_rejections: list[SystemEventRejection] = []
         self._preparation_timeout_task: asyncio.Task[None] | None = None
+        self._playback_timeout_task: asyncio.Task[None] | None = None
         self._owned_timer_tasks: set[asyncio.Task[None]] = set()
 
     @property
@@ -196,6 +209,13 @@ class GameController:
         task = self._preparation_timeout_task
         return task is not None and not task.done()
 
+    @property
+    def playback_timeout_active(self) -> bool:
+        """Return whether a live playback timeout task is currently owned."""
+
+        task = self._playback_timeout_task
+        return task is not None and not task.done()
+
     async def start(self) -> None:
         """Start exactly one consumer and wait until it is ready for work."""
 
@@ -228,9 +248,11 @@ class GameController:
         if self._accepting_messages:
             self._accepting_messages = False
             self._retire_preparation_timeout()
+            self._retire_playback_timeout()
             self._queue.put_nowait(_STOP_CONSUMER)
         await task
         self._retire_preparation_timeout()
+        self._retire_playback_timeout()
         await self._await_timer_cleanup()
         self._consumer_task = None
         self._consumer_ready = None
@@ -254,7 +276,16 @@ class GameController:
 
         response = asyncio.get_running_loop().create_future()
         response.add_done_callback(_observe_response_exception)
-        self._queue.put_nowait(_QueuedMessage(request, response))
+        queued_request: ClientRequest | _TrustedBuzzSubmission = request
+        if isinstance(request, BuzzRequest):
+            # This is the current trusted ingress boundary. Future WebSocket
+            # integration must perform this capture promptly when the message
+            # reaches authoritative server code, before any queue wait.
+            queued_request = _TrustedBuzzSubmission(
+                request=request,
+                received_at_monotonic=self._game_engine.monotonic_time(),
+            )
+        self._queue.put_nowait(_QueuedMessage(queued_request, response))
         return await asyncio.shield(response)
 
     def post_system_event(self, event: SystemEvent) -> None:
@@ -296,8 +327,21 @@ class GameController:
             finally:
                 self._queue.task_done()
 
-    def _dispatch(self, message: AuthoritativeMessage) -> object:
+    def _dispatch(
+        self, message: AuthoritativeMessage | _TrustedBuzzSubmission
+    ) -> object:
         """Route one message to existing application or domain operations."""
+
+        if isinstance(message, _TrustedBuzzSubmission):
+            request = message.request
+            result = self._game_engine.accept_buzz(
+                request.game_session_id,
+                request.round_id,
+                request.requesting_browser_token,
+                message.received_at_monotonic,
+            )
+            self._retire_playback_timeout()
+            return result
 
         if isinstance(message, CreateGameRequest):
             return self._game_engine.create_game(
@@ -351,7 +395,7 @@ class GameController:
                 message.preparation_id,
                 message.browser_token,
             )
-            self._retire_timeout_if_collection_completed(result)
+            self._complete_preparation_event(result)
             return result
         if isinstance(message, AudioPreparationFailedEvent):
             result = self._game_engine.record_audio_preparation_failed(
@@ -359,14 +403,22 @@ class GameController:
                 message.preparation_id,
                 message.browser_token,
             )
-            self._retire_timeout_if_collection_completed(result)
+            self._complete_preparation_event(result)
             return result
         if isinstance(message, AudioPreparationTimeoutEvent):
             result = self._game_engine.audio_preparation_timed_out(
                 message.game_session_id,
                 message.preparation_id,
             )
-            self._retire_timeout_if_collection_completed(result)
+            self._complete_preparation_event(result)
+            return result
+        if isinstance(message, PlaybackTimeoutEvent):
+            result = self._game_engine.playback_timed_out(
+                message.game_session_id,
+                message.round_id,
+                self._game_engine.monotonic_time(),
+            )
+            self._retire_playback_timeout()
             return result
         if isinstance(message, AcknowledgeAudioPreparationFailureRequest):
             result = self._game_engine.acknowledge_audio_preparation_failure(
@@ -432,16 +484,78 @@ class GameController:
             # Shutdown/failure retires owned timers; a racing expiry is harmless.
             return
 
-    def _retire_timeout_if_collection_completed(
+    def _complete_preparation_event(
         self,
         result: PreparationEventResult,
     ) -> None:
         if result.outcome is not PreparationOutcome.COLLECTING:
             self._retire_preparation_timeout()
+        if result.outcome is PreparationOutcome.PLAYING:
+            game = self._game_engine.active_game
+            active_round = result.active_round
+            if game is None or active_round is None:
+                raise DomainInvariantError(
+                    "a PLAYING preparation result requires an actual round"
+                )
+            self._schedule_playback_timeout(
+                game.game_session_id,
+                active_round.round_id,
+                active_round.playback_deadline_monotonic,
+            )
 
     def _retire_preparation_timeout(self) -> None:
         task = self._preparation_timeout_task
         self._preparation_timeout_task = None
+        if task is not None and not task.done():
+            task.cancel()
+
+    def _schedule_playback_timeout(
+        self,
+        game_session_id: UUID,
+        round_id: UUID,
+        deadline_monotonic: float,
+    ) -> None:
+        self._retire_playback_timeout()
+        task = asyncio.create_task(
+            self._post_playback_timeout(
+                game_session_id,
+                round_id,
+                deadline_monotonic,
+            ),
+            name="wst-playback-timeout",
+        )
+        self._playback_timeout_task = task
+        self._owned_timer_tasks.add(task)
+        task.add_done_callback(self._timer_task_done)
+
+    async def _post_playback_timeout(
+        self,
+        game_session_id: UUID,
+        round_id: UUID,
+        deadline_monotonic: float,
+    ) -> None:
+        remaining_seconds = max(
+            0.0,
+            deadline_monotonic - self._game_engine.monotonic_time(),
+        )
+        try:
+            await self._playback_timeout_sleep(remaining_seconds)
+        except asyncio.CancelledError:
+            return
+        try:
+            self.post_system_event(
+                PlaybackTimeoutEvent(
+                    game_session_id=game_session_id,
+                    round_id=round_id,
+                )
+            )
+        except (ControllerNotRunningError, ControllerFailedError):
+            # Shutdown/failure retires owned timers; a racing expiry is harmless.
+            return
+
+    def _retire_playback_timeout(self) -> None:
+        task = self._playback_timeout_task
+        self._playback_timeout_task = None
         if task is not None and not task.done():
             task.cancel()
 
@@ -453,7 +567,7 @@ class GameController:
         if error is not None:
             task.get_loop().call_exception_handler(
                 {
-                    "message": "WST preparation timeout task failed",
+                    "message": "WST owned timer task failed",
                     "exception": error,
                     "task": task,
                 }
@@ -495,6 +609,7 @@ class GameController:
         self._failure = error
         self._accepting_messages = False
         self._retire_preparation_timeout()
+        self._retire_playback_timeout()
         if queued.response is not None:
             self._complete_response(queued.response, error=error)
 

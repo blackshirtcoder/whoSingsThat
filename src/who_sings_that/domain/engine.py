@@ -5,7 +5,10 @@ from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import Enum
+from math import isfinite
+from numbers import Real
 from random import shuffle as random_shuffle
+from time import monotonic
 from uuid import UUID, uuid4
 
 from .deck import Deck, DeckEntry, Shuffle, TrackReference, build_deck
@@ -23,6 +26,8 @@ from .models import (
     InvalidPlayerNameError,
     PendingAudioPreparation,
     ResolvedPlaylist,
+    RoundTermination,
+    RoundTerminationReason,
     SelectedPlaylistSnapshot,
     SkippedDeckEntry,
     normalize_player_name,
@@ -151,6 +156,14 @@ class UnauthorizedPreparationFailureAcknowledgementError(GameEngineError):
     """Raised when someone other than the connected Songmaster acknowledges."""
 
 
+class BuzzNotAllowedError(GameEngineError):
+    """Expected rejection of an invalid, stale, ineligible, or late buzz."""
+
+
+class PlaybackTimeoutInapplicableError(GameEngineError):
+    """Expected discard of an early or stale playback timeout event."""
+
+
 class PreparationOutcome(Enum):
     """Outcome exposed internally after applying one preparation event."""
 
@@ -179,6 +192,7 @@ class GameEngine:
         installation_defaults: GameSettings | None = None,
         *,
         clock: Callable[[], datetime] | None = None,
+        monotonic_clock: Callable[[], float] | None = None,
         game_id_factory: Callable[[], UUID] | None = None,
         preparation_id_factory: Callable[[], UUID] | None = None,
         round_id_factory: Callable[[], UUID] | None = None,
@@ -190,6 +204,9 @@ class GameEngine:
             else GameSettings()
         )
         self._clock = clock if clock is not None else lambda: datetime.now(UTC)
+        self._monotonic_clock = (
+            monotonic_clock if monotonic_clock is not None else monotonic
+        )
         self._game_id_factory = (
             game_id_factory if game_id_factory is not None else uuid4
         )
@@ -218,6 +235,20 @@ class GameEngine:
         """Return the active game, if one exists."""
 
         return self._active_game
+
+    def monotonic_time(self) -> float:
+        """Return a validated timestamp from the authoritative timing clock.
+
+        The application controller uses this same clock domain at trusted buzz
+        ingress, when scheduling the playback timer, and when dispatching its
+        expiry. Wall-clock time is deliberately absent from those decisions.
+        """
+
+        return self._validated_monotonic_timestamp(
+            self._monotonic_clock(),
+            error_type=DomainInvariantError,
+            name="the engine monotonic clock value",
+        )
 
     def create_game(self, browser_token: str, display_name: str) -> GameSession:
         """Apply transition A (``NO_GAME`` to ``LOBBY``) atomically."""
@@ -678,6 +709,113 @@ class GameEngine:
         self._transition_to(GameState.ROUND_COMPLETE)
         return game
 
+    def accept_buzz(
+        self,
+        game_session_id: UUID,
+        round_id: UUID,
+        requesting_browser_token: str,
+        received_at_monotonic: float,
+    ) -> RoundTermination:
+        """Apply transition F using an application-trusted receipt timestamp."""
+
+        game, active_round = self._current_playing_round_for_event(
+            game_session_id,
+            round_id,
+            error_type=BuzzNotAllowedError,
+            event_name="buzz",
+        )
+        if not game.buzzing_enabled:
+            raise BuzzNotAllowedError("buzzing is not enabled for this round")
+
+        token = self._validate_browser_token(
+            requesting_browser_token,
+            error_type=BuzzNotAllowedError,
+        )
+        member = game.members.get(token)
+        if member is None:
+            raise BuzzNotAllowedError("the requesting browser is not a game member")
+        if not member.connected:
+            raise BuzzNotAllowedError("a disconnected member cannot buzz")
+        if token not in active_round.buzz_eligible_browser_tokens:
+            raise BuzzNotAllowedError(
+                "the requesting member is not eligible for this round"
+            )
+
+        receipt = self._validated_monotonic_timestamp(
+            received_at_monotonic,
+            error_type=BuzzNotAllowedError,
+            name="trusted buzz receipt timestamp",
+        )
+        if receipt < active_round.playback_started_monotonic:
+            raise BuzzNotAllowedError("buzz was received before playback started")
+        if receipt >= active_round.playback_deadline_monotonic:
+            raise BuzzNotAllowedError("buzz was received at or after the deadline")
+
+        termination = RoundTermination(
+            reason=RoundTerminationReason.BUZZ,
+            winning_browser_token=token,
+            buzz_elapsed_seconds=(
+                receipt - active_round.playback_started_monotonic
+            ),
+        )
+        game.round_termination = termination
+        self._transition_to(GameState.AWAITING_REVEAL)
+        return termination
+
+    def playback_timed_out(
+        self,
+        game_session_id: UUID,
+        round_id: UUID,
+        observed_at_monotonic: float,
+    ) -> RoundTermination:
+        """Apply transition G after the authoritative playback deadline."""
+
+        game, active_round = self._current_playing_round_for_event(
+            game_session_id,
+            round_id,
+            error_type=PlaybackTimeoutInapplicableError,
+            event_name="playback timeout",
+        )
+        observed_at = self._validated_monotonic_timestamp(
+            observed_at_monotonic,
+            error_type=PlaybackTimeoutInapplicableError,
+            name="trusted playback timeout timestamp",
+        )
+        if observed_at < active_round.playback_deadline_monotonic:
+            raise PlaybackTimeoutInapplicableError(
+                "playback timeout arrived before the authoritative deadline"
+            )
+
+        termination = RoundTermination(
+            reason=RoundTerminationReason.PLAYBACK_TIMEOUT,
+        )
+        game.round_termination = termination
+        self._transition_to(GameState.AWAITING_REVEAL)
+        return termination
+
+    def _current_playing_round_for_event(
+        self,
+        game_session_id: UUID,
+        round_id: UUID,
+        *,
+        error_type: type[GameEngineError],
+        event_name: str,
+    ) -> tuple[GameSession, ActiveRound]:
+        game = self._active_game
+        if (
+            self._state is not GameState.PLAYING
+            or game is None
+            or game.game_session_id != game_session_id
+        ):
+            raise error_type(f"{event_name} does not target the playing game")
+        active_round = game.active_round
+        if not isinstance(active_round, ActiveRound):
+            raise DomainInvariantError("PLAYING requires an actual round")
+        if active_round.round_id != round_id:
+            raise error_type(f"{event_name} targets a stale round")
+        self._validate_state_invariants(GameState.PLAYING)
+        return game, active_round
+
     def _record_audio_preparation_response(
         self,
         game_session_id: UUID,
@@ -778,6 +916,10 @@ class GameEngine:
         playback_started_at = self._clock()
         if not isinstance(playback_started_at, datetime):
             raise DomainInvariantError("the engine clock must return a datetime")
+        playback_started_monotonic = self.monotonic_time()
+        playback_deadline_monotonic = (
+            playback_started_monotonic + pending.playback_duration_seconds
+        )
 
         active_round = ActiveRound(
             round_id=round_id,
@@ -796,6 +938,8 @@ class GameEngine:
             buzz_eligible_browser_tokens=pending.buzz_eligible_browser_tokens,
             playback_clients=ready_tokens,
             playback_started_at=playback_started_at,
+            playback_started_monotonic=playback_started_monotonic,
+            playback_deadline_monotonic=playback_deadline_monotonic,
         )
         result = self._preparation_event_result(
             responses,
@@ -803,6 +947,7 @@ class GameEngine:
             active_round=active_round,
         )
         game.active_round = active_round
+        game.round_termination = None
         game.pending_audio_preparation = None
         game.audio_preparation_responses = None
         self._transition_to(GameState.PLAYING)
@@ -937,6 +1082,21 @@ class GameEngine:
         if not browser_token:
             raise error_type("browser_token must not be empty")
         return browser_token
+
+    @staticmethod
+    def _validated_monotonic_timestamp(
+        value: object,
+        *,
+        error_type: type[GameEngineError],
+        name: str,
+    ) -> float:
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, Real)
+            or not isfinite(value)
+        ):
+            raise error_type(f"{name} must be a finite real number")
+        return float(value)
 
     @staticmethod
     def _validate_playlist_id(playlist_id: str) -> str:
@@ -1126,6 +1286,8 @@ class GameEngine:
                 self._enter_audio_preparing()
             case GameState.PLAYING:
                 self._enter_playing()
+            case GameState.AWAITING_REVEAL:
+                self._enter_awaiting_reveal()
             case GameState.FINISHED:
                 self._enter_finished()
             case _:
@@ -1183,6 +1345,22 @@ class GameEngine:
         game.displayed_title = None
         game.buzzing_enabled = True
 
+    def _enter_awaiting_reveal(self) -> None:
+        """Disable buzzing while preserving the unconsumed current round."""
+
+        game = self._active_game
+        if (
+            game is None
+            or game.active_round is None
+            or game.round_termination is None
+        ):
+            raise DomainInvariantError(
+                "AWAITING_REVEAL entry requires a terminated actual round"
+            )
+        # Physical audio stop and browser notification remain transport work.
+        # The application controller retires its playback timer after dispatch.
+        game.buzzing_enabled = False
+
     def _take_transition_k(self) -> None:
         """Apply transition K after established deck exhaustion."""
 
@@ -1214,6 +1392,7 @@ class GameEngine:
         game.ended_at = ended_at
         game.final_standings = self._calculate_final_standings(game)
         game.active_round = None
+        game.round_termination = None
         game.pending_audio_preparation = None
         game.audio_preparation_responses = None
         game.buzzing_enabled = False
@@ -1256,6 +1435,8 @@ class GameEngine:
                 self._validate_audio_preparing_invariants()
             case GameState.PLAYING:
                 self._validate_playing_invariants()
+            case GameState.AWAITING_REVEAL:
+                self._validate_awaiting_reveal_invariants()
             case GameState.FINISHED:
                 self._validate_finished_invariants()
             case _:
@@ -1299,6 +1480,8 @@ class GameEngine:
             raise DomainInvariantError("LOBBY cannot have selected-playlist snapshots")
         if game.active_round is not None:
             raise DomainInvariantError("LOBBY cannot have an active round")
+        if game.round_termination is not None:
+            raise DomainInvariantError("LOBBY cannot have round termination facts")
         if game.pending_audio_preparation is not None:
             raise DomainInvariantError("LOBBY cannot have a pending preparation")
         if game.audio_preparation_responses is not None:
@@ -1505,6 +1688,10 @@ class GameEngine:
         )
         if game.active_round is not None:
             raise DomainInvariantError("ROUND_COMPLETE cannot have an active round")
+        if game.round_termination is not None:
+            raise DomainInvariantError(
+                "ROUND_COMPLETE cannot have round termination facts"
+            )
         if game.pending_audio_preparation is not None:
             raise DomainInvariantError(
                 "ROUND_COMPLETE cannot have a pending preparation"
@@ -1554,6 +1741,10 @@ class GameEngine:
         if game.active_round is not None:
             raise DomainInvariantError(
                 "AUDIO_PREPARING cannot have an active played round"
+            )
+        if game.round_termination is not None:
+            raise DomainInvariantError(
+                "AUDIO_PREPARING cannot have round termination facts"
             )
         if game.buzzing_enabled is not False:
             raise DomainInvariantError(
@@ -1683,32 +1874,49 @@ class GameEngine:
                 "audio target snapshot must contain only valid audio targets"
             )
 
-    def _validate_playing_invariants(self) -> None:
-        game = self._active_game
-        if game is None:
-            raise DomainInvariantError("PLAYING requires an active game")
-        deck = self._validate_started_game_facts(game, state_name="PLAYING")
+    def _validate_actual_round_facts(
+        self, game: GameSession, *, state_name: str
+    ) -> ActiveRound:
+        deck = self._validate_started_game_facts(game, state_name=state_name)
         if game.deck_exhausted is not False or game.deck_pointer >= len(deck):
             raise DomainInvariantError(
-                "PLAYING requires a non-exhausted entry under the pointer"
+                f"{state_name} requires a non-exhausted entry under the pointer"
             )
         active_round = game.active_round
         if not isinstance(active_round, ActiveRound):
-            raise DomainInvariantError("PLAYING requires an actual round")
+            raise DomainInvariantError(f"{state_name} requires an actual round")
         if active_round.deck_entry is not deck[game.deck_pointer]:
             raise DomainInvariantError(
-                "the active round must bind the deck entry under the pointer"
+                "the actual round must bind the unconsumed deck entry under the pointer"
             )
         if active_round.original_deck_position != active_round.deck_entry.original_position:
-            raise DomainInvariantError("active round deck position is inconsistent")
+            raise DomainInvariantError("actual round deck position is inconsistent")
         if active_round.track_id != active_round.deck_entry.track.track_id:
-            raise DomainInvariantError("active round track identity is inconsistent")
+            raise DomainInvariantError("actual round track identity is inconsistent")
         if not isinstance(active_round.round_id, UUID) or not isinstance(
             active_round.preparation_id, UUID
         ):
             raise DomainInvariantError("round and preparation identities must be UUIDs")
         if not isinstance(active_round.playback_started_at, datetime):
-            raise DomainInvariantError("PLAYING requires a playback start timestamp")
+            raise DomainInvariantError(
+                f"{state_name} requires a UTC playback start timestamp"
+            )
+        started_monotonic = self._validated_monotonic_timestamp(
+            active_round.playback_started_monotonic,
+            error_type=DomainInvariantError,
+            name="playback monotonic start",
+        )
+        deadline_monotonic = self._validated_monotonic_timestamp(
+            active_round.playback_deadline_monotonic,
+            error_type=DomainInvariantError,
+            name="playback monotonic deadline",
+        )
+        if deadline_monotonic != (
+            started_monotonic + active_round.playback_duration_seconds
+        ):
+            raise DomainInvariantError(
+                "playback deadline must use the start clock domain and duration"
+            )
         if (
             active_round.configured_playback_offset_seconds
             != game.settings.playback_offset_seconds
@@ -1718,7 +1926,7 @@ class GameEngine:
             != game.settings.speed_bonus_plateau_percent
         ):
             raise DomainInvariantError(
-                "active round settings must preserve the preparation snapshot"
+                "actual round settings must preserve the preparation snapshot"
             )
         expected_effective_offset = calculate_effective_playback_offset(
             active_round.deck_entry.track,
@@ -1726,7 +1934,7 @@ class GameEngine:
             active_round.playback_duration_seconds,
         )
         if active_round.effective_playback_offset_seconds != expected_effective_offset:
-            raise DomainInvariantError("active round effective offset is inconsistent")
+            raise DomainInvariantError("actual round effective offset is inconsistent")
         if not isinstance(
             active_round.buzz_eligible_browser_tokens, frozenset
         ) or not isinstance(active_round.playback_clients, frozenset):
@@ -1734,7 +1942,9 @@ class GameEngine:
                 "round eligibility and playback client snapshots must be immutable"
             )
         if not active_round.playback_clients:
-            raise DomainInvariantError("PLAYING requires at least one playback client")
+            raise DomainInvariantError(
+                f"{state_name} requires at least one playback client"
+            )
         if not active_round.playback_clients <= active_round.buzz_eligible_browser_tokens:
             raise DomainInvariantError(
                 "playback clients must belong to the frozen eligible player set"
@@ -1742,19 +1952,83 @@ class GameEngine:
         if not active_round.buzz_eligible_browser_tokens <= frozenset(game.members):
             raise DomainInvariantError("round eligibility must contain only members")
         if game.pending_audio_preparation is not None:
-            raise DomainInvariantError("PLAYING cannot retain a pending preparation")
+            raise DomainInvariantError(
+                f"{state_name} cannot retain a pending preparation"
+            )
         if game.audio_preparation_responses is not None:
-            raise DomainInvariantError("PLAYING cannot retain preparation responses")
+            raise DomainInvariantError(
+                f"{state_name} cannot retain preparation responses"
+            )
+        if game.displayed_deck_position != active_round.original_deck_position:
+            raise DomainInvariantError(
+                f"{state_name} must display the actual deck position"
+            )
+        if game.displayed_artist is not None or game.displayed_title is not None:
+            raise DomainInvariantError(
+                f"{state_name} answer display must remain blank"
+            )
+        if game.ended_at is not None or game.end_reason is not None:
+            raise DomainInvariantError(
+                f"{state_name} cannot have game finalization facts"
+            )
+        if game.final_standings != ():
+            raise DomainInvariantError(f"{state_name} cannot have final standings")
+        return active_round
+
+    def _validate_playing_invariants(self) -> None:
+        game = self._active_game
+        if game is None:
+            raise DomainInvariantError("PLAYING requires an active game")
+        self._validate_actual_round_facts(game, state_name="PLAYING")
+        if game.round_termination is not None:
+            raise DomainInvariantError("PLAYING cannot have round termination facts")
         if game.buzzing_enabled is not True:
             raise DomainInvariantError("buzzing must be enabled in PLAYING")
-        if game.displayed_deck_position != active_round.original_deck_position:
-            raise DomainInvariantError("PLAYING must display the active deck position")
-        if game.displayed_artist is not None or game.displayed_title is not None:
-            raise DomainInvariantError("PLAYING answer display must remain blank")
-        if game.ended_at is not None or game.end_reason is not None:
-            raise DomainInvariantError("PLAYING cannot have game finalization facts")
-        if game.final_standings != ():
-            raise DomainInvariantError("PLAYING cannot have final standings")
+
+    def _validate_awaiting_reveal_invariants(self) -> None:
+        game = self._active_game
+        if game is None:
+            raise DomainInvariantError("AWAITING_REVEAL requires an active game")
+        active_round = self._validate_actual_round_facts(
+            game, state_name="AWAITING_REVEAL"
+        )
+        if game.buzzing_enabled is not False:
+            raise DomainInvariantError(
+                "buzzing must be disabled in AWAITING_REVEAL"
+            )
+        termination = game.round_termination
+        if not isinstance(termination, RoundTermination):
+            raise DomainInvariantError(
+                "AWAITING_REVEAL requires an immutable termination outcome"
+            )
+        if termination.reason is RoundTerminationReason.BUZZ:
+            winner = termination.winning_browser_token
+            if (
+                winner not in game.members
+                or winner not in active_round.buzz_eligible_browser_tokens
+            ):
+                raise DomainInvariantError(
+                    "a buzz termination requires an eligible member as winner"
+                )
+            elapsed = self._validated_monotonic_timestamp(
+                termination.buzz_elapsed_seconds,
+                error_type=DomainInvariantError,
+                name="buzz elapsed time",
+            )
+            if not 0 <= elapsed < active_round.playback_duration_seconds:
+                raise DomainInvariantError(
+                    "buzz elapsed time must be within the strict playback interval"
+                )
+        elif termination.reason is RoundTerminationReason.PLAYBACK_TIMEOUT:
+            if (
+                termination.winning_browser_token is not None
+                or termination.buzz_elapsed_seconds is not None
+            ):
+                raise DomainInvariantError(
+                    "a timeout termination cannot contain buzz winner facts"
+                )
+        else:
+            raise DomainInvariantError("round termination reason is not supported")
 
     def _validate_finished_invariants(self) -> None:
         game = self._active_game
@@ -1763,6 +2037,8 @@ class GameEngine:
         deck = self._validate_started_game_facts(game, state_name="FINISHED")
         if game.active_round is not None:
             raise DomainInvariantError("FINISHED cannot have an active round")
+        if game.round_termination is not None:
+            raise DomainInvariantError("FINISHED cannot have round termination facts")
         if game.pending_audio_preparation is not None:
             raise DomainInvariantError("FINISHED cannot have a pending preparation")
         if game.audio_preparation_responses is not None:

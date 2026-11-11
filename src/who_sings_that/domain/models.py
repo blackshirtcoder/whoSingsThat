@@ -40,6 +40,13 @@ class GameEndReason(Enum):
     DECK_EXHAUSTED = "deck_exhausted"
 
 
+class RoundTerminationReason(Enum):
+    """Mutually exclusive authoritative outcomes of the playback interval."""
+
+    BUZZ = "buzz"
+    PLAYBACK_TIMEOUT = "playback_timeout"
+
+
 class InvalidPlayerNameError(ValueError):
     """Raised when a display name cannot identify a game member."""
 
@@ -199,6 +206,17 @@ class ActiveRound:
     buzz_eligible_browser_tokens: frozenset[str]
     playback_clients: frozenset[str]
     playback_started_at: datetime
+    playback_started_monotonic: float
+    playback_deadline_monotonic: float
+
+
+@dataclass(frozen=True, slots=True)
+class RoundTermination:
+    """Immutable outcome facts established by transition F or G."""
+
+    reason: RoundTerminationReason
+    winning_browser_token: str | None = None
+    buzz_elapsed_seconds: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -265,6 +283,7 @@ class GameSession:
     end_reason: GameEndReason | None = None
     final_standings: tuple[FinalStanding, ...] = ()
     active_round: ActiveRound | None = None
+    round_termination: RoundTermination | None = None
     pending_audio_preparation: PendingAudioPreparation | None = None
     audio_preparation_responses: AudioPreparationResponseState | None = None
     buzzing_enabled: bool = False

@@ -73,6 +73,19 @@ class PlaySongRequest(ClientRequest):
 
 
 @dataclass(frozen=True, slots=True)
+class BuzzRequest(ClientRequest):
+    """Request transition F for one actual round.
+
+    Trusted receipt time is intentionally absent. The controller attaches it at
+    authoritative ingress before this request waits in the FIFO queue.
+    """
+
+    game_session_id: UUID
+    round_id: UUID
+    requesting_browser_token: str
+
+
+@dataclass(frozen=True, slots=True)
 class AcknowledgeAudioPreparationFailureRequest(ClientRequest):
     """Request transition D for a finalized unsuccessful preparation."""
 
@@ -128,6 +141,14 @@ class AudioPreparationTimeoutEvent(SystemEvent):
     preparation_id: UUID
 
 
+@dataclass(frozen=True, slots=True)
+class PlaybackTimeoutEvent(SystemEvent):
+    """Application timer expiry for one specific actual round."""
+
+    game_session_id: UUID
+    round_id: UUID
+
+
 AuthoritativeMessage = ClientRequest | SystemEvent
 
 
@@ -138,12 +159,14 @@ __all__ = [
     "AudioPreparationTimeoutEvent",
     "AuthoritativeMessage",
     "BrowserAudioCapabilityChangedEvent",
+    "BuzzRequest",
     "ClientRequest",
     "CreateGameRequest",
     "DeselectPlaylistRequest",
     "JoinGameRequest",
     "MemberDisconnectedEvent",
     "PlaySongRequest",
+    "PlaybackTimeoutEvent",
     "SelectPlaylistRequest",
     "SetAudioPreferenceRequest",
     "StartGameRequest",
