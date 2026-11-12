@@ -62,6 +62,11 @@ def test_alembic_head_creates_versioned_catalog_schema(
 
     assert set(database_inspector.get_table_names()) == {
         "alembic_version",
+        "completed_game_deck_entries",
+        "completed_game_participants",
+        "completed_game_playlists",
+        "completed_game_songmaster_events",
+        "completed_games",
         "playlist_tracks",
         "playlists",
         "tracks",
@@ -94,7 +99,7 @@ def test_alembic_head_creates_versioned_catalog_schema(
     )} == {"uq_tracks_relative_path"}
     with engine.connect() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0002_create_playlists"
+            "0003_create_completed_game_history"
         )
         create_statement = connection.scalar(
             text("SELECT sql FROM sqlite_master WHERE name = 'tracks'")

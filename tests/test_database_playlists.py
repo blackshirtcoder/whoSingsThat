@@ -120,6 +120,11 @@ def test_playlist_migration_schema_constraints_and_indexes(tmp_path: Path) -> No
 
     assert set(database_inspector.get_table_names()) == {
         "alembic_version",
+        "completed_game_deck_entries",
+        "completed_game_participants",
+        "completed_game_playlists",
+        "completed_game_songmaster_events",
+        "completed_games",
         "playlist_tracks",
         "playlists",
         "tracks",
@@ -180,7 +185,7 @@ def test_upgrade_from_track_only_schema_preserves_tracks_exactly(tmp_path: Path)
             text("SELECT * FROM tracks ORDER BY track_id")
         ).mappings().all()
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0002_create_playlists"
+            "0003_create_completed_game_history"
         )
     assert upgraded_rows == original_rows
     assert list_playlists(upgraded_engine) == ()

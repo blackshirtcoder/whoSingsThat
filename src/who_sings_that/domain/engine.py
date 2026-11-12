@@ -4,6 +4,7 @@ from collections.abc import Callable, Iterable
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from decimal import Decimal
 from enum import Enum
 from math import isfinite
 from numbers import Real
@@ -16,6 +17,7 @@ from .models import (
     ActiveRound,
     AudioPreparationResponseState,
     AudioPreparationStatus,
+    CompletedGameHistory,
     CompletedRound,
     DeckSkipReason,
     FinalStanding,
@@ -25,6 +27,10 @@ from .models import (
     GameSession,
     GameSettings,
     GameState,
+    HistoricalDeckEntry,
+    HistoricalDeckOutcome,
+    HistoricalParticipant,
+    HistoricalSongmasterEvent,
     InvalidPlayerNameError,
     PendingAudioPreparation,
     ResolvedPlaylist,
@@ -33,6 +39,8 @@ from .models import (
     RoundVoidReason,
     SelectedPlaylistSnapshot,
     SkippedDeckEntry,
+    SongmasterEvent,
+    SongmasterEventReason,
     SongmasterRecovery,
     SongmasterRecoveryOutcome,
     SongmasterRecoveryResolution,
@@ -46,7 +54,12 @@ from .playback import (
     is_duration_eligible,
     select_deck_candidate,
 )
-from .scoring import ScoringChoice, calculate_points
+from .scoring import (
+    BASE_SCORES,
+    ScoringChoice,
+    calculate_points,
+    exact_speed_multiplier,
+)
 
 
 class GameEngineError(RuntimeError):
@@ -346,12 +359,22 @@ class GameEngine:
             join_order=0,
             audio_enabled=True,
         )
+        created_at = self._clock()
         game = GameSession(
             game_session_id=self._game_id_factory(),
-            created_at=self._clock(),
+            created_at=created_at,
             settings=deepcopy(self._installation_defaults),
             members={token: creator},
             songmaster_browser_token=token,
+            songmaster_events=(
+                SongmasterEvent(
+                    sequence=1,
+                    occurred_at=created_at,
+                    reason=SongmasterEventReason.INITIAL_ASSIGNMENT,
+                    previous_songmaster_browser_token=None,
+                    resulting_songmaster_browser_token=token,
+                ),
+            ),
         )
 
         previous_state = self._state
@@ -738,6 +761,9 @@ class GameEngine:
         # The prior round remains correctable until transition C successfully
         # commits a preparation. All request validation above is non-mutating.
         game.scoring_correction_round_id = None
+        # The bounded live void snapshot is no longer needed once a later
+        # candidate is successfully bound. Durable game-local history retains it.
+        game.last_voided_round = None
         self._transition_to(GameState.AUDIO_PREPARING)
         return pending
 
@@ -785,12 +811,13 @@ class GameEngine:
                 raise DomainInvariantError(
                     f"{source_state.name} requires an actual round"
                 )
-            game.last_voided_round = VoidedRound(
+            voided = VoidedRound(
                 active_round=active_round,
                 reason=RoundVoidReason.GAME_ENDED,
                 termination=game.round_termination,
                 answer_revealed=source_state is GameState.SCORING,
             )
+            self._record_voided_round(game, voided)
 
         game.end_reason = GameEndReason.SONGMASTER_ENDED_GAME
         self._transition_to(GameState.FINISHED)
@@ -866,6 +893,12 @@ class GameEngine:
             )
         self._validate_state_invariants(self._state)
         game.songmaster_browser_token = recipient_token
+        self._record_songmaster_event(
+            game,
+            SongmasterEventReason.MANUAL_TRANSFER,
+            previous_browser_token=requester,
+            resulting_browser_token=recipient_token,
+        )
         self._validate_state_invariants(self._state)
         return recipient
 
@@ -984,6 +1017,16 @@ class GameEngine:
                 original_position=entry.original_position,
                 track_id=entry.track.track_id,
                 reason=DeckSkipReason.AUDIO_PREPARATION_FAILED,
+                configured_playback_offset_seconds=(
+                    pending.configured_playback_offset_seconds
+                ),
+                effective_playback_offset_seconds=(
+                    pending.effective_playback_offset_seconds
+                ),
+                playback_duration_seconds=pending.playback_duration_seconds,
+                speed_bonus_plateau_percent=(
+                    pending.speed_bonus_plateau_percent
+                ),
             ),
         )
         game.deck_pointer += 1
@@ -1134,12 +1177,13 @@ class GameEngine:
         if termination.reason is RoundTerminationReason.PLAYBACK_TIMEOUT:
             # Transition I finalizes the zero-point round and consumes its bound
             # entry before normal ROUND_COMPLETE candidate scanning runs.
-            game.last_completed_round = CompletedRound(
+            completed = CompletedRound(
                 active_round=active_round,
                 termination=termination,
                 scoring_choice=None,
                 awarded_points=0,
             )
+            self._record_completed_round(game, completed)
             game.scoring_correction_round_id = None
             game.deck_pointer += 1
             game.active_round = None
@@ -1207,7 +1251,7 @@ class GameEngine:
         # Transition-J-specific work is committed exactly once before normal
         # ROUND_COMPLETE entry scanning executes without finalizing the game.
         game.members[winner_token].committed_score += awarded_points
-        game.last_completed_round = completed
+        self._record_completed_round(game, completed)
         game.scoring_correction_round_id = round_id
         game.deck_pointer += 1
         game.active_round = None
@@ -1294,6 +1338,12 @@ class GameEngine:
         )
         game.members[winner_token].committed_score = adjusted_score
         game.last_completed_round = replacement
+        game.completed_rounds = tuple(
+            replacement
+            if item.active_round.round_id == replacement.active_round.round_id
+            else item
+            for item in game.completed_rounds
+        )
         self._validate_state_invariants(GameState.ROUND_COMPLETE)
         return replacement
 
@@ -1464,6 +1514,12 @@ class GameEngine:
             SongmasterRecoveryResolution.ORIGINAL_RECONNECTED,
             token,
         )
+        self._record_songmaster_event(
+            game,
+            SongmasterEventReason.ORIGINAL_RECONNECTED,
+            previous_browser_token=token,
+            resulting_browser_token=token,
+        )
         self._validate_state_invariants(self._state)
         return outcome
 
@@ -1510,11 +1566,18 @@ class GameEngine:
                 raise SongmasterRecoveryInapplicableError(
                     "automatic failover requires a connected eligible contestant"
                 )
+            previous_songmaster = game.songmaster_browser_token
             game.songmaster_browser_token = replacement.browser_token
             outcome = self._complete_songmaster_recovery(
                 recovery,
                 SongmasterRecoveryResolution.AUTOMATIC_FAILOVER,
                 replacement.browser_token,
+            )
+            self._record_songmaster_event(
+                game,
+                SongmasterEventReason.AUTOMATIC_FAILOVER,
+                previous_browser_token=previous_songmaster,
+                resulting_browser_token=replacement.browser_token,
             )
             self._validate_state_invariants(self._state)
             return outcome
@@ -1566,11 +1629,18 @@ class GameEngine:
             raise SongmasterRecoveryInapplicableError(
                 "indefinite recovery requires a connected game member"
             )
+        previous_songmaster = game.songmaster_browser_token
         game.songmaster_browser_token = token
         outcome = self._complete_songmaster_recovery(
             recovery,
             SongmasterRecoveryResolution.RESUMED_AFTER_INDEFINITE_SUSPENSION,
             token,
+        )
+        self._record_songmaster_event(
+            game,
+            SongmasterEventReason.RESUMED_AFTER_INDEFINITE_SUSPENSION,
+            previous_browser_token=previous_songmaster,
+            resulting_browser_token=token,
         )
         self._validate_state_invariants(self._state)
         return outcome
@@ -1610,12 +1680,13 @@ class GameEngine:
             raise DomainInvariantError(
                 "Songmaster round normalization requires an actual round"
             )
-        game.last_voided_round = VoidedRound(
+        voided = VoidedRound(
             active_round=active_round,
             reason=RoundVoidReason.SONGMASTER_DISCONNECTED,
             termination=game.round_termination,
             answer_revealed=source_state is GameState.SCORING,
         )
+        self._record_voided_round(game, voided)
         game.deck_pointer += 1
         game.active_round = None
         game.round_termination = None
@@ -1979,13 +2050,14 @@ class GameEngine:
         if browser_token not in active_round.playback_clients:
             return False
 
-        game.last_voided_round = VoidedRound(
+        voided = VoidedRound(
             active_round=active_round,
             reason=RoundVoidReason.PLAYBACK_CLIENT_LOST,
             termination=None,
             answer_revealed=False,
             lost_playback_client_browser_token=browser_token,
         )
+        self._record_voided_round(game, voided)
         game.deck_pointer += 1
         game.active_round = None
         game.round_termination = None
@@ -2266,6 +2338,15 @@ class GameEngine:
                 original_position=entry.original_position,
                 track_id=entry.track.track_id,
                 reason=DeckSkipReason.DURATION_INELIGIBLE,
+                configured_playback_offset_seconds=(
+                    game.settings.playback_offset_seconds
+                ),
+                playback_duration_seconds=(
+                    game.settings.playback_duration_seconds
+                ),
+                speed_bonus_plateau_percent=(
+                    game.settings.speed_bonus_plateau_percent
+                ),
             )
             for entry in selection.skipped_entries
         )
@@ -2359,6 +2440,301 @@ class GameEngine:
         game.audio_preparation_responses = None
         game.scoring_correction_round_id = None
         game.buzzing_enabled = False
+        game.completed_game_history = self._build_completed_game_history(game)
+
+    @staticmethod
+    def _record_completed_round(
+        game: GameSession,
+        completed: CompletedRound,
+    ) -> None:
+        """Retain one finalized round without duplicating its actual-round ID."""
+
+        round_id = completed.active_round.round_id
+        if any(
+            item.active_round.round_id == round_id
+            for item in game.completed_rounds
+        ):
+            raise DomainInvariantError("a completed round cannot be recorded twice")
+        if any(
+            item.active_round.round_id == round_id for item in game.voided_rounds
+        ):
+            raise DomainInvariantError("a voided round cannot later be completed")
+        game.last_completed_round = completed
+        game.completed_rounds += (completed,)
+
+    @staticmethod
+    def _record_voided_round(game: GameSession, voided: VoidedRound) -> None:
+        """Retain one void without duplicating or contradicting its round."""
+
+        round_id = voided.active_round.round_id
+        if any(
+            item.active_round.round_id == round_id for item in game.voided_rounds
+        ):
+            raise DomainInvariantError("a voided round cannot be recorded twice")
+        if any(
+            item.active_round.round_id == round_id
+            for item in game.completed_rounds
+        ):
+            raise DomainInvariantError("a completed round cannot later be voided")
+        game.last_voided_round = voided
+        game.voided_rounds += (voided,)
+
+    def _record_songmaster_event(
+        self,
+        game: GameSession,
+        reason: SongmasterEventReason,
+        *,
+        previous_browser_token: str | None,
+        resulting_browser_token: str,
+    ) -> None:
+        """Append one ordered role/recovery fact using the domain wall clock."""
+
+        if game.completed_game_history is not None:
+            # FINISHED recovery restores authority to close retained results;
+            # it occurs after ended_at and cannot rewrite immutable history.
+            return
+        occurred_at = self._clock()
+        if not isinstance(occurred_at, datetime):
+            raise DomainInvariantError("the engine clock must return a datetime")
+        game.songmaster_events += (
+            SongmasterEvent(
+                sequence=len(game.songmaster_events) + 1,
+                occurred_at=occurred_at,
+                reason=reason,
+                previous_songmaster_browser_token=previous_browser_token,
+                resulting_songmaster_browser_token=resulting_browser_token,
+            ),
+        )
+
+    @staticmethod
+    def _build_completed_game_history(game: GameSession) -> CompletedGameHistory:
+        """Freeze all retained game-local facts into a persistence-ready value."""
+
+        if (
+            game.deck is None
+            or game.started_at is None
+            or game.ended_at is None
+            or game.end_reason is None
+        ):
+            raise DomainInvariantError(
+                "completed history requires started and ended game facts"
+            )
+
+        participant_ids = {
+            member.browser_token: member.join_order + 1
+            for member in game.members.values()
+        }
+        standings = {
+            standing.browser_token: standing for standing in game.final_standings
+        }
+        participants = tuple(
+            HistoricalParticipant(
+                participant_id=participant_ids[member.browser_token],
+                join_order=member.join_order,
+                display_name=member.display_name,
+                final_rank=standings[member.browser_token].rank,
+                final_score=standings[member.browser_token].score,
+            )
+            for member in sorted(
+                game.members.values(),
+                key=lambda item: item.join_order,
+            )
+        )
+        songmaster_events = tuple(
+            HistoricalSongmasterEvent(
+                sequence=event.sequence,
+                occurred_at=event.occurred_at,
+                reason=event.reason,
+                previous_participant_id=(
+                    None
+                    if event.previous_songmaster_browser_token is None
+                    else participant_ids[event.previous_songmaster_browser_token]
+                ),
+                resulting_participant_id=participant_ids[
+                    event.resulting_songmaster_browser_token
+                ],
+            )
+            for event in game.songmaster_events
+        )
+
+        completed_by_position = {
+            item.active_round.original_deck_position: item
+            for item in game.completed_rounds
+        }
+        voided_by_position = {
+            item.active_round.original_deck_position: item
+            for item in game.voided_rounds
+        }
+        skipped_by_position = {
+            item.original_position: item for item in game.skipped_deck_entries
+        }
+        disposition_count = (
+            len(completed_by_position)
+            + len(voided_by_position)
+            + len(skipped_by_position)
+        )
+        if disposition_count != len(
+            set(completed_by_position)
+            | set(voided_by_position)
+            | set(skipped_by_position)
+        ):
+            raise DomainInvariantError(
+                "one deck position cannot have multiple historical outcomes"
+            )
+
+        deck_entries: list[HistoricalDeckEntry] = []
+        for entry in game.deck:
+            track = entry.track
+            common = {
+                "original_position": entry.original_position,
+                "track_id": track.track_id,
+                "artist": track.artist,
+                "title": track.title,
+                "track_duration_seconds": Decimal(str(track.duration_seconds)),
+            }
+            completed = completed_by_position.get(entry.original_position)
+            if completed is not None:
+                active = completed.active_round
+                termination = completed.termination
+                winner = termination.winning_browser_token
+                elapsed = termination.buzz_elapsed_seconds
+                choice = completed.scoring_choice
+                multiplier = (
+                    None
+                    if elapsed is None or choice is None
+                    else exact_speed_multiplier(
+                        active.playback_duration_seconds,
+                        active.speed_bonus_plateau_percent / 100,
+                        elapsed,
+                    )
+                )
+                deck_entries.append(
+                    HistoricalDeckEntry(
+                        **common,
+                        outcome=HistoricalDeckOutcome.COMPLETED,
+                        round_id=active.round_id,
+                        configured_playback_offset_seconds=(
+                            active.configured_playback_offset_seconds
+                        ),
+                        effective_playback_offset_seconds=(
+                            active.effective_playback_offset_seconds
+                        ),
+                        playback_duration_seconds=(
+                            active.playback_duration_seconds
+                        ),
+                        speed_bonus_plateau_percent=(
+                            active.speed_bonus_plateau_percent
+                        ),
+                        playback_started_at=active.playback_started_at,
+                        round_termination_reason=termination.reason,
+                        buzzing_participant_id=(
+                            None if winner is None else participant_ids[winner]
+                        ),
+                        buzz_elapsed_seconds=(
+                            None if elapsed is None else Decimal(str(elapsed))
+                        ),
+                        scoring_multiplier=multiplier,
+                        scoring_choice=choice,
+                        base_score=None if choice is None else BASE_SCORES[choice],
+                        awarded_points=completed.awarded_points,
+                        answer_revealed=True,
+                    )
+                )
+                continue
+
+            voided = voided_by_position.get(entry.original_position)
+            if voided is not None:
+                active = voided.active_round
+                termination = voided.termination
+                winner = (
+                    None if termination is None else termination.winning_browser_token
+                )
+                elapsed = (
+                    None if termination is None else termination.buzz_elapsed_seconds
+                )
+                lost = voided.lost_playback_client_browser_token
+                deck_entries.append(
+                    HistoricalDeckEntry(
+                        **common,
+                        outcome=HistoricalDeckOutcome.VOIDED,
+                        round_id=active.round_id,
+                        configured_playback_offset_seconds=(
+                            active.configured_playback_offset_seconds
+                        ),
+                        effective_playback_offset_seconds=(
+                            active.effective_playback_offset_seconds
+                        ),
+                        playback_duration_seconds=(
+                            active.playback_duration_seconds
+                        ),
+                        speed_bonus_plateau_percent=(
+                            active.speed_bonus_plateau_percent
+                        ),
+                        playback_started_at=active.playback_started_at,
+                        round_termination_reason=(
+                            None if termination is None else termination.reason
+                        ),
+                        buzzing_participant_id=(
+                            None if winner is None else participant_ids[winner]
+                        ),
+                        buzz_elapsed_seconds=(
+                            None if elapsed is None else Decimal(str(elapsed))
+                        ),
+                        void_reason=voided.reason,
+                        lost_playback_client_participant_id=(
+                            None if lost is None else participant_ids[lost]
+                        ),
+                        answer_revealed=voided.answer_revealed,
+                    )
+                )
+                continue
+
+            skipped = skipped_by_position.get(entry.original_position)
+            if skipped is not None:
+                deck_entries.append(
+                    HistoricalDeckEntry(
+                        **common,
+                        outcome=HistoricalDeckOutcome.SKIPPED,
+                        skip_reason=skipped.reason,
+                        configured_playback_offset_seconds=(
+                            skipped.configured_playback_offset_seconds
+                        ),
+                        effective_playback_offset_seconds=(
+                            skipped.effective_playback_offset_seconds
+                        ),
+                        playback_duration_seconds=(
+                            skipped.playback_duration_seconds
+                        ),
+                        speed_bonus_plateau_percent=(
+                            skipped.speed_bonus_plateau_percent
+                        ),
+                    )
+                )
+                continue
+
+            deck_entries.append(
+                HistoricalDeckEntry(
+                    **common,
+                    outcome=HistoricalDeckOutcome.UNPLAYED,
+                )
+            )
+
+        return CompletedGameHistory(
+            game_session_id=game.game_session_id,
+            created_at=game.created_at,
+            started_at=game.started_at,
+            ended_at=game.ended_at,
+            end_reason=game.end_reason,
+            playback_offset_seconds=game.settings.playback_offset_seconds,
+            playback_duration_seconds=game.settings.playback_duration_seconds,
+            speed_bonus_plateau_percent=(
+                game.settings.speed_bonus_plateau_percent
+            ),
+            participants=participants,
+            selected_playlists=game.selected_playlist_snapshots,
+            songmaster_events=songmaster_events,
+            deck_entries=tuple(deck_entries),
+        )
 
     @staticmethod
     def _calculate_final_standings(game: GameSession) -> tuple[FinalStanding, ...]:

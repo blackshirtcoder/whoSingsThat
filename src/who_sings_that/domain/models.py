@@ -74,6 +74,27 @@ class RoundTerminationReason(Enum):
     PLAYBACK_TIMEOUT = "playback_timeout"
 
 
+class HistoricalDeckOutcome(Enum):
+    """The mutually exclusive final disposition of one original deck entry."""
+
+    COMPLETED = "completed"
+    VOIDED = "voided"
+    SKIPPED = "skipped"
+    UNPLAYED = "unplayed"
+
+
+class SongmasterEventReason(Enum):
+    """Why a Songmaster authority event was retained in game-local history."""
+
+    INITIAL_ASSIGNMENT = "initial_assignment"
+    MANUAL_TRANSFER = "manual_transfer"
+    AUTOMATIC_FAILOVER = "automatic_failover"
+    ORIGINAL_RECONNECTED = "original_reconnected"
+    RESUMED_AFTER_INDEFINITE_SUSPENSION = (
+        "resumed_after_indefinite_suspension"
+    )
+
+
 class InvalidPlayerNameError(ValueError):
     """Raised when a display name cannot identify a game member."""
 
@@ -302,6 +323,19 @@ class SkippedDeckEntry:
     original_position: int
     track_id: int
     reason: DeckSkipReason
+    configured_playback_offset_seconds: int | None = field(
+        default=None,
+        compare=False,
+    )
+    effective_playback_offset_seconds: Decimal | None = field(
+        default=None,
+        compare=False,
+    )
+    playback_duration_seconds: int | None = field(default=None, compare=False)
+    speed_bonus_plateau_percent: Decimal | None = field(
+        default=None,
+        compare=False,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -350,6 +384,86 @@ class SongmasterRecoveryOutcome:
     voided_round_id: UUID | None
 
 
+@dataclass(frozen=True, slots=True)
+class SongmasterEvent:
+    """One ordered live-game authority fact, still keyed by browser token."""
+
+    sequence: int
+    occurred_at: datetime
+    reason: SongmasterEventReason
+    previous_songmaster_browser_token: str | None
+    resulting_songmaster_browser_token: str
+
+
+@dataclass(frozen=True, slots=True)
+class HistoricalParticipant:
+    """A game-local participant snapshot with no reusable browser identity."""
+
+    participant_id: int
+    join_order: int
+    display_name: str
+    final_rank: int
+    final_score: int
+
+
+@dataclass(frozen=True, slots=True)
+class HistoricalSongmasterEvent:
+    """A token-free Songmaster authority event for durable history."""
+
+    sequence: int
+    occurred_at: datetime
+    reason: SongmasterEventReason
+    previous_participant_id: int | None
+    resulting_participant_id: int
+
+
+@dataclass(frozen=True, slots=True)
+class HistoricalDeckEntry:
+    """The immutable final historical view of one original deck position."""
+
+    original_position: int
+    track_id: int
+    artist: str | None
+    title: str | None
+    track_duration_seconds: Decimal
+    outcome: HistoricalDeckOutcome
+    skip_reason: DeckSkipReason | None = None
+    round_id: UUID | None = None
+    configured_playback_offset_seconds: int | None = None
+    effective_playback_offset_seconds: Decimal | None = None
+    playback_duration_seconds: int | None = None
+    speed_bonus_plateau_percent: Decimal | None = None
+    playback_started_at: datetime | None = None
+    round_termination_reason: RoundTerminationReason | None = None
+    buzzing_participant_id: int | None = None
+    buzz_elapsed_seconds: Decimal | None = None
+    scoring_multiplier: Decimal | None = None
+    scoring_choice: ScoringChoice | None = None
+    base_score: int | None = None
+    awarded_points: int | None = None
+    void_reason: RoundVoidReason | None = None
+    lost_playback_client_participant_id: int | None = None
+    answer_revealed: bool | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class CompletedGameHistory:
+    """Authoritative immutable snapshot emitted on entry to ``FINISHED``."""
+
+    game_session_id: UUID
+    created_at: datetime
+    started_at: datetime
+    ended_at: datetime
+    end_reason: GameEndReason
+    playback_offset_seconds: int
+    playback_duration_seconds: int
+    speed_bonus_plateau_percent: Decimal
+    participants: tuple[HistoricalParticipant, ...]
+    selected_playlists: tuple[SelectedPlaylistSnapshot, ...]
+    songmaster_events: tuple[HistoricalSongmasterEvent, ...]
+    deck_entries: tuple[HistoricalDeckEntry, ...]
+
+
 @dataclass(slots=True)
 class GameSession:
     """The live in-memory aggregate for the currently implemented states."""
@@ -361,6 +475,7 @@ class GameSession:
     songmaster_browser_token: str
     songmaster_recovery: SongmasterRecovery | None = None
     last_songmaster_recovery_outcome: SongmasterRecoveryOutcome | None = None
+    songmaster_events: tuple[SongmasterEvent, ...] = ()
     selected_playlist_ids: set[str] | frozenset[str] = field(default_factory=set)
     playlist_selection_editable: bool = True
     selected_playlist_snapshots: tuple[SelectedPlaylistSnapshot, ...] = ()
@@ -377,6 +492,8 @@ class GameSession:
     round_termination: RoundTermination | None = None
     last_completed_round: CompletedRound | None = None
     last_voided_round: VoidedRound | None = None
+    completed_rounds: tuple[CompletedRound, ...] = ()
+    voided_rounds: tuple[VoidedRound, ...] = ()
     scoring_correction_round_id: UUID | None = None
     pending_audio_preparation: PendingAudioPreparation | None = None
     audio_preparation_responses: AudioPreparationResponseState | None = None
@@ -384,6 +501,7 @@ class GameSession:
     displayed_deck_position: int | None = None
     displayed_artist: str | None = None
     displayed_title: str | None = None
+    completed_game_history: CompletedGameHistory | None = None
 
     @property
     def songmaster(self) -> GameMember:

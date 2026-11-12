@@ -9,6 +9,15 @@ from .catalog import (
     list_tracks,
 )
 from .engine import create_sqlite_engine
+from .history import (
+    CompletedGameHistoryConflictError,
+    CompletedGameHistoryError,
+    CompletedGameHistoryPersistenceError,
+    CompletedGameSummary,
+    get_completed_game_history,
+    list_completed_games,
+    save_completed_game_history,
+)
 from .migration import upgrade_database
 from .playlists import (
     DuplicatePlaylistNameError,
@@ -29,6 +38,10 @@ from .playlists import (
 )
 
 __all__ = [
+    "CompletedGameHistoryConflictError",
+    "CompletedGameHistoryError",
+    "CompletedGameHistoryPersistenceError",
+    "CompletedGameSummary",
     "DuplicatePlaylistNameError",
     "DuplicateTrackPathError",
     "InvalidPlaylistNameError",
@@ -40,16 +53,19 @@ __all__ = [
     "create_playlist",
     "create_sqlite_engine",
     "delete_playlist",
+    "get_completed_game_history",
     "get_playlist_by_id",
     "get_playlist_tracks",
     "get_track_by_id",
     "get_track_by_relative_path",
     "import_tracks",
+    "list_completed_games",
     "list_playlists",
     "list_tracks",
     "normalize_playlist_name",
     "playlist_name_uniqueness_key",
     "remove_tracks_from_playlist",
+    "save_completed_game_history",
     "update_playlist",
     "upgrade_database",
 ]

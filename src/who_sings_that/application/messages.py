@@ -124,6 +124,14 @@ class CloseGameRequest(ClientRequest):
 
 
 @dataclass(frozen=True, slots=True)
+class RetryCompletedGamePersistenceRequest(ClientRequest):
+    """Retry the atomic archive write for a retained finished game."""
+
+    game_session_id: UUID
+    requesting_browser_token: str
+
+
+@dataclass(frozen=True, slots=True)
 class BuzzRequest(ClientRequest):
     """Request transition F for one actual round.
 
@@ -262,6 +270,7 @@ __all__ = [
     "PlaySongRequest",
     "PlaybackTimeoutEvent",
     "RegisterConnectionRequest",
+    "RetryCompletedGamePersistenceRequest",
     "RevealRequest",
     "SelectPlaylistRequest",
     "SetAudioPreferenceRequest",

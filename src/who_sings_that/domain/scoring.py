@@ -87,6 +87,16 @@ def speed_multiplier(
     return float(_speed_multiplier_decimal(duration, plateau_fraction, elapsed_time))
 
 
+def exact_speed_multiplier(
+    duration: float | Decimal,
+    plateau_fraction: float | Decimal,
+    elapsed_time: float | Decimal,
+) -> Decimal:
+    """Return the exact Decimal multiplier used by authoritative scoring."""
+
+    return _speed_multiplier_decimal(duration, plateau_fraction, elapsed_time)
+
+
 def calculate_points(
     choice: ScoringChoice,
     duration: float | Decimal,

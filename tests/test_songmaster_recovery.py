@@ -22,7 +22,7 @@ from who_sings_that.application import (
     StaleConnectionError,
     TransferSongmasterRequest,
 )
-from who_sings_that.database import create_sqlite_engine
+from who_sings_that.database import create_sqlite_engine, upgrade_database
 from who_sings_that.domain import (
     GameEngine,
     GameSettings,
@@ -71,7 +71,9 @@ class NeverSleep:
 
 @pytest.fixture
 def storage(tmp_path: Path) -> tuple[Engine, Path]:
-    engine = create_sqlite_engine(tmp_path / "recovery.sqlite3")
+    database_path = tmp_path / "recovery.sqlite3"
+    upgrade_database(database_path)
+    engine = create_sqlite_engine(database_path)
     music_root = tmp_path / "music"
     music_root.mkdir()
     return engine, music_root

@@ -18,6 +18,10 @@ from uuid import UUID
 from sqlalchemy import Engine
 
 from who_sings_that.catalog import extract_track_metadata
+from who_sings_that.database import (
+    CompletedGameHistoryError,
+    save_completed_game_history,
+)
 from who_sings_that.domain import (
     DomainInvariantError,
     GameEngine,
@@ -60,6 +64,7 @@ from .messages import (
     PlaybackTimeoutEvent,
     PlaySongRequest,
     RegisterConnectionRequest,
+    RetryCompletedGamePersistenceRequest,
     RevealRequest,
     SelectPlaylistRequest,
     SetAudioPreferenceRequest,
@@ -116,6 +121,10 @@ class ControllerFailedError(GameControllerError):
         self.failure = failure
 
 
+class CompletedGamePersistenceNotAllowedError(GameControllerError):
+    """A history retry lacks a retained finished game or Songmaster authority."""
+
+
 @dataclass(frozen=True, slots=True)
 class SystemEventRejection:
     """Observable expected rejection of an unsolicited system event."""
@@ -158,6 +167,8 @@ _STOP_CONSUMER: Final = _StopConsumer()
 DEFAULT_PREPARATION_TIMEOUT_SECONDS: Final = 5.0
 DEFAULT_SONGMASTER_RECONNECT_GRACE_SECONDS: Final = 10.0
 _EXPECTED_APPLICATION_ERRORS: Final = (
+    CompletedGameHistoryError,
+    CompletedGamePersistenceNotAllowedError,
     InvalidMusicRootError,
     InvalidSelectedPlaylistIdsError,
     NoStructurallyEligibleTracksError,
@@ -235,6 +246,7 @@ class GameController:
         self._failure: BaseException | None = None
         self._system_event_rejections: list[SystemEventRejection] = []
         self._connection_registry = ConnectionRegistry()
+        self._persisted_completed_game_ids: set[UUID] = set()
         self._preparation_timeout_task: asyncio.Task[None] | None = None
         self._playback_timeout_task: asyncio.Task[None] | None = None
         self._songmaster_reconnect_grace_task: asyncio.Task[None] | None = None
@@ -270,6 +282,11 @@ class GameController:
         """Return the application-owned registry for diagnostics and adapters."""
 
         return self._connection_registry
+
+    def is_completed_history_persisted(self, game_session_id: UUID) -> bool:
+        """Return whether this controller observed a successful archive commit."""
+
+        return game_session_id in self._persisted_completed_game_ids
 
     @property
     def preparation_timeout_active(self) -> bool:
@@ -525,6 +542,10 @@ class GameController:
                 raise DomainInvariantError(
                     "Play Song must return preparation or finalization facts"
                 )
+            else:
+                self._persist_finished_history(
+                    message.requesting_browser_token
+                )
             return result
         if isinstance(message, EndGameRequest):
             self._require_target_game(message.game_session_id)
@@ -534,9 +555,25 @@ class GameController:
             )
             self._retire_preparation_timeout()
             self._retire_playback_timeout()
+            self._persist_finished_history(message.requesting_browser_token)
             return result
+        if isinstance(message, RetryCompletedGamePersistenceRequest):
+            self._require_target_game(message.game_session_id)
+            return self._persist_finished_history(
+                message.requesting_browser_token
+            )
         if isinstance(message, CloseGameRequest):
             self._require_target_game(message.game_session_id)
+            if self._game_engine.state is not GameState.FINISHED:
+                # Preserve the domain's established state-specific rejection.
+                return self._game_engine.close_game(
+                    message.game_session_id,
+                    message.requesting_browser_token,
+                )
+            # A game without a known successful commit retries immediately
+            # before teardown. A known success needs no second database access.
+            if message.game_session_id not in self._persisted_completed_game_ids:
+                self._persist_finished_history(message.requesting_browser_token)
             result = self._game_engine.close_game(
                 message.game_session_id,
                 message.requesting_browser_token,
@@ -674,6 +711,38 @@ class GameController:
             )
         raise UnsupportedMessageError(
             f"no authoritative handler for {type(message).__name__}"
+        )
+
+    def _persist_finished_history(
+        self,
+        requesting_browser_token: str,
+    ) -> GameFinalizationResult:
+        """Commit the retained FINISHED snapshot in the current FIFO handler."""
+
+        game = self._game_engine.active_game
+        if self._game_engine.state is not GameState.FINISHED or game is None:
+            raise CompletedGamePersistenceNotAllowedError(
+                "completed history persistence requires a retained FINISHED game"
+            )
+        if (
+            requesting_browser_token != game.songmaster_browser_token
+            or not game.songmaster.connected
+        ):
+            raise CompletedGamePersistenceNotAllowedError(
+                "only the current connected Songmaster may retry persistence"
+            )
+        history = game.completed_game_history
+        if history is None:
+            raise DomainInvariantError(
+                "FINISHED requires an authoritative completed history snapshot"
+            )
+        save_completed_game_history(self._database_engine, history)
+        self._persisted_completed_game_ids.add(game.game_session_id)
+        if game.end_reason is None:  # pragma: no cover - FINISHED invariant
+            raise DomainInvariantError("FINISHED requires an end reason")
+        return GameFinalizationResult(
+            end_reason=game.end_reason,
+            final_standings=game.final_standings,
         )
 
     def _require_target_game(self, game_session_id: object) -> None:
@@ -1161,6 +1230,7 @@ def _observe_response_exception(response: asyncio.Future[Any]) -> None:
 __all__ = [
     "DEFAULT_PREPARATION_TIMEOUT_SECONDS",
     "DEFAULT_SONGMASTER_RECONNECT_GRACE_SECONDS",
+    "CompletedGamePersistenceNotAllowedError",
     "ConsumerAlreadyRunningError",
     "ConsumerSelfRequestError",
     "ControllerFailedError",

@@ -1336,7 +1336,7 @@ actual round is retained as a void and contributes no award.
 1. record game end timestamp;
 2. calculate/freeze final standings;
 3. retain final metadata in the live session;
-4. reserve completed-game persistence for a later increment;
+4. freeze an immutable, persistence-ready completed-game history snapshot;
 5. clear transient playback/preparation/timer state;
 6. broadcast final game state;
 7. replace gameplay controls with final-results UI.
@@ -1361,12 +1361,13 @@ Actions:
 
 Target: `NO_GAME`.
 
-The current implementation has no completed-game-history persistence. Closing
-therefore discards the only live finished session; a future persistence
-increment must archive history before transition L performs this teardown.
-Closing does not invalidate browser-local tokens. Reusing a token creates a
-fresh game-local membership and does not inherit the former name, role, or
-score.
+The application controller atomically archives the frozen history on entry to
+`FINISHED`, before reporting successful finalization. Transition L requires the
+controller to have observed a successful archive commit and retries an unknown
+or failed commit before teardown, so a write failure cannot silently discard
+the only authoritative snapshot. Closing does not invalidate
+browser-local tokens. Reusing a token creates a fresh game-local membership and
+does not inherit the former name, role, or score.
 
 ## 36. Global Overlay: End Game
 
@@ -1622,64 +1623,103 @@ No special solo state machine exists.
 
 ## 42. Game History
 
-Completed game history is intended to be retained indefinitely in SQLite; that
-persistence is not implemented in the current phase.
-
-Persist immutable historical snapshots rather than relying on mutable catalog records.
-
-Suggested game-level history:
+Completed game history is retained indefinitely in the same SQLite database as
+the catalog and playlists. Migration `0003_create_completed_game_history`
+adds five normalized tables:
 
 ```text
-game_id
-created_at
-started_at
-ended_at
-end_reason
-participants
-Songmaster changes
-selected playlist snapshots
-game settings
-final standings
+completed_games
+completed_game_participants
+completed_game_playlists
+completed_game_songmaster_events
+completed_game_deck_entries
 ```
 
-Suggested deck-entry/round history:
+`completed_games.game_id` is the immutable game UUID and archive root. The root
+stores lifecycle times, end reason, the final game settings, and a canonical
+content hash. Child rows use real foreign keys to the archive root. References
+to buzzers, lost playback clients, and Songmaster predecessors/successors use
+game-local participant IDs. Historical playlist IDs and stable track IDs are
+retained as descriptive references, not foreign keys to mutable catalog rows.
+Artist, title, playlist name, playlist creation time, playlist song count,
+participant name, final rank, and final score are copied into the archive.
 
-```text
-original deck position
-track_id
-artist snapshot
-title snapshot
-configured offset
-effective offset
-duration
-plateau
-played / skipped / void status
-skip reason
-void reason
-round end reason
-buzzer
-buzz time
-multiplier
-adjudication
-base score
-final points
-```
+Every original deck position has exactly one historical row with outcome:
 
-Skipped deck entries that never became rounds should still be represented sufficiently for diagnostics/history, but must not be misrepresented as played rounds.
+- `completed`: an actual round finalized by timeout or accepted scoring;
+- `voided`: an actual played round discarded by End Game, Songmaster loss, or
+  playback-client loss;
+- `skipped`: a prospective entry consumed without becoming an actual round,
+  with `duration_ineligible` or `audio_preparation_failed` as its reason;
+- `unplayed`: an immutable deck entry never reached before voluntary game end.
 
-Later metadata corrections or playlist changes must not rewrite historical games.
+Only played outcomes have a round UUID and playback-start facts. A completed
+timeout has a termination reason and an explicit zero award but no buzzer or
+adjudication. A void has no accepted adjudication or award, even if a buzz or
+timeout had already terminated playback. A duration-ineligible skip has no
+effective offset because no legal playback interval existed. Unknown artist or
+title values from lower-level synthetic domain inputs remain null rather than
+being fabricated; normal persistent-playlist resolution supplies both.
 
-The live engine currently retains only `last_completed_round`, sufficient for
-the bounded correction window, and `last_voided_round`, sufficient to preserve
-one unfinished actual round when End Game finalizes from an active-round state.
-Durable completed-game/round history persistence and transport-facing history
-projections remain unimplemented.
+The live aggregate retains immutable tuples of every completed round and void,
+all skip records with their skip-time settings, and ordered Songmaster events.
+`last_completed_round` and `last_voided_round` remain bounded normal-gameplay
+views. Score correction replaces the matching item in the completed-round
+tuple and applies only its existing scoreboard delta, so the archive contains
+one round with the authoritative final adjudication and award. Start Game
+already copies catalog artist/title into each immutable `TrackReference`, and
+copies selected-playlist metadata into `SelectedPlaylistSnapshot`; finalization
+does not query mutable catalog data or inspect media files.
+
+Initial assignment, manual transfer, automatic failover, timely incumbent
+reconnect, and resumption from indefinite suspension are ordered game-local
+Songmaster events. A reconnect event whose predecessor and result are the same
+participant is distinguishable from actual succession. Recovery generations
+and ordinary stale-event validation prevent duplicate events.
+
+The Songmaster event boundary is `ended_at`. Recovery while the retained game
+is already in `FINISHED` remains a live authority mechanism for Close Game and
+is visible through the existing recovery outcome, but it is not a retroactive
+change to the immutable completed-game archive.
+
+On every supported transition into `FINISHED`, the domain freezes one
+`CompletedGameHistory`. In the same serialized FIFO handler, the controller
+writes the root and every child row in one SQLAlchemy transaction. An identical
+retry for the same UUID is harmless because its canonical hash matches. A UUID
+with different content raises a conflict and is never overwritten. Database
+failure is returned as an explicit operational error while the live game stays
+in `FINISHED`; `RetryCompletedGamePersistenceRequest` retries the retained
+snapshot. Close Game uses the controller's known-success guard, retrying the
+idempotent save before transition L whenever no successful commit was observed,
+so failed history cannot be silently lost.
+
+The persistence read interface is `list_completed_games()` for stable
+newest-first summaries and `get_completed_game_history()` for one detached,
+read-only structured snapshot. Returned values are ordinary frozen domain data,
+not live SQLAlchemy objects. Close Game, later game creation, catalog edits, and
+catalog/playlist deletion do not mutate these snapshots. There is no automatic
+retention or deletion.
+
+Exact Decimal inputs—track duration snapshots, effective offsets, plateau,
+buzz time, and scoring multiplier—are stored as decimal text; awarded points
+remain authoritative integers. Migration upgrades preserve existing catalog and
+playlist rows and work for both fresh databases and databases at revision
+`0002_create_playlists`. Downgrade removes only the completed-history tables.
+
+V1 still does not checkpoint an active game. A process failure before the
+atomic FINISHED transaction commits loses that active/in-process game; a
+successfully committed completed game survives restart.
 
 ## 43. Historical Player Identity
 
-V1 does not attempt to identify the same human across separate games.
+V1 does not attempt to identify the same human across separate games. Each
+archive assigns small participant IDs from immutable join order and stores the
+game-local display name, final rank, and final score. Browser tokens and
+connection IDs are not persisted in completed history and have no meaning to
+historical reads.
 
-A future profile/account system may link game-local historical participant records later.
+A future profile/account system may link game-local historical participant
+records later, but the current schema neither creates nor implies such a link.
 
 ## 44. Audio Readiness Notes
 
@@ -1859,8 +1899,8 @@ min multiplier: 1.0x
     End Game from `AUDIO_PREPARING` fabricates neither a round nor a void.
 44. Loss of any current-round `playback_client` during `PLAYING` voids and consumes that round and returns to `ROUND_COMPLETE`.
 45. Active games need not survive server restart in V1.
-46. Completed game history is intended to persist indefinitely, but its database
-    persistence remains unimplemented.
+46. Completed game history persists indefinitely after one atomic FINISHED
+    archive transaction; Close Game never deletes it.
 47. Transition L clears the live session and game-local memberships while
     browser-local tokens remain reusable with fresh membership facts.
 48. Preparation waits for all targets or timeout before evaluating READY targets.
