@@ -4,7 +4,7 @@ import logging
 from collections.abc import Callable
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, WebSocket
+from fastapi import FastAPI, Request, WebSocket
 from sqlalchemy import Engine
 
 from who_sings_that.application import GameController
@@ -14,6 +14,7 @@ from who_sings_that.database import (
 )
 
 from .config import ServerSettings
+from .media import media_response
 from .transport import WebSocketTransport
 
 ControllerFactory = Callable[[Engine, ServerSettings], GameController]
@@ -58,6 +59,13 @@ def create_app(
     async def websocket_endpoint(websocket: WebSocket) -> None:
         await websocket.app.state.websocket_transport.handle(websocket)
 
+    @application.get("/media/{opaque_capability}", include_in_schema=False)
+    async def protected_media_endpoint(
+        request: Request,
+        opaque_capability: str,
+    ):
+        return await media_response(request, opaque_capability)
+
     return application
 
 
@@ -65,7 +73,11 @@ def _default_controller_factory(
     database_engine: Engine,
     settings: ServerSettings,
 ) -> GameController:
-    return GameController(database_engine, settings.music_root)
+    return GameController(
+        database_engine,
+        settings.music_root,
+        media_capability_lifetime_seconds=(settings.media_capability_lifetime_seconds),
+    )
 
 
 logging.getLogger(__name__).addHandler(logging.NullHandler())

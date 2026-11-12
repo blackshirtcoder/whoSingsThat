@@ -1114,10 +1114,9 @@ timeout entry before entering `ROUND_COMPLETE`.
 6. keep artist/title hidden and retain enough outcome data for a later UI to
    show the buzzer/time or playback expiry.
 
-The implemented domain entry behavior performs the authoritative state and
-buzz-disable work. The application controller retires its playback timer.
-Physical audio-stop commands and browser notifications are not implemented
-because transport and playback do not yet exist.
+The domain entry behavior performs the authoritative state and buzz-disable
+work. The application controller retires its playback timer, and Phase C1 sends
+the ordered physical audio-stop command. Actual browser playback is Phase C2.
 
 The termination outcome invariants are:
 
@@ -1563,12 +1562,10 @@ efficiency only: game ID, recovery UUID, state, connection ID, preparation ID,
 and round ID checks make duplicate, superseded, cross-game, and late queued
 events harmless expected rejections.
 
-Future state-projection/UI work must notify clients when grace starts, a round is
-voided, the incumbent returns, authority transfers, indefinite suspension
-begins, and a later connection resumes the game. It must project the structured
-recovery facts without exposing pre-reveal track metadata. Phase A provides the
-request/response WebSocket ingress only; browser state projection, audio-stop
-messages, and generic notification infrastructure remain deferred.
+Phase B projections notify clients when grace starts, a round is voided, the
+incumbent returns, authority transfers, indefinite suspension begins, and a
+later connection resumes the game without exposing pre-reveal track metadata.
+Phase C1 additionally stops/cancels affected audio activity.
 
 V1 does not persist active-game state across server restart/crash.
 
@@ -1755,10 +1752,10 @@ game engine directly.
 READY/FAILED events identify the reporting member and source connection. The
 controller validates that source against its current-connection registry before
 domain preparation applicability checks. The same validation applies to
-connection loss, capability updates, and buzz ingress. The Phase A transport
-creates authenticated connection IDs and submits these events with the trusted
-physical-connection identity. Full browser audio command delivery and state
-projection are not implemented yet.
+connection loss, capability updates, and buzz ingress. The transport creates
+authenticated connection IDs and submits these events with the trusted
+physical-connection identity. Phase B implements state projection, and Phase C1
+implements server-side audio command delivery; browser execution is Phase C2.
 
 Active-state new membership, contestant disconnect, same-token reconnect,
 contestant playback-client connection-loss voiding, and Songmaster
@@ -2060,6 +2057,7 @@ WST_HOST                           default: 127.0.0.1
 WST_PORT                           default: 8000
 WST_LOG_LEVEL                      default: info
 WST_MAX_WEBSOCKET_MESSAGE_BYTES    default: 65536
+WST_MEDIA_CAPABILITY_LIFETIME_SECONDS default: 120
 ```
 
 The basic environment-backed launch command is:
@@ -2227,16 +2225,10 @@ facts. Authorized Reveal changes domain state but Phase A still returns only
 bounded acknowledgement/state facts; answer delivery belongs to per-player
 Phase B projection.
 
-Phase A intentionally does not provide general state broadcasts, per-player
-state projection, browser UI, audio HTTP delivery, remote preparation/play
-commands, synchronized playback, audio-stop messages, or Songmaster recovery
-countdown notifications. The socket handler and transport map permit future
-unsolicited server messages, but no speculative broadcast framework exists.
-Until Phase B/C supplies preparation and playback events, a standalone browser
-cannot discover every opaque preparation/round identifier needed to drive a
-whole audio round from responses alone. Phase A tests therefore exercise that
-transport-to-controller boundary using authoritative controller inspection;
-they do not represent deferred audio delivery as implemented.
+Phase A did not originally provide state broadcasts, media delivery, or audio
+control. Phase B subsequently added projections and notifications, and Phase C1
+adds the server-side media/control facilities specified below. Browser audio
+execution remains deferred to C2.
 
 ## 52. Phase B Authoritative State Projection and Notifications
 
@@ -2448,10 +2440,145 @@ controller resolves it against current membership, then invokes the existing
 authority, target connection, legal state, and recovery suspension checks are
 unchanged.
 
-### 52.10 Remaining Phase C/D limits
+### 52.10 Remaining UI limits
 
-Phase B does not provide HTML/CSS/JavaScript UI, HTTP media delivery, opaque
-media authorization, browser preload/play/stop delivery, actual playback,
-multi-location synchronization, `/admin`, or history browsing. Preparation and
-round UUIDs are projected only to describe current state and route the existing
-Phase A response commands. Audio bytes and filenames remain unavailable.
+Phase B does not provide HTML/CSS/JavaScript UI, actual browser playback,
+multi-location synchronization, `/admin`, or history browsing. Phase C1 adds
+the server-side facilities below; C2 remains responsible for consuming them.
+
+## 53. Phase C1 Authorized HTTP Music and Audio Control
+
+### 53.1 Media capabilities and endpoint
+
+Transition C issues a fresh cryptographically random bearer capability to each
+member in the immutable preparation-target snapshot. The in-memory server-side
+record binds the opaque value to the game UUID, preparation UUID, stable track
+ID, private browser token, and exact authoritative connection ID. It expires
+after `WST_MEDIA_CAPABILITY_LIFETIME_SECONDS` (120 seconds by default). The
+public participant UUID is never accepted as media authority.
+
+The browser receives only `GET /media/{opaque_capability}`. The URL contains no
+track ID, filename, catalog path, artist, or title. Each request checks expiry
+and verifies that the bound connection is still current, then resolves the
+stored track ID through SQLite. Unknown, expired, revoked, stale-connection, or
+missing-catalog capabilities return a generic 404 response.
+
+Capabilities are explicitly invalidated on FAILED, unsuccessful preparation,
+preparation cancellation, playback termination, round void, connection loss or
+replacement, End/Cancel/Close Game, controller failure, and shutdown. At
+transition E, only READY playback clients retain their capabilities; their
+records are promoted to the actual round and remain available long enough for
+ordinary browser range/preload behavior, subject to the fixed expiry. A later
+round always receives independent random capabilities. Cleanup therefore does
+not depend on a polling task; expiry is additionally enforced on lookup.
+
+Authorization is fixed when an HTTP request begins. Revocation prevents new
+requests, but an already-authorized response whose file transfer is in progress
+is allowed to finish. This avoids corrupting a browser preload mid-response and
+is not intended as DRM.
+
+### 53.2 Filesystem and HTTP behavior
+
+Media resolution is lazy, so application startup does not require the music
+root or any real MP3 to be present. At request time the catalog-relative path
+must be nonempty and relative under both POSIX and Windows path rules. Absolute
+paths, drive-qualified paths, `..`, non-files, missing/unreadable files, and
+resolved symlinks outside the configured music root are rejected without
+placing filesystem or catalog details in the response.
+
+Successful responses use `audio/mpeg`, `Accept-Ranges: bytes`, exact
+`Content-Length`, and standard `Content-Range` behavior. Single and multipart
+byte ranges are streamed by Starlette's asynchronous file response rather than
+loading the MP3 into memory. Malformed ranges return 400; unsatisfiable ranges
+return 416 with `Content-Range: bytes */{size}`. Protected success and error
+responses use `Cache-Control: private, no-store, max-age=0`, `Pragma: no-cache`,
+and `X-Content-Type-Options: nosniff`. There is no generic static music route,
+redirect, or identifying content-disposition filename.
+
+### 53.3 WebSocket audio-control contracts
+
+All controls are protocol version 1 unsolicited records with
+`request_id: null`. Internal browser tokens and connection IDs are routing facts
+and never appear in JSON.
+
+`prepare_audio` is sent once to each transition-C target:
+
+```json
+{
+  "version": 1,
+  "request_id": null,
+  "type": "prepare_audio",
+  "payload": {
+    "game_session_id": "uuid",
+    "preparation_id": "uuid",
+    "media_url": "/media/opaque-random-value",
+    "effective_playback_offset_seconds": "30",
+    "playback_duration_seconds": 30,
+    "preparation_timeout_seconds": 5.0
+  }
+}
+```
+
+`play_audio` is sent at committed transition E only to READY members in the
+immutable `playback_clients` snapshot:
+
+```json
+{
+  "version": 1,
+  "request_id": null,
+  "type": "play_audio",
+  "payload": {
+    "game_session_id": "uuid",
+    "preparation_id": "uuid",
+    "round_id": "uuid",
+    "effective_playback_offset_seconds": "30",
+    "playback_duration_seconds": 30,
+    "authoritative_playback_started_at": "UTC ISO-8601 timestamp"
+  }
+}
+```
+
+`stop_audio` identifies the preparation and optional actual round and carries
+one stable reason: `accepted_buzz`, `playback_timeout`, `round_void`,
+`playback_client_loss`, `songmaster_loss`, `preparation_failed`,
+`game_termination`, or `connection_replaced`. It contains no answer data.
+
+### 53.4 Ordering, readiness, and timing
+
+Audio controls use a distinct FIFO lane in the existing per-socket sender. The
+lane is bounded at 32 pending controls, is never state-coalesced, and is drained
+by the same nonblocking sender task and five-second send deadline used by Phase
+B. Prepare therefore precedes Play, and a queued Stop cannot be overtaken by an
+older Play for the same socket. Overflow or send timeout closes the slow socket;
+normal authoritative disconnect processing then applies playback-client voiding
+or Songmaster recovery. The GameController still owns the only authoritative
+game-event FIFO and never awaits network I/O.
+
+The existing connection-authenticated `audio_preparation_ready` and
+`audio_preparation_failed` operations are unchanged. An HTTP 200/206 does not
+mark a browser READY; only the browser can report that its complete audio path
+is usable for immediate playback. Old preparation UUIDs and stale sockets remain
+ordinary authoritative rejections. Zero READY targets follow the existing
+failure/acknowledgement path.
+
+Transition E starts the authoritative monotonic interval before Play delivery.
+The UTC start in `play_audio` is diagnostic/advisory for the C2 browser. For this
+initial LAN contract the browser starts promptly when Play arrives; network and
+browser scheduling latency means devices are not guaranteed sample-accurate or
+simultaneous. Buzz validity, timeout, and scoring continue to use only trusted
+server monotonic timing and never client playback reports.
+
+### 53.5 Secrecy boundary and C2
+
+Prepare, Play, and Stop never serialize artist, title, filename, relative path,
+raw track ID, or future deck contents. Opaque authorization prevents catalog
+enumeration and stale-round access, but an authorized browser receives the MP3
+bytes. It can inspect embedded ID3 metadata or infer the answer from the audio;
+opaque URLs do not provide cryptographic secrecy or DRM. Metadata stripping,
+transcoding, watermarking, and adversarial redistribution controls remain out
+of scope for this trusted-LAN V1.
+
+Phase C2 must implement browser preload/readiness, autoplay unlocking, offset
+seeking, actual Play/Stop behavior, and UI error reporting. C1 deliberately
+does not fabricate READY, execute JavaScript audio, or resynchronize playback
+after reconnect.

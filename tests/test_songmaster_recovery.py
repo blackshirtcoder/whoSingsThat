@@ -8,6 +8,7 @@ from sqlalchemy import Engine
 
 from who_sings_that.application import (
     AudioPreparationReadyEvent,
+    AudioStopReason,
     BrowserAudioCapabilityChangedEvent,
     CloseGameRequest,
     CreateGameRequest,
@@ -20,6 +21,7 @@ from who_sings_that.application import (
     RegisterConnectionRequest,
     SongmasterReconnectGraceExpiredEvent,
     StaleConnectionError,
+    StopAudioCommand,
     TransferSongmasterRequest,
 )
 from who_sings_that.database import create_sqlite_engine, upgrade_database
@@ -186,7 +188,8 @@ def test_songmaster_loss_normalizes_every_source_state(
 
     expected_state = (
         source_state
-        if source_state in {GameState.LOBBY, GameState.ROUND_COMPLETE, GameState.FINISHED}
+        if source_state
+        in {GameState.LOBBY, GameState.ROUND_COMPLETE, GameState.FINISHED}
         else GameState.ROUND_COMPLETE
     )
     assert engine.state is expected_state
@@ -215,10 +218,7 @@ def test_songmaster_loss_normalizes_every_source_state(
         assert game.deck_pointer == pointer_before + 1
         assert game.last_voided_round is not None
         assert game.last_voided_round.active_round is active_round_before
-        assert (
-            game.last_voided_round.reason
-            is RoundVoidReason.SONGMASTER_DISCONNECTED
-        )
+        assert game.last_voided_round.reason is RoundVoidReason.SONGMASTER_DISCONNECTED
         assert game.last_voided_round.answer_revealed is (
             source_state is GameState.SCORING
         )
@@ -370,9 +370,7 @@ async def test_controller_grace_reconnect_retires_timer_and_rejects_old_expiry(
     assert controller.songmaster_reconnect_grace_active
 
     clock.value = 109.0
-    await controller.submit_request(
-        RegisterConnectionRequest(GAME_ID, "sm", "sm-b")
-    )
+    await controller.submit_request(RegisterConnectionRequest(GAME_ID, "sm", "sm-b"))
     game = engine.active_game
     assert game is not None
     assert game.songmaster_browser_token == "sm"
@@ -418,9 +416,7 @@ async def test_longest_continuously_connected_contestant_is_promoted(
     controller = controller_for(storage, engine, sleep)
     await controller.start()
     # Replacing p1 makes p2's unchanged connection the longest continuous one.
-    await controller.submit_request(
-        RegisterConnectionRequest(GAME_ID, "p1", "p1-b")
-    )
+    await controller.submit_request(RegisterConnectionRequest(GAME_ID, "p1", "p1-b"))
     recovery_id = await disconnect_songmaster(controller)
 
     clock.value = 110.0
@@ -449,9 +445,7 @@ async def test_longest_continuously_connected_contestant_is_promoted(
     ].count("songmaster_automatically_changed") == 1
     assert controller.songmaster_reconnect_grace_active is False
 
-    await controller.submit_request(
-        RegisterConnectionRequest(GAME_ID, "sm", "sm-late")
-    )
+    await controller.submit_request(RegisterConnectionRequest(GAME_ID, "sm", "sm-late"))
     assert game.songmaster_browser_token == "p2"
     assert game.members["sm"].connected is True
     controller.post_system_event(
@@ -548,9 +542,7 @@ async def test_solo_game_can_resume_after_indefinite_suspension(
     )
     await controller._queue.join()
 
-    await controller.submit_request(
-        JoinGameRequest(GAME_ID, "sm", "sm-returned")
-    )
+    await controller.submit_request(JoinGameRequest(GAME_ID, "sm", "sm-returned"))
     game = engine.active_game
     assert game is not None
     assert game.songmaster_browser_token == "sm"
@@ -570,9 +562,7 @@ async def test_songmaster_replacement_normalizes_without_wait_and_stale_loss_is_
     controller = controller_for(storage, engine, NeverSleep())
     await controller.start()
 
-    await controller.submit_request(
-        RegisterConnectionRequest(GAME_ID, "sm", "sm-b")
-    )
+    await controller.submit_request(RegisterConnectionRequest(GAME_ID, "sm", "sm-b"))
     game = engine.active_game
     assert game is not None
     assert engine.state is GameState.ROUND_COMPLETE
@@ -606,6 +596,8 @@ async def test_disconnect_retires_preparation_timer_and_old_ready_is_stale(
     await controller._queue.join()
     pending = await controller.submit_request(PlaySongRequest(GAME_ID, "sm"))
     assert controller.preparation_timeout_active
+    controls = []
+    controller.add_audio_control_listener(controls.append)
 
     recovery_id = await disconnect_songmaster(controller)
     assert controller.preparation_timeout_active is False
@@ -623,6 +615,9 @@ async def test_disconnect_retires_preparation_timer_and_old_ready_is_stale(
     assert game is not None and game.songmaster_recovery is not None
     assert game.songmaster_recovery.recovery_id == recovery_id
     assert engine.state is GameState.ROUND_COMPLETE
+    assert [
+        command.reason for command in controls if isinstance(command, StopAudioCommand)
+    ] == [AudioStopReason.SONGMASTER_LOSS]
     await controller.stop()
 
 
@@ -651,6 +646,8 @@ async def test_disconnect_retires_playback_timer_and_old_timeout_is_stale(
     assert game is not None and game.active_round is not None
     round_id = game.active_round.round_id
     assert controller.playback_timeout_active
+    controls = []
+    controller.add_audio_control_listener(controls.append)
 
     await disconnect_songmaster(controller)
     assert controller.playback_timeout_active is False
@@ -660,6 +657,9 @@ async def test_disconnect_retires_playback_timer_and_old_timeout_is_stale(
     assert game.deck_pointer == 1
     assert game.last_voided_round is not None
     assert game.last_voided_round.reason is RoundVoidReason.SONGMASTER_DISCONNECTED
+    assert [
+        command.reason for command in controls if isinstance(command, StopAudioCommand)
+    ] == [AudioStopReason.SONGMASTER_LOSS]
     await controller.stop()
 
 
@@ -673,9 +673,7 @@ async def test_old_expiry_cannot_affect_closed_or_replacement_game(
     await controller.start()
     recovery_id = await disconnect_songmaster(controller)
     clock.value = 109.0
-    await controller.submit_request(
-        RegisterConnectionRequest(GAME_ID, "sm", "sm-b")
-    )
+    await controller.submit_request(RegisterConnectionRequest(GAME_ID, "sm", "sm-b"))
     await controller.submit_request(EndGameRequest(GAME_ID, "sm"))
     await controller.submit_request(CloseGameRequest(GAME_ID, "sm"))
     second = await controller.submit_request(

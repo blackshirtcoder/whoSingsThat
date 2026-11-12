@@ -10,11 +10,13 @@ from sqlalchemy import Engine
 
 from who_sings_that.application import (
     AudioPreparationReadyEvent,
+    AudioStopReason,
     BuzzRequest,
     ControllerFailedError,
     GameController,
     PlaybackTimeoutEvent,
     PlaySongRequest,
+    StopAudioCommand,
     SystemEvent,
 )
 from who_sings_that.database import create_sqlite_engine, upgrade_database
@@ -474,9 +476,13 @@ async def test_timeout_processed_before_later_buzz_wins(
 async def test_transition_e_schedules_timer_from_authoritative_deadline(
     controller_storage: tuple[Engine, Path],
 ) -> None:
-    controller, engine, _, preparation_sleep, playback_sleep = (
-        await start_playback_through_controller(controller_storage)
-    )
+    (
+        controller,
+        engine,
+        _,
+        preparation_sleep,
+        playback_sleep,
+    ) = await start_playback_through_controller(controller_storage)
 
     assert preparation_sleep.cancelled.is_set()
     assert playback_sleep.delays == [30.0]
@@ -503,9 +509,13 @@ async def test_delayed_timer_task_uses_remaining_authoritative_deadline(
 async def test_timer_expiry_posts_fifo_event_and_takes_transition_g(
     controller_storage: tuple[Engine, Path],
 ) -> None:
-    controller, engine, clock, _, playback_sleep = (
-        await start_playback_through_controller(controller_storage)
-    )
+    (
+        controller,
+        engine,
+        clock,
+        _,
+        playback_sleep,
+    ) = await start_playback_through_controller(controller_storage)
     assert controller.latest_projection is not None
     playing_revision = controller.latest_projection.revision
     clock.value = 130.0
@@ -531,9 +541,15 @@ async def test_timer_expiry_posts_fifo_event_and_takes_transition_g(
 async def test_explicit_transition_g_retires_still_sleeping_timer(
     controller_storage: tuple[Engine, Path],
 ) -> None:
-    controller, engine, clock, _, playback_sleep = (
-        await start_playback_through_controller(controller_storage)
-    )
+    (
+        controller,
+        engine,
+        clock,
+        _,
+        playback_sleep,
+    ) = await start_playback_through_controller(controller_storage)
+    controls = []
+    controller.add_audio_control_listener(controls.append)
     clock.value = 130.0
 
     controller.post_system_event(PlaybackTimeoutEvent(GAME_ID, ROUND_ID))
@@ -542,6 +558,9 @@ async def test_explicit_transition_g_retires_still_sleeping_timer(
 
     assert engine.state is GameState.AWAITING_REVEAL
     assert controller.playback_timeout_active is False
+    assert [
+        command.reason for command in controls if isinstance(command, StopAudioCommand)
+    ] == [AudioStopReason.PLAYBACK_TIMEOUT]
     await controller.stop()
 
 
@@ -549,9 +568,11 @@ async def test_explicit_transition_g_retires_still_sleeping_timer(
 async def test_accepted_buzz_retires_playback_timer(
     controller_storage: tuple[Engine, Path],
 ) -> None:
-    controller, _, clock, _, playback_sleep = (
-        await start_playback_through_controller(controller_storage)
+    controller, _, clock, _, playback_sleep = await start_playback_through_controller(
+        controller_storage
     )
+    controls = []
+    controller.add_audio_control_listener(controls.append)
     clock.value = 102.0
 
     accepted = await controller.submit_request(
@@ -561,6 +582,9 @@ async def test_accepted_buzz_retires_playback_timer(
 
     assert accepted.reason is RoundTerminationReason.BUZZ
     assert controller.playback_timeout_active is False
+    assert [
+        command.reason for command in controls if isinstance(command, StopAudioCommand)
+    ] == [AudioStopReason.ACCEPTED_BUZZ]
     await controller.stop()
 
 
@@ -592,8 +616,8 @@ async def test_already_queued_stale_timeout_after_buzz_is_harmless(
 async def test_shutdown_cleans_up_playback_timer(
     controller_storage: tuple[Engine, Path],
 ) -> None:
-    controller, _, _, _, playback_sleep = (
-        await start_playback_through_controller(controller_storage)
+    controller, _, _, _, playback_sleep = await start_playback_through_controller(
+        controller_storage
     )
 
     await controller.stop()
@@ -606,8 +630,8 @@ async def test_shutdown_cleans_up_playback_timer(
 async def test_fatal_failure_cleans_up_playback_timer(
     controller_storage: tuple[Engine, Path],
 ) -> None:
-    controller, _, clock, _, playback_sleep = (
-        await start_playback_through_controller(controller_storage)
+    controller, _, clock, _, playback_sleep = await start_playback_through_controller(
+        controller_storage
     )
     clock.value = 102.0
 

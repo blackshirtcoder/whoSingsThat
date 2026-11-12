@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from uuid import uuid4
 
+import httpx
 import pytest
 import pytest_asyncio
 import uvicorn
@@ -37,6 +38,7 @@ class RunningServer:
     server: uvicorn.Server
     task: asyncio.Task[None]
     websocket_url: str
+    http_url: str
     controllers: list[GameController]
 
 
@@ -100,6 +102,7 @@ async def running_server(tmp_path: Path) -> AsyncIterator[RunningServer]:
             server=server,
             task=task,
             websocket_url=f"ws://127.0.0.1:{port}/ws",
+            http_url=f"http://127.0.0.1:{port}",
             controllers=controllers,
         )
     finally:
@@ -491,9 +494,13 @@ async def test_replacement_socket_becomes_authoritative_and_old_cleanup_is_stale
 async def test_real_concurrent_buzz_has_one_winner_and_leaks_no_answer(
     running_server: RunningServer,
 ) -> None:
-    songmaster, contestant, songmaster_token, contestant_token, _ = (
-        await _create_two_player_game(running_server)
-    )
+    (
+        songmaster,
+        contestant,
+        songmaster_token,
+        contestant_token,
+        _,
+    ) = await _create_two_player_game(running_server)
     try:
         round_id, setup_responses = await _start_playing_round(
             running_server,
@@ -523,11 +530,194 @@ async def test_real_concurrent_buzz_has_one_winner_and_leaks_no_answer(
 
 
 @pytest.mark.asyncio
+async def test_authorized_media_range_and_audio_control_lifecycle(
+    running_server: RunningServer,
+) -> None:
+    media_path = (
+        running_server.app.state.settings.music_root
+        / "private/Secret Artist - Secret Title.mp3"
+    )
+    media_path.parent.mkdir()
+    media_bytes = bytes(range(256)) * 40
+    media_path.write_bytes(media_bytes)
+    songmaster, contestant, _, _, _ = await _create_two_player_game(running_server)
+    try:
+        playlist_id = _add_secret_playlist(running_server)
+        assert (
+            await _command(
+                songmaster,
+                "select_playlist",
+                {"playlist_id": playlist_id},
+            )
+        )["ok"]
+        assert (
+            await _command(
+                songmaster,
+                "set_audio_capability",
+                {"browser_audio_usable": True},
+            )
+        )["ok"]
+        assert (await _command(songmaster, "start_game"))["ok"]
+        played = await _command(songmaster, "play_song")
+        preparation_id = played["result"]["preparation_id"]
+        prepare = await _next_unsolicited(
+            songmaster,
+            message_type="prepare_audio",
+        )
+        payload = prepare["payload"]
+        assert payload["preparation_id"] == preparation_id
+        assert payload["effective_playback_offset_seconds"] == "30"
+        assert payload["playback_duration_seconds"] == 30
+        assert payload["preparation_timeout_seconds"] == 5.0
+        assert payload["media_url"].startswith("/media/")
+        serialized = json.dumps(prepare)
+        assert "Secret Artist" not in serialized
+        assert "Secret Title" not in serialized
+        assert "private/" not in serialized
+        assert not any(
+            message.get("type") == "prepare_audio"
+            for message in _UNSOLICITED[id(contestant)]
+        )
+
+        async with httpx.AsyncClient(base_url=running_server.http_url) as client:
+            full = await client.get(payload["media_url"])
+            assert full.status_code == 200
+            assert full.content == media_bytes
+            assert full.headers["content-type"] == "audio/mpeg"
+            assert full.headers["content-length"] == str(len(media_bytes))
+            assert full.headers["accept-ranges"] == "bytes"
+            assert "no-store" in full.headers["cache-control"]
+
+            partial = await client.get(
+                payload["media_url"],
+                headers={"Range": "bytes=100-199"},
+            )
+            assert partial.status_code == 206
+            assert partial.content == media_bytes[100:200]
+            assert partial.headers["content-range"] == (
+                f"bytes 100-199/{len(media_bytes)}"
+            )
+            assert partial.headers["content-length"] == "100"
+
+            multipart = await client.get(
+                payload["media_url"],
+                headers={"Range": "bytes=0-9,20-29"},
+            )
+            assert multipart.status_code == 206
+            assert multipart.headers["content-type"].startswith(
+                "multipart/byteranges; boundary="
+            )
+            assert b"Content-Range: bytes 0-9/" in multipart.content
+            assert b"Content-Range: bytes 20-29/" in multipart.content
+
+            malformed = await client.get(
+                payload["media_url"],
+                headers={"Range": "not-bytes"},
+            )
+            assert malformed.status_code == 400
+            unsatisfiable = await client.get(
+                payload["media_url"],
+                headers={"Range": "bytes=999999-"},
+            )
+            assert unsatisfiable.status_code == 416
+            assert unsatisfiable.headers["content-range"] == (
+                f"bytes */{len(media_bytes)}"
+            )
+            unknown = await client.get("/media/not-a-capability")
+            assert unknown.status_code == 404
+
+            media_path.unlink()
+            missing = await client.get(payload["media_url"])
+            assert missing.status_code == 404
+            missing_serialized = missing.text + repr(missing.headers)
+            assert "Secret Artist" not in missing_serialized
+            assert "Secret Title" not in missing_serialized
+            assert str(media_path.parent) not in missing_serialized
+            media_path.write_bytes(media_bytes)
+
+        assert (
+            await _command(
+                songmaster,
+                "audio_preparation_ready",
+                {"preparation_id": preparation_id},
+            )
+        )["ok"]
+        play = await _next_unsolicited(songmaster, message_type="play_audio")
+        assert play["payload"]["preparation_id"] == preparation_id
+        assert play["payload"]["round_id"]
+        assert "media_url" not in play["payload"]
+        round_id = play["payload"]["round_id"]
+        assert (await _command(songmaster, "buzz", {"round_id": round_id}))["ok"]
+        stop = await _next_unsolicited(songmaster, message_type="stop_audio")
+        assert stop["payload"]["round_id"] == round_id
+        assert stop["payload"]["reason"] == "accepted_buzz"
+
+        async with httpx.AsyncClient(base_url=running_server.http_url) as client:
+            revoked = await client.get(payload["media_url"])
+            assert revoked.status_code == 404
+    finally:
+        await songmaster.close()
+        await contestant.close()
+
+
+@pytest.mark.asyncio
+async def test_connection_replacement_revokes_preparation_media(
+    running_server: RunningServer,
+) -> None:
+    (
+        songmaster,
+        contestant,
+        songmaster_token,
+        _,
+        game_id,
+    ) = await _create_two_player_game(running_server)
+    replacement: ClientConnection | None = None
+    try:
+        playlist_id = _add_secret_playlist(running_server)
+        await _command(
+            songmaster,
+            "select_playlist",
+            {"playlist_id": playlist_id},
+        )
+        await _command(
+            songmaster,
+            "set_audio_capability",
+            {"browser_audio_usable": True},
+        )
+        await _command(songmaster, "start_game")
+        await _command(songmaster, "play_song")
+        prepare = await _next_unsolicited(
+            songmaster,
+            message_type="prepare_audio",
+        )
+
+        replacement, _ = await _connect(running_server)
+        await _identity(replacement, songmaster_token)
+        reconnected = await _command(
+            replacement,
+            "reconnect",
+            {"game_session_id": game_id},
+        )
+        assert reconnected["ok"]
+        async with httpx.AsyncClient(base_url=running_server.http_url) as client:
+            response = await client.get(prepare["payload"]["media_url"])
+        assert response.status_code == 404
+        controller = running_server.app.state.game_controller
+        assert controller.game_engine.state is GameState.ROUND_COMPLETE
+        assert controller.media_capabilities.active_count == 0
+    finally:
+        await songmaster.close()
+        await contestant.close()
+        if replacement is not None:
+            await replacement.close()
+
+
+@pytest.mark.asyncio
 async def test_contestant_disconnect_reaches_controller_and_voids_playback(
     running_server: RunningServer,
 ) -> None:
-    songmaster, contestant, _, contestant_token, _ = (
-        await _create_two_player_game(running_server)
+    songmaster, contestant, _, contestant_token, _ = await _create_two_player_game(
+        running_server
     )
     try:
         assert (
@@ -554,6 +744,8 @@ async def test_contestant_disconnect_reaches_controller_and_voids_playback(
         await _eventually(
             lambda: controller.game_engine.state is GameState.ROUND_COMPLETE
         )
+        stop = await _next_unsolicited(songmaster, message_type="stop_audio")
+        assert stop["payload"]["reason"] == "playback_client_loss"
         game = controller.game_engine.active_game
         assert not game.members[contestant_token].connected
         assert game.last_voided_round.reason is RoundVoidReason.PLAYBACK_CLIENT_LOST
@@ -566,16 +758,18 @@ async def test_contestant_disconnect_reaches_controller_and_voids_playback(
 async def test_abrupt_contestant_disconnect_reaches_controller(
     running_server: RunningServer,
 ) -> None:
-    songmaster, contestant, _, contestant_token, _ = (
-        await _create_two_player_game(running_server)
+    songmaster, contestant, _, contestant_token, _ = await _create_two_player_game(
+        running_server
     )
     try:
         contestant.transport.abort()
         controller = running_server.app.state.game_controller
         await _eventually(
-            lambda: not controller.game_engine.active_game.members[
-                contestant_token
-            ].connected
+            lambda: (
+                not controller.game_engine.active_game.members[
+                    contestant_token
+                ].connected
+            )
         )
     finally:
         await songmaster.close()
@@ -661,9 +855,7 @@ async def test_initial_snapshots_and_join_broadcast_use_safe_public_ids(
         assert creator_state["type"] == "state_snapshot"
         assert creator_payload["state"] == "lobby"
         assert creator_payload["recipient"]["is_songmaster"] is True
-        creator_public_id = creator_payload["recipient"][
-            "public_participant_id"
-        ]
+        creator_public_id = creator_payload["recipient"]["public_participant_id"]
         assert creator_public_id == created["result"]["public_participant_id"]
 
         await _command(
@@ -682,8 +874,7 @@ async def test_initial_snapshots_and_join_broadcast_use_safe_public_ids(
         joined_payload = joined_state["payload"]
         assert creator_update["payload"]["revision"] == joined_payload["revision"]
         participant_ids = {
-            item["public_participant_id"]
-            for item in joined_payload["participants"]
+            item["public_participant_id"] for item in joined_payload["participants"]
         }
         assert len(participant_ids) == 2
         assert creator_public_id in participant_ids
@@ -711,9 +902,7 @@ async def test_initial_snapshots_and_join_broadcast_use_safe_public_ids(
 async def test_public_id_songmaster_transfer_updates_every_recipient(
     running_server: RunningServer,
 ) -> None:
-    songmaster, contestant, _, _, _ = await _create_two_player_game(
-        running_server
-    )
+    songmaster, contestant, _, _, _ = await _create_two_player_game(running_server)
     try:
         songmaster_initial = await _next_state_after(songmaster)
         contestant_initial = await _next_state_after(contestant)
@@ -764,9 +953,7 @@ async def test_public_id_songmaster_transfer_updates_every_recipient(
 async def test_pre_reveal_payloads_are_secret_and_provisional_score_replaces(
     running_server: RunningServer,
 ) -> None:
-    songmaster, contestant, _, _, _ = await _create_two_player_game(
-        running_server
-    )
+    songmaster, contestant, _, _, _ = await _create_two_player_game(running_server)
     try:
         await _next_state_after(songmaster)
         await _next_state_after(contestant)
@@ -886,9 +1073,13 @@ async def test_pre_reveal_payloads_are_secret_and_provisional_score_replaces(
 async def test_mid_round_join_and_reconnect_have_recipient_specific_eligibility(
     running_server: RunningServer,
 ) -> None:
-    songmaster, contestant, _, contestant_token, game_id = (
-        await _create_two_player_game(running_server)
-    )
+    (
+        songmaster,
+        contestant,
+        _,
+        contestant_token,
+        game_id,
+    ) = await _create_two_player_game(running_server)
     third, _ = await _connect(running_server)
     replacement: ClientConnection | None = None
     try:
@@ -912,9 +1103,11 @@ async def test_mid_round_join_and_reconnect_have_recipient_specific_eligibility(
         await contestant.close()
         controller = running_server.app.state.game_controller
         await _eventually(
-            lambda: not controller.game_engine.active_game.members[
-                contestant_token
-            ].connected
+            lambda: (
+                not controller.game_engine.active_game.members[
+                    contestant_token
+                ].connected
+            )
         )
         replacement, _ = await _connect(running_server)
         await _identity(replacement, contestant_token)
@@ -943,9 +1136,13 @@ async def test_mid_round_join_and_reconnect_have_recipient_specific_eligibility(
 async def test_disconnect_recovery_and_cancel_emit_authoritative_updates(
     running_server: RunningServer,
 ) -> None:
-    songmaster, contestant, songmaster_token, _, game_id = (
-        await _create_two_player_game(running_server)
-    )
+    (
+        songmaster,
+        contestant,
+        songmaster_token,
+        _,
+        game_id,
+    ) = await _create_two_player_game(running_server)
     replacement: ClientConnection | None = None
     try:
         await _next_state_after(songmaster)
@@ -993,9 +1190,13 @@ async def test_disconnect_recovery_and_cancel_emit_authoritative_updates(
 async def test_finished_member_reconnect_receives_final_standings_snapshot(
     running_server: RunningServer,
 ) -> None:
-    songmaster, contestant, _, contestant_token, game_id = (
-        await _create_two_player_game(running_server)
-    )
+    (
+        songmaster,
+        contestant,
+        _,
+        contestant_token,
+        game_id,
+    ) = await _create_two_player_game(running_server)
     replacement: ClientConnection | None = None
     try:
         await _next_state_after(songmaster)
@@ -1016,9 +1217,11 @@ async def test_finished_member_reconnect_receives_final_standings_snapshot(
         await contestant.close()
         controller = running_server.app.state.game_controller
         await _eventually(
-            lambda: not controller.game_engine.active_game.members[
-                contestant_token
-            ].connected
+            lambda: (
+                not controller.game_engine.active_game.members[
+                    contestant_token
+                ].connected
+            )
         )
         replacement, _ = await _connect(running_server)
         await _identity(replacement, contestant_token)
@@ -1032,9 +1235,10 @@ async def test_finished_member_reconnect_receives_final_standings_snapshot(
         snapshot = await _next_state_after(replacement, state="finished")
         assert snapshot["type"] == "state_snapshot"
         assert snapshot["payload"]["finished"] is True
-        assert snapshot["payload"]["final_standings"] == finished["payload"][
-            "final_standings"
-        ]
+        assert (
+            snapshot["payload"]["final_standings"]
+            == finished["payload"]["final_standings"]
+        )
     finally:
         await songmaster.close()
         await contestant.close()

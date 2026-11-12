@@ -1,5 +1,16 @@
 """Application operations connecting persistence and the game domain."""
 
+from .audio import (
+    AudioControlCommand,
+    AudioStopReason,
+    MediaCapability,
+    MediaCapabilityPhase,
+    MediaCapabilityStore,
+    MediaCapabilityUnavailable,
+    PlayAudioCommand,
+    PrepareAudioCommand,
+    StopAudioCommand,
+)
 from .connections import (
     ConnectionRegistration,
     ConnectionRegistrationStatus,
@@ -7,6 +18,7 @@ from .connections import (
     InvalidConnectionIdError,
 )
 from .controller import (
+    DEFAULT_MEDIA_CAPABILITY_LIFETIME_SECONDS,
     DEFAULT_PREPARATION_TIMEOUT_SECONDS,
     DEFAULT_SONGMASTER_RECONNECT_GRACE_SECONDS,
     CompletedGamePersistenceNotAllowedError,
@@ -78,14 +90,17 @@ from .start_game import (
 )
 
 __all__ = [
+    "DEFAULT_MEDIA_CAPABILITY_LIFETIME_SECONDS",
     "DEFAULT_PREPARATION_TIMEOUT_SECONDS",
     "DEFAULT_SONGMASTER_RECONNECT_GRACE_SECONDS",
     "PROJECTION_SCHEMA_VERSION",
     "AcceptScoreRequest",
     "AcknowledgeAudioPreparationFailureRequest",
+    "AudioControlCommand",
     "AudioPreparationFailedEvent",
     "AudioPreparationReadyEvent",
     "AudioPreparationTimeoutEvent",
+    "AudioStopReason",
     "AuthoritativeMessage",
     "AuthoritativeProjectionUpdate",
     "BrowserAudioCapabilityChangedEvent",
@@ -114,12 +129,18 @@ __all__ = [
     "InvalidMusicRootError",
     "InvalidSelectedPlaylistIdsError",
     "JoinGameRequest",
+    "MediaCapability",
+    "MediaCapabilityPhase",
+    "MediaCapabilityStore",
+    "MediaCapabilityUnavailable",
     "MemberDisconnectedEvent",
     "MembershipSynchronization",
     "NoStructurallyEligibleTracksError",
+    "PlayAudioCommand",
     "PlaySongRequest",
     "PlaybackTimeoutEvent",
     "PlaylistResolution",
+    "PrepareAudioCommand",
     "PublicGameProjection",
     "PublicParticipantProjection",
     "RecipientProjection",
@@ -135,6 +156,7 @@ __all__ = [
     "StaleGameSessionError",
     "StartGameRequest",
     "StartGameResult",
+    "StopAudioCommand",
     "SystemEvent",
     "SystemEventRejection",
     "TrackExclusion",

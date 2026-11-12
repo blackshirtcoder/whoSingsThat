@@ -24,6 +24,7 @@ from who_sings_that.database import (
     save_completed_game_history,
 )
 from who_sings_that.domain import (
+    ActiveRound,
     DomainInvariantError,
     GameEngine,
     GameEngineError,
@@ -39,6 +40,15 @@ from who_sings_that.domain import (
     UnknownGameMemberError,
 )
 
+from .audio import (
+    AudioControlCommand,
+    AudioStopReason,
+    MediaCapability,
+    MediaCapabilityStore,
+    PlayAudioCommand,
+    PrepareAudioCommand,
+    StopAudioCommand,
+)
 from .connections import (
     ConnectionRegistration,
     ConnectionRegistrationStatus,
@@ -173,6 +183,15 @@ class _QueuedMessage:
     projection_browser_token: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class _AudioContext:
+    game_session_id: UUID | None
+    state: GameState
+    pending: PendingAudioPreparation | None
+    active_round: ActiveRound | None
+    connections: dict[str, str]
+
+
 class _StopConsumer:
     pass
 
@@ -180,6 +199,7 @@ class _StopConsumer:
 _STOP_CONSUMER: Final = _StopConsumer()
 DEFAULT_PREPARATION_TIMEOUT_SECONDS: Final = 5.0
 DEFAULT_SONGMASTER_RECONNECT_GRACE_SECONDS: Final = 10.0
+DEFAULT_MEDIA_CAPABILITY_LIFETIME_SECONDS: Final = 120.0
 _EXPECTED_APPLICATION_ERRORS: Final = (
     CompletedGameHistoryError,
     CompletedGamePersistenceNotAllowedError,
@@ -221,6 +241,9 @@ class GameController:
         songmaster_reconnect_grace_sleep: Callable[
             [float], Awaitable[None]
         ] = asyncio.sleep,
+        media_capability_lifetime_seconds: float = (
+            DEFAULT_MEDIA_CAPABILITY_LIFETIME_SECONDS
+        ),
     ) -> None:
         if (
             isinstance(preparation_timeout_seconds, bool)
@@ -239,6 +262,15 @@ class GameController:
         ):
             raise ValueError(
                 "songmaster_reconnect_grace_seconds must be a positive finite number"
+            )
+        if (
+            isinstance(media_capability_lifetime_seconds, bool)
+            or not isinstance(media_capability_lifetime_seconds, Real)
+            or not isfinite(media_capability_lifetime_seconds)
+            or media_capability_lifetime_seconds <= 0
+        ):
+            raise ValueError(
+                "media_capability_lifetime_seconds must be a positive finite number"
             )
         self._game_engine = game_engine if game_engine is not None else GameEngine()
         self._database_engine = database_engine
@@ -272,6 +304,11 @@ class GameController:
             Callable[[AuthoritativeProjectionUpdate], None]
         ] = []
         self._recovery_deadlines_utc: dict[UUID, datetime] = {}
+        self._media_capabilities = MediaCapabilityStore(
+            float(media_capability_lifetime_seconds),
+            self._game_engine.monotonic_time,
+        )
+        self._audio_control_listeners: list[Callable[[AudioControlCommand], None]] = []
 
     @property
     def game_engine(self) -> GameEngine:
@@ -303,6 +340,43 @@ class GameController:
         """Return the application-owned registry for diagnostics and adapters."""
 
         return self._connection_registry
+
+    @property
+    def media_capabilities(self) -> MediaCapabilityStore:
+        """Return the private capability store used by the HTTP adapter."""
+
+        return self._media_capabilities
+
+    def authorize_media_capability(self, opaque_token: str) -> MediaCapability:
+        """Validate one bearer capability against expiry and live connection."""
+
+        record = self._media_capabilities.authorize(opaque_token)
+        if not self._connection_registry.is_current(
+            record.game_session_id,
+            record.browser_token,
+            record.connection_id,
+        ):
+            self._media_capabilities.revoke_recipient(
+                record.game_session_id,
+                record.browser_token,
+                record.connection_id,
+            )
+            return self._media_capabilities.authorize(opaque_token)
+        return record
+
+    def add_audio_control_listener(
+        self,
+        listener: Callable[[AudioControlCommand], None],
+    ) -> None:
+        if listener not in self._audio_control_listeners:
+            self._audio_control_listeners.append(listener)
+
+    def remove_audio_control_listener(
+        self,
+        listener: Callable[[AudioControlCommand], None],
+    ) -> None:
+        if listener in self._audio_control_listeners:
+            self._audio_control_listeners.remove(listener)
 
     @property
     def latest_projection(self) -> AuthoritativeProjectionUpdate | None:
@@ -428,6 +502,7 @@ class GameController:
         self._retire_playback_timeout()
         self._retire_songmaster_reconnect_grace()
         await self._await_timer_cleanup()
+        self._media_capabilities.revoke_all()
         self._consumer_task = None
         self._consumer_ready = None
         if self._failure is not None:
@@ -539,11 +614,17 @@ class GameController:
                 if queued is _STOP_CONSUMER:
                     return
                 prior_projection = self._latest_projection
+                prior_audio = self._capture_audio_context()
                 try:
                     result = self._dispatch(queued.message)
                 except Exception as error:  # noqa: BLE001 - consumer failure boundary
                     if self._is_expected_operational_error(error):
                         try:
+                            self._complete_audio_effects(
+                                queued.message,
+                                None,
+                                prior_audio,
+                            )
                             self._capture_projection_change(prior_projection)
                         except Exception as projection_error:  # noqa: BLE001
                             self._fail_controller(queued, projection_error)
@@ -553,6 +634,11 @@ class GameController:
                     self._fail_controller(queued, error)
                     return
                 try:
+                    self._complete_audio_effects(
+                        queued.message,
+                        result,
+                        prior_audio,
+                    )
                     self._capture_projection_change(prior_projection)
                     response_result: object = result
                     if queued.projection_browser_token is not None:
@@ -896,6 +982,271 @@ class GameController:
         raise UnsupportedMessageError(
             f"no authoritative handler for {type(message).__name__}"
         )
+
+    def _capture_audio_context(self) -> _AudioContext:
+        game = self._game_engine.active_game
+        if game is None:
+            return _AudioContext(None, self._game_engine.state, None, None, {})
+        connections = {
+            token: connection_id
+            for token in game.members
+            if (
+                connection_id := self._connection_registry.current_connection_id(
+                    game.game_session_id,
+                    token,
+                )
+            )
+            is not None
+        }
+        return _AudioContext(
+            game.game_session_id,
+            self._game_engine.state,
+            game.pending_audio_preparation,
+            game.active_round,
+            connections,
+        )
+
+    def _complete_audio_effects(
+        self,
+        submitted: object,
+        result: object,
+        prior: _AudioContext,
+    ) -> None:
+        """Publish narrow controls from the just-committed FIFO transition."""
+
+        message = submitted
+        if isinstance(
+            message,
+            (
+                CurrentConnectionRequest,
+                _TrustedBuzzSubmission,
+                _TrustedConnectionSubmission,
+            ),
+        ):
+            message = message.request
+
+        game = self._game_engine.active_game
+
+        if isinstance(result, PendingAudioPreparation):
+            if game is None:
+                raise DomainInvariantError("audio preparation requires an active game")
+            for browser_token in sorted(result.audio_target_browser_tokens):
+                connection_id = self._connection_registry.current_connection_id(
+                    game.game_session_id,
+                    browser_token,
+                )
+                if connection_id is None:
+                    raise DomainInvariantError(
+                        "an audio preparation target requires a current connection"
+                    )
+                capability = self._media_capabilities.issue(
+                    game_session_id=game.game_session_id,
+                    preparation_id=result.preparation_id,
+                    browser_token=browser_token,
+                    connection_id=connection_id,
+                    track_id=result.deck_entry.track.track_id,
+                )
+                self._publish_audio_control(
+                    PrepareAudioCommand(
+                        game_session_id=game.game_session_id,
+                        preparation_id=result.preparation_id,
+                        browser_token=browser_token,
+                        connection_id=connection_id,
+                        media_url=f"/media/{capability.opaque_token}",
+                        effective_playback_offset_seconds=(
+                            result.effective_playback_offset_seconds
+                        ),
+                        playback_duration_seconds=result.playback_duration_seconds,
+                        preparation_timeout_seconds=self._preparation_timeout_seconds,
+                    )
+                )
+
+        if isinstance(message, AudioPreparationFailedEvent):
+            self._media_capabilities.revoke_recipient(
+                message.game_session_id,
+                message.browser_token,
+                message.source_connection_id,
+            )
+
+        if isinstance(result, PreparationEventResult):
+            if result.outcome is PreparationOutcome.PLAYING:
+                active_round = result.active_round
+                if game is None or active_round is None:
+                    raise DomainInvariantError(
+                        "PLAYING preparation effects require an active round"
+                    )
+                self._media_capabilities.promote_ready(
+                    result.preparation_id,
+                    result.ready_browser_tokens,
+                    active_round.round_id,
+                )
+                if prior.pending is not None:
+                    self._stop_preparation_targets(
+                        prior,
+                        AudioStopReason.PREPARATION_FAILED,
+                        browser_tokens=(
+                            prior.pending.audio_target_browser_tokens
+                            - result.ready_browser_tokens
+                        ),
+                    )
+                for browser_token in sorted(active_round.playback_clients):
+                    connection_id = self._connection_registry.current_connection_id(
+                        game.game_session_id,
+                        browser_token,
+                    )
+                    if connection_id is None:
+                        raise DomainInvariantError(
+                            "a playback client requires a current connection"
+                        )
+                    self._publish_audio_control(
+                        PlayAudioCommand(
+                            game_session_id=game.game_session_id,
+                            preparation_id=active_round.preparation_id,
+                            round_id=active_round.round_id,
+                            browser_token=browser_token,
+                            connection_id=connection_id,
+                            effective_playback_offset_seconds=(
+                                active_round.effective_playback_offset_seconds
+                            ),
+                            playback_duration_seconds=(
+                                active_round.playback_duration_seconds
+                            ),
+                            authoritative_playback_started_at=(
+                                active_round.playback_started_at
+                            ),
+                        )
+                    )
+            elif result.outcome is PreparationOutcome.FAILURE_PENDING_ACKNOWLEDGEMENT:
+                self._media_capabilities.revoke_preparation(result.preparation_id)
+                self._stop_preparation_targets(
+                    prior,
+                    AudioStopReason.PREPARATION_FAILED,
+                )
+
+        current_active = game.active_round if game is not None else None
+        if (
+            prior.state is GameState.PLAYING
+            and prior.active_round is not None
+            and (
+                current_active is None
+                or current_active.round_id != prior.active_round.round_id
+                or self._game_engine.state is not GameState.PLAYING
+            )
+        ):
+            reason = self._audio_stop_reason(message, game)
+            self._stop_playback_targets(prior, reason)
+            self._media_capabilities.revoke_preparation(
+                prior.active_round.preparation_id
+            )
+
+        current_pending = game.pending_audio_preparation if game is not None else None
+        if (
+            prior.state is GameState.AUDIO_PREPARING
+            and prior.pending is not None
+            and not isinstance(result, PreparationEventResult)
+            and not isinstance(
+                message,
+                AcknowledgeAudioPreparationFailureRequest,
+            )
+            and (
+                current_pending is None
+                or current_pending.preparation_id != prior.pending.preparation_id
+            )
+        ):
+            self._stop_preparation_targets(
+                prior,
+                self._audio_stop_reason(message, game),
+            )
+            self._media_capabilities.revoke_preparation(prior.pending.preparation_id)
+
+        if isinstance(message, (CancelGameRequest, CloseGameRequest, EndGameRequest)):
+            game_id = getattr(message, "game_session_id", prior.game_session_id)
+            if game_id is not None:
+                self._media_capabilities.revoke_game(game_id)
+
+        self._media_capabilities.reconcile_connections(
+            self._connection_registry.is_current
+        )
+
+    def _stop_preparation_targets(
+        self,
+        prior: _AudioContext,
+        reason: AudioStopReason,
+        *,
+        browser_tokens: frozenset[str] | None = None,
+    ) -> None:
+        pending = prior.pending
+        if pending is None or prior.game_session_id is None:
+            return
+        targets = (
+            pending.audio_target_browser_tokens
+            if browser_tokens is None
+            else browser_tokens
+        )
+        for browser_token in sorted(targets):
+            connection_id = prior.connections.get(browser_token)
+            if connection_id is None:
+                continue
+            self._publish_audio_control(
+                StopAudioCommand(
+                    game_session_id=prior.game_session_id,
+                    preparation_id=pending.preparation_id,
+                    round_id=None,
+                    browser_token=browser_token,
+                    connection_id=connection_id,
+                    reason=reason,
+                )
+            )
+
+    def _stop_playback_targets(
+        self,
+        prior: _AudioContext,
+        reason: AudioStopReason,
+    ) -> None:
+        active_round = prior.active_round
+        if active_round is None or prior.game_session_id is None:
+            return
+        for browser_token in sorted(active_round.playback_clients):
+            connection_id = prior.connections.get(browser_token)
+            if connection_id is None:
+                continue
+            self._publish_audio_control(
+                StopAudioCommand(
+                    game_session_id=prior.game_session_id,
+                    preparation_id=active_round.preparation_id,
+                    round_id=active_round.round_id,
+                    browser_token=browser_token,
+                    connection_id=connection_id,
+                    reason=reason,
+                )
+            )
+
+    @staticmethod
+    def _audio_stop_reason(message: object, game: object) -> AudioStopReason:
+        if isinstance(message, BuzzRequest):
+            return AudioStopReason.ACCEPTED_BUZZ
+        if isinstance(message, PlaybackTimeoutEvent):
+            return AudioStopReason.PLAYBACK_TIMEOUT
+        if isinstance(message, EndGameRequest):
+            return AudioStopReason.GAME_TERMINATION
+        if isinstance(
+            message,
+            (MemberDisconnectedEvent, RegisterConnectionRequest, JoinGameRequest),
+        ):
+            recovery = getattr(game, "songmaster_recovery", None)
+            voided = getattr(game, "last_voided_round", None)
+            if recovery is not None or (
+                voided is not None and voided.reason.value == "songmaster_disconnected"
+            ):
+                return AudioStopReason.SONGMASTER_LOSS
+            if voided is not None and voided.reason.value == "playback_client_lost":
+                return AudioStopReason.PLAYBACK_CLIENT_LOSS
+            return AudioStopReason.CONNECTION_REPLACED
+        return AudioStopReason.ROUND_VOID
+
+    def _publish_audio_control(self, command: AudioControlCommand) -> None:
+        for listener in tuple(self._audio_control_listeners):
+            listener(command)
 
     def _capture_projection_change(
         self,
@@ -1380,6 +1731,7 @@ class GameController:
                 "a reconnect-grace timer requires authoritative deadline facts"
             )
         self._retire_songmaster_reconnect_grace()
+        self._media_capabilities.revoke_all()
         task = asyncio.create_task(
             self._post_songmaster_reconnect_grace_expiry(
                 game_session_id,
@@ -1474,6 +1826,7 @@ class GameController:
         self._retire_preparation_timeout()
         self._retire_playback_timeout()
         self._retire_songmaster_reconnect_grace()
+        self._media_capabilities.revoke_all()
         if queued.response is not None:
             self._complete_response(queued.response, error=error)
 

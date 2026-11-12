@@ -15,7 +15,10 @@ from who_sings_that.application import (
     AudioPreparationTimeoutEvent,
     ControllerFailedError,
     GameController,
+    PlayAudioCommand,
     PlaySongRequest,
+    PrepareAudioCommand,
+    StopAudioCommand,
     SystemEvent,
 )
 from who_sings_that.database import (
@@ -169,9 +172,7 @@ def make_controller(
 
 
 async def play_song(controller: GameController):
-    return await controller.submit_request(
-        PlaySongRequest(GAME_ID, "songmaster-token")
-    )
+    return await controller.submit_request(PlaySongRequest(GAME_ID, "songmaster-token"))
 
 
 @pytest.mark.asyncio
@@ -216,6 +217,8 @@ async def test_ready_and_failed_events_preserve_fifo_and_complete_e_immediately(
         audio_targets=("songmaster-token", "player-token"),
     )
     controller = make_controller(controller_storage, engine, sleep)
+    commands = []
+    controller.add_audio_control_listener(commands.append)
     await controller.start()
     pending = await play_song(controller)
     await sleep.started.wait()
@@ -251,8 +254,21 @@ async def test_ready_and_failed_events_preserve_fifo_and_complete_e_immediately(
         {"songmaster-token"}
     )
     assert controller.preparation_timeout_active is False
+    assert [type(command) for command in commands] == [
+        PrepareAudioCommand,
+        PrepareAudioCommand,
+        StopAudioCommand,
+        PlayAudioCommand,
+    ]
+    assert commands[-1].browser_token == "songmaster-token"
+    assert all(
+        "artist" not in repr(command).lower() and "title" not in repr(command).lower()
+        for command in commands
+    )
+    assert controller.media_capabilities.active_count == 1
     await sleep.cancelled.wait()
     await controller.stop()
+    assert controller.media_capabilities.active_count == 0
 
 
 @pytest.mark.asyncio
@@ -305,6 +321,8 @@ async def test_zero_ready_timeout_then_acknowledgement_request_takes_d(
         TrackReference(2, 180),
     )
     controller = make_controller(controller_storage, engine, sleep)
+    commands = []
+    controller.add_audio_control_listener(commands.append)
     await controller.start()
     pending = await play_song(controller)
     await sleep.started.wait()
@@ -325,6 +343,8 @@ async def test_zero_ready_timeout_then_acknowledgement_request_takes_d(
 
     assert result is engine.active_game
     assert engine.state is GameState.ROUND_COMPLETE
+    assert sum(isinstance(command, StopAudioCommand) for command in commands) == 1
+    assert controller.media_capabilities.active_count == 0
     assert result.deck_pointer == 1
     assert result.active_round is None
     assert controller.preparation_timeout_active is False

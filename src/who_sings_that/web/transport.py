@@ -16,6 +16,7 @@ from starlette.websockets import WebSocket, WebSocketDisconnect, WebSocketState
 from who_sings_that.application import (
     AcceptScoreRequest,
     AcknowledgeAudioPreparationFailureRequest,
+    AudioControlCommand,
     AudioPreparationFailedEvent,
     AudioPreparationReadyEvent,
     AuthoritativeProjectionUpdate,
@@ -34,7 +35,9 @@ from who_sings_that.application import (
     GameController,
     JoinGameRequest,
     MemberDisconnectedEvent,
+    PlayAudioCommand,
     PlaySongRequest,
+    PrepareAudioCommand,
     RegisterConnectionRequest,
     RetryCompletedGamePersistenceRequest,
     RevealRequest,
@@ -42,6 +45,7 @@ from who_sings_that.application import (
     SelectProvisionalScoreRequest,
     SetAudioPreferenceRequest,
     StartGameRequest,
+    StopAudioCommand,
     TransferSongmasterByPublicIdRequest,
 )
 from who_sings_that.domain import (
@@ -81,6 +85,7 @@ class _OutboundMailbox:
         self._state: _OutboundRecord | None = None
         self._state_after_snapshot: _OutboundRecord | None = None
         self._events: deque[_OutboundRecord] = deque()
+        self._controls: deque[_OutboundRecord] = deque()
         self._wake = asyncio.Event()
         self._closed = False
         self._highest_revision_by_game: dict[UUID, int] = {}
@@ -91,6 +96,7 @@ class _OutboundMailbox:
             (1 if self._state is not None else 0)
             + (1 if self._state_after_snapshot is not None else 0)
             + len(self._events)
+            + len(self._controls)
         )
 
     def put_state(
@@ -147,10 +153,26 @@ class _OutboundMailbox:
         self._wake.set()
         return True
 
+    def put_control(self, command: AudioControlCommand) -> bool:
+        if self._closed:
+            return True
+        if len(self._controls) >= self._max_events:
+            return False
+        self._controls.append(
+            _OutboundRecord(
+                game_session_id=command.game_session_id,
+                message=_audio_control_message(command),
+            )
+        )
+        self._wake.set()
+        return True
+
     async def get(self) -> _OutboundRecord | None:
         while True:
             if self._closed:
                 return None
+            if self._controls:
+                return self._controls.popleft()
             if self._state is not None:
                 record = self._state
                 self._state = self._state_after_snapshot
@@ -159,7 +181,7 @@ class _OutboundMailbox:
             if self._events:
                 return self._events.popleft()
             self._wake.clear()
-            if self._state is not None or self._events:
+            if self._controls or self._state is not None or self._events:
                 continue
             await self._wake.wait()
 
@@ -168,6 +190,7 @@ class _OutboundMailbox:
         self._state = None
         self._state_after_snapshot = None
         self._events.clear()
+        self._controls.clear()
         self._wake.set()
 
 
@@ -267,6 +290,24 @@ class TransportConnections:
                     break
         return tuple(overloaded)
 
+    def publish_audio(
+        self,
+        command: AudioControlCommand,
+    ) -> TransportSession | None:
+        """Enqueue one ordered control only for its exact authoritative socket."""
+
+        if not self._accepting:
+            return None
+        key = (command.game_session_id, command.browser_token)
+        if self._current_memberships.get(key) != command.connection_id:
+            return None
+        session = self._sessions.get(command.connection_id)
+        if session is None or session.game_session_id != command.game_session_id:
+            return None
+        if not session.mailbox.put_control(command):
+            return session
+        return None
+
     async def clear_game(self, game_id: UUID) -> None:
         async with self._lock:
             keys = tuple(key for key in self._current_memberships if key[0] == game_id)
@@ -337,6 +378,7 @@ class WebSocketTransport:
         self._max_message_bytes = max_message_bytes
         self.connections = TransportConnections()
         self._controller.add_projection_listener(self._publish_projection_update)
+        self._controller.add_audio_control_listener(self._publish_audio_control)
 
     async def handle(self, websocket: WebSocket) -> None:
         connection_id = uuid4().hex
@@ -385,7 +427,7 @@ class WebSocketTransport:
                     await _close_socket(websocket, _SHUTDOWN_CLOSE_CODE)
                     break
                 await self._handle_text(session, raw)
-        except (WebSocketDisconnect, TimeoutError):
+        except WebSocketDisconnect, TimeoutError:
             pass
         except RuntimeError:
             if websocket.client_state is not WebSocketState.DISCONNECTED:
@@ -395,6 +437,7 @@ class WebSocketTransport:
 
     async def shutdown(self) -> None:
         self._controller.remove_projection_listener(self._publish_projection_update)
+        self._controller.remove_audio_control_listener(self._publish_audio_control)
         await self.connections.shutdown()
 
     def _publish_projection_update(
@@ -410,6 +453,18 @@ class WebSocketTransport:
                     name=f"wst-slow-client-close-{session.connection_id}",
                 )
 
+    def _publish_audio_control(self, command: AudioControlCommand) -> None:
+        """Controller callback: enqueue an ordered control without network I/O."""
+
+        session = self.connections.publish_audio(command)
+        if session is not None and (
+            session.overload_task is None or session.overload_task.done()
+        ):
+            session.overload_task = asyncio.create_task(
+                _close_socket(session.websocket, _SLOW_CLIENT_CLOSE_CODE),
+                name=f"wst-slow-client-close-{session.connection_id}",
+            )
+
     async def _deliver_outbound(self, session: TransportSession) -> None:
         try:
             while True:
@@ -419,7 +474,7 @@ class WebSocketTransport:
                 await self._send_session_json(session, record.message)
         except asyncio.CancelledError:
             return
-        except (WebSocketDisconnect, RuntimeError, TimeoutError):
+        except WebSocketDisconnect, RuntimeError, TimeoutError:
             await _close_socket(session.websocket, _SLOW_CLIENT_CLOSE_CODE)
         except Exception:
             LOGGER.exception(
@@ -475,7 +530,7 @@ class WebSocketTransport:
                 )
                 return
             payload = payload_type.model_validate(envelope.payload)
-        except (json.JSONDecodeError, ValueError, ValidationError, TypeError):
+        except json.JSONDecodeError, ValueError, ValidationError, TypeError:
             await self._send_error(
                 session,
                 request_id,
@@ -640,7 +695,7 @@ class WebSocketTransport:
             self._controller.post_system_event(
                 MemberDisconnectedEvent(game_id, token, session.connection_id)
             )
-        except (ControllerNotRunningError, ControllerFailedError):
+        except ControllerNotRunningError, ControllerFailedError:
             LOGGER.info(
                 "Connection %s closed after controller retirement",
                 session.connection_id,
@@ -768,8 +823,7 @@ def _membership_result(
     participant = next(
         item
         for item in public.participants
-        if item.public_participant_id
-        == recipient.recipient.public_participant_id
+        if item.public_participant_id == recipient.recipient.public_participant_id
     )
     return {
         "game_session_id": str(update.game_session_id),
@@ -803,6 +857,63 @@ def _command_result(
             for standing in result.final_standings
         ]
     return response
+
+
+def _audio_control_message(command: AudioControlCommand) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "game_session_id": str(command.game_session_id),
+    }
+    if isinstance(command, PrepareAudioCommand):
+        message_type = "prepare_audio"
+        payload.update(
+            {
+                "preparation_id": str(command.preparation_id),
+                "media_url": command.media_url,
+                "effective_playback_offset_seconds": str(
+                    command.effective_playback_offset_seconds
+                ),
+                "playback_duration_seconds": command.playback_duration_seconds,
+                "preparation_timeout_seconds": command.preparation_timeout_seconds,
+            }
+        )
+    elif isinstance(command, PlayAudioCommand):
+        message_type = "play_audio"
+        payload.update(
+            {
+                "preparation_id": str(command.preparation_id),
+                "round_id": str(command.round_id),
+                "effective_playback_offset_seconds": str(
+                    command.effective_playback_offset_seconds
+                ),
+                "playback_duration_seconds": command.playback_duration_seconds,
+                "authoritative_playback_started_at": (
+                    command.authoritative_playback_started_at.isoformat()
+                ),
+            }
+        )
+    elif isinstance(command, StopAudioCommand):
+        message_type = "stop_audio"
+        payload.update(
+            {
+                "preparation_id": (
+                    None
+                    if command.preparation_id is None
+                    else str(command.preparation_id)
+                ),
+                "round_id": (
+                    None if command.round_id is None else str(command.round_id)
+                ),
+                "reason": command.reason.value,
+            }
+        )
+    else:  # pragma: no cover - closed command union
+        raise TypeError("unsupported audio-control command")
+    return {
+        "version": PROTOCOL_VERSION,
+        "request_id": None,
+        "type": message_type,
+        "payload": payload,
+    }
 
 
 _ERROR_CODES_BY_CLASS: Final[dict[str, str]] = {
@@ -853,13 +964,10 @@ def _public_error(error: Exception) -> tuple[str, str]:
     code = _ERROR_CODES_BY_CLASS.get(class_name)
     if code is None and class_name.startswith("Unauthorized"):
         code = "not_songmaster"
-    if code is None and class_name.endswith(
-        ("NotAllowedError", "InapplicableError")
-    ):
+    if code is None and class_name.endswith(("NotAllowedError", "InapplicableError")):
         code = "illegal_state"
     if code is None and (
-        class_name.startswith("Invalid")
-        or isinstance(error, (ValueError, TypeError))
+        class_name.startswith("Invalid") or isinstance(error, (ValueError, TypeError))
     ):
         code = "invalid_command"
     if code is None:
@@ -872,7 +980,7 @@ async def _close_socket(websocket: WebSocket, code: int) -> None:
         return
     try:
         await asyncio.wait_for(websocket.close(code=code), timeout=1.0)
-    except (TimeoutError, RuntimeError):
+    except TimeoutError, RuntimeError:
         return
 
 

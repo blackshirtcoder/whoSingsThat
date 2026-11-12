@@ -11,6 +11,7 @@ from sqlalchemy import Engine
 from who_sings_that.application import (
     AudioPreparationReadyEvent,
     AudioPreparationTimeoutEvent,
+    AudioStopReason,
     BuzzRequest,
     CancelGameRequest,
     CloseGameRequest,
@@ -23,6 +24,7 @@ from who_sings_that.application import (
     SelectPlaylistRequest,
     StaleGameSessionError,
     StartGameRequest,
+    StopAudioCommand,
 )
 from who_sings_that.catalog import (
     MediaStatus,
@@ -156,9 +158,7 @@ def make_controller(
     if game is not None:
         for token in game.members:
             connection_id = (
-                "connection-1"
-                if token == "songmaster-token"
-                else "player-connection"
+                "connection-1" if token == "songmaster-token" else "player-connection"
             )
             controller.connection_registry.register(
                 game.game_session_id, token, connection_id
@@ -192,9 +192,7 @@ async def test_controller_cancel_rejections_and_success_keep_consumer_running(
             CancelGameRequest(UUID(int=999), "songmaster-token")
         )
     with pytest.raises(UnauthorizedCancelGameError):
-        await controller.submit_request(
-            CancelGameRequest(GAME_IDS[0], "player-token")
-        )
+        await controller.submit_request(CancelGameRequest(GAME_IDS[0], "player-token"))
 
     result = await controller.submit_request(
         CancelGameRequest(GAME_IDS[0], "songmaster-token")
@@ -274,6 +272,8 @@ async def test_end_game_from_playing_retires_timer_before_late_events(
     assert game.active_round is not None
     active_round = game.active_round
     assert controller.playback_timeout_active is True
+    controls = []
+    controller.add_audio_control_listener(controls.append)
 
     finalization_task = asyncio.create_task(
         controller.submit_request(EndGameRequest(GAME_IDS[0], "songmaster-token"))
@@ -289,6 +289,9 @@ async def test_end_game_from_playing_retires_timer_before_late_events(
     assert game.last_voided_round is not None
     assert game.last_voided_round.termination is None
     assert controller.playback_timeout_active is False
+    assert [
+        command.reason for command in controls if isinstance(command, StopAudioCommand)
+    ] == [AudioStopReason.GAME_TERMINATION]
     assert isinstance(
         controller.system_event_rejections[-1].error,
         PlaybackTimeoutInapplicableError,
@@ -487,9 +490,7 @@ async def test_controller_end_game_rejection_leaves_consumer_operational(
     await controller.start()
 
     with pytest.raises(UnauthorizedEndGameError):
-        await controller.submit_request(
-            EndGameRequest(GAME_IDS[0], "player-token")
-        )
+        await controller.submit_request(EndGameRequest(GAME_IDS[0], "player-token"))
 
     result = await controller.submit_request(
         EndGameRequest(GAME_IDS[0], "songmaster-token")
