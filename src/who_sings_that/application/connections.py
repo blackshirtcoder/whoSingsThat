@@ -145,6 +145,18 @@ class ConnectionRegistry:
             and record.connection_id == connection_id
         )
 
+    def current_connection_id(
+        self,
+        game_session_id: UUID,
+        browser_token: str,
+    ) -> str | None:
+        """Return the current live transport identity for one membership."""
+
+        record = self._records.get((game_session_id, browser_token))
+        if record is None or not record.connected:
+            return None
+        return record.connection_id
+
     def mark_disconnected(
         self,
         game_session_id: UUID,

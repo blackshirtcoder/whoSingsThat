@@ -3,7 +3,9 @@
 import asyncio
 import json
 import logging
-from dataclasses import dataclass
+from collections import deque
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from secrets import token_urlsafe
 from typing import Any, Final
 from uuid import UUID, uuid4
@@ -16,9 +18,11 @@ from who_sings_that.application import (
     AcknowledgeAudioPreparationFailureRequest,
     AudioPreparationFailedEvent,
     AudioPreparationReadyEvent,
+    AuthoritativeProjectionUpdate,
     BrowserAudioCapabilityChangedEvent,
     BuzzRequest,
     CancelGameRequest,
+    CapturedRecipientProjection,
     CloseGameRequest,
     ControllerFailedError,
     ControllerNotRunningError,
@@ -35,12 +39,13 @@ from who_sings_that.application import (
     RetryCompletedGamePersistenceRequest,
     RevealRequest,
     SelectPlaylistRequest,
+    SelectProvisionalScoreRequest,
     SetAudioPreferenceRequest,
     StartGameRequest,
+    TransferSongmasterByPublicIdRequest,
 )
 from who_sings_that.domain import (
     GameFinalizationResult,
-    GameMember,
     PendingAudioPreparation,
     ScoringChoice,
 )
@@ -57,6 +62,113 @@ from .protocol import (
 LOGGER = logging.getLogger(__name__)
 _REPLACED_CLOSE_CODE: Final = 4001
 _SHUTDOWN_CLOSE_CODE: Final = 1012
+_SLOW_CLIENT_CLOSE_CODE: Final = 1013
+_MAX_TRANSIENT_EVENTS: Final = 32
+_SEND_TIMEOUT_SECONDS: Final = 5.0
+
+
+@dataclass(frozen=True, slots=True)
+class _OutboundRecord:
+    game_session_id: UUID
+    message: dict[str, Any]
+
+
+class _OutboundMailbox:
+    """Bounded per-socket delivery with one coalesced state snapshot."""
+
+    def __init__(self, max_events: int = _MAX_TRANSIENT_EVENTS) -> None:
+        self._max_events = max_events
+        self._state: _OutboundRecord | None = None
+        self._state_after_snapshot: _OutboundRecord | None = None
+        self._events: deque[_OutboundRecord] = deque()
+        self._wake = asyncio.Event()
+        self._closed = False
+        self._highest_revision_by_game: dict[UUID, int] = {}
+
+    @property
+    def backlog_size(self) -> int:
+        return (
+            (1 if self._state is not None else 0)
+            + (1 if self._state_after_snapshot is not None else 0)
+            + len(self._events)
+        )
+
+    def put_state(
+        self,
+        message_type: str,
+        update: AuthoritativeProjectionUpdate,
+        recipient: CapturedRecipientProjection,
+    ) -> None:
+        if self._closed:
+            return
+        highest = self._highest_revision_by_game.get(update.game_session_id, 0)
+        if update.revision < highest:
+            return
+        self._highest_revision_by_game[update.game_session_id] = update.revision
+        record = _OutboundRecord(
+            game_session_id=update.game_session_id,
+            message={
+                "version": PROTOCOL_VERSION,
+                "request_id": None,
+                "type": message_type,
+                "payload": update.state_payload_for(recipient),
+            },
+        )
+        if (
+            self._state is not None
+            and self._state.message["type"] == "state_snapshot"
+            and message_type == "state_update"
+        ):
+            self._state_after_snapshot = record
+        else:
+            self._state = record
+        self._wake.set()
+
+    def put_event(
+        self,
+        update: AuthoritativeProjectionUpdate,
+        event_payload: dict[str, Any],
+    ) -> bool:
+        if self._closed:
+            return True
+        if len(self._events) >= self._max_events:
+            return False
+        self._events.append(
+            _OutboundRecord(
+                game_session_id=update.game_session_id,
+                message={
+                    "version": PROTOCOL_VERSION,
+                    "request_id": None,
+                    "type": "game_event",
+                    "payload": event_payload,
+                },
+            )
+        )
+        self._wake.set()
+        return True
+
+    async def get(self) -> _OutboundRecord | None:
+        while True:
+            if self._closed:
+                return None
+            if self._state is not None:
+                record = self._state
+                self._state = self._state_after_snapshot
+                self._state_after_snapshot = None
+                return record
+            if self._events:
+                return self._events.popleft()
+            self._wake.clear()
+            if self._state is not None or self._events:
+                continue
+            await self._wake.wait()
+
+    def close(self) -> None:
+        self._closed = True
+        self._state = None
+        self._state_after_snapshot = None
+        self._events.clear()
+        self._wake.set()
 
 
 @dataclass(slots=True)
@@ -65,6 +177,10 @@ class TransportSession:
     websocket: WebSocket
     browser_token: str | None = None
     game_session_id: UUID | None = None
+    send_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    mailbox: _OutboundMailbox = field(default_factory=_OutboundMailbox)
+    sender_task: asyncio.Task[None] | None = None
+    overload_task: asyncio.Task[None] | None = None
 
 
 class TransportConnections:
@@ -87,12 +203,31 @@ class TransportConnections:
             self._sessions[session.connection_id] = session
             return True
 
-    async def bind_membership(self, session: TransportSession, game_id: UUID) -> None:
+    async def bind_membership(
+        self,
+        session: TransportSession,
+        game_id: UUID,
+        refresh_projection: Callable[
+            [], tuple[AuthoritativeProjectionUpdate, CapturedRecipientProjection]
+        ],
+    ) -> None:
         predecessor: TransportSession | None = None
         token = session.browser_token
         if token is None:  # pragma: no cover - guarded by command routing
             raise RuntimeError("membership binding requires browser identity")
         async with self._lock:
+            update, recipient = refresh_projection()
+            if (
+                update.game_session_id != game_id
+                or recipient.browser_token != token
+                or recipient.connection_id != session.connection_id
+            ):
+                raise RuntimeError(
+                    "membership synchronization does not match this socket"
+                )
+            session.mailbox.put_state("state_snapshot", update, recipient)
+            if update.invalidated:
+                return
             key = (game_id, token)
             predecessor_id = self._current_memberships.get(key)
             session.game_session_id = game_id
@@ -101,6 +236,36 @@ class TransportConnections:
                 predecessor = self._sessions.get(predecessor_id)
         if predecessor is not None:
             await _close_socket(predecessor.websocket, _REPLACED_CLOSE_CODE)
+
+    def publish(
+        self,
+        update: AuthoritativeProjectionUpdate,
+    ) -> tuple[TransportSession, ...]:
+        """Enqueue one capture without awaiting a socket or acquiring a lock."""
+
+        if not self._accepting:
+            return ()
+        overloaded: list[TransportSession] = []
+        for recipient in update.recipients:
+            key = (update.game_session_id, recipient.browser_token)
+            connection_id = self._current_memberships.get(key)
+            if connection_id != recipient.connection_id:
+                continue
+            session = self._sessions.get(connection_id)
+            if session is None or session.game_session_id != update.game_session_id:
+                continue
+            session.mailbox.put_state("state_update", update, recipient)
+            for notification in update.notifications:
+                if not session.mailbox.put_event(
+                    update,
+                    notification.to_payload(
+                        update.game_session_id,
+                        update.revision,
+                    ),
+                ):
+                    overloaded.append(session)
+                    break
+        return tuple(overloaded)
 
     async def clear_game(self, game_id: UUID) -> None:
         async with self._lock:
@@ -116,6 +281,7 @@ class TransportConnections:
 
         async with self._lock:
             self._sessions.pop(session.connection_id, None)
+            session.mailbox.close()
             token = session.browser_token
             game_id = session.game_session_id
             if token is None or game_id is None:
@@ -131,6 +297,8 @@ class TransportConnections:
             self._accepting = False
             sessions = tuple(self._sessions.values())
             self._current_memberships.clear()
+            for session in sessions:
+                session.mailbox.close()
         if sessions:
             await asyncio.gather(
                 *(
@@ -139,6 +307,26 @@ class TransportConnections:
                 ),
                 return_exceptions=True,
             )
+            sender_tasks = tuple(
+                session.sender_task
+                for session in sessions
+                if session.sender_task is not None
+            )
+            if sender_tasks:
+                for task in sender_tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*sender_tasks, return_exceptions=True)
+            overload_tasks = tuple(
+                session.overload_task
+                for session in sessions
+                if session.overload_task is not None
+            )
+            if overload_tasks:
+                for task in overload_tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*overload_tasks, return_exceptions=True)
 
 
 class WebSocketTransport:
@@ -148,6 +336,7 @@ class WebSocketTransport:
         self._controller = controller
         self._max_message_bytes = max_message_bytes
         self.connections = TransportConnections()
+        self._controller.add_projection_listener(self._publish_projection_update)
 
     async def handle(self, websocket: WebSocket) -> None:
         connection_id = uuid4().hex
@@ -156,20 +345,24 @@ class WebSocketTransport:
         if not await self.connections.add(session):
             await websocket.close(code=_SHUTDOWN_CLOSE_CODE)
             return
-        await websocket.send_json(
-            {
-                "version": PROTOCOL_VERSION,
-                "request_id": None,
-                "type": "transport_connected",
-                "ok": True,
-                "result": {
-                    "connection_id": connection_id,
-                    "max_message_bytes": self._max_message_bytes,
-                },
-            }
-        )
-
         try:
+            await self._send_session_json(
+                session,
+                {
+                    "version": PROTOCOL_VERSION,
+                    "request_id": None,
+                    "type": "transport_connected",
+                    "ok": True,
+                    "result": {
+                        "connection_id": connection_id,
+                        "max_message_bytes": self._max_message_bytes,
+                    },
+                },
+            )
+            session.sender_task = asyncio.create_task(
+                self._deliver_outbound(session),
+                name=f"wst-websocket-sender-{connection_id}",
+            )
             while True:
                 message = await websocket.receive()
                 if message["type"] == "websocket.disconnect":
@@ -177,12 +370,12 @@ class WebSocketTransport:
                 raw = message.get("text")
                 if raw is None:
                     await self._send_error(
-                        websocket, None, "invalid_command", "JSON text is required."
+                        session, None, "invalid_command", "JSON text is required."
                     )
                     continue
                 if len(raw.encode("utf-8")) > self._max_message_bytes:
                     await self._send_error(
-                        websocket,
+                        session,
                         None,
                         "message_too_large",
                         "The command exceeds the configured message-size limit.",
@@ -192,7 +385,7 @@ class WebSocketTransport:
                     await _close_socket(websocket, _SHUTDOWN_CLOSE_CODE)
                     break
                 await self._handle_text(session, raw)
-        except WebSocketDisconnect:
+        except (WebSocketDisconnect, TimeoutError):
             pass
         except RuntimeError:
             if websocket.client_state is not WebSocketState.DISCONNECTED:
@@ -201,7 +394,50 @@ class WebSocketTransport:
             await self._cleanup(session)
 
     async def shutdown(self) -> None:
+        self._controller.remove_projection_listener(self._publish_projection_update)
         await self.connections.shutdown()
+
+    def _publish_projection_update(
+        self,
+        update: AuthoritativeProjectionUpdate,
+    ) -> None:
+        """Controller callback: enqueue only; never perform network I/O."""
+
+        for session in self.connections.publish(update):
+            if session.overload_task is None or session.overload_task.done():
+                session.overload_task = asyncio.create_task(
+                    _close_socket(session.websocket, _SLOW_CLIENT_CLOSE_CODE),
+                    name=f"wst-slow-client-close-{session.connection_id}",
+                )
+
+    async def _deliver_outbound(self, session: TransportSession) -> None:
+        try:
+            while True:
+                record = await session.mailbox.get()
+                if record is None:
+                    return
+                await self._send_session_json(session, record.message)
+        except asyncio.CancelledError:
+            return
+        except (WebSocketDisconnect, RuntimeError, TimeoutError):
+            await _close_socket(session.websocket, _SLOW_CLIENT_CLOSE_CODE)
+        except Exception:
+            LOGGER.exception(
+                "Outbound WebSocket delivery failed for %s",
+                session.connection_id,
+            )
+            await _close_socket(session.websocket, _SLOW_CLIENT_CLOSE_CODE)
+
+    @staticmethod
+    async def _send_session_json(
+        session: TransportSession,
+        message: dict[str, Any],
+    ) -> None:
+        async with session.send_lock:
+            await asyncio.wait_for(
+                session.websocket.send_json(message),
+                timeout=_SEND_TIMEOUT_SECONDS,
+            )
 
     async def _handle_text(self, session: TransportSession, raw: str) -> None:
         request_id: str | None = None
@@ -220,7 +456,7 @@ class WebSocketTransport:
                 or version != PROTOCOL_VERSION
             ):
                 await self._send_error(
-                    session.websocket,
+                    session,
                     request_id,
                     "unsupported_protocol_version",
                     f"Only protocol version {PROTOCOL_VERSION} is supported.",
@@ -232,7 +468,7 @@ class WebSocketTransport:
             payload_type = PAYLOAD_MODELS.get(operation)
             if payload_type is None:
                 await self._send_error(
-                    session.websocket,
+                    session,
                     request_id,
                     "unknown_operation",
                     "The requested operation is not supported.",
@@ -241,7 +477,7 @@ class WebSocketTransport:
             payload = payload_type.model_validate(envelope.payload)
         except (json.JSONDecodeError, ValueError, ValidationError, TypeError):
             await self._send_error(
-                session.websocket,
+                session,
                 request_id,
                 "invalid_command",
                 "The command envelope or payload is invalid.",
@@ -250,7 +486,12 @@ class WebSocketTransport:
 
         try:
             result = await self._execute(session, operation, payload)
-            await session.websocket.send_json(result_response(request_id, result))
+            await self._send_session_json(
+                session,
+                result_response(request_id, result),
+            )
+        except TimeoutError:
+            await _close_socket(session.websocket, _SLOW_CLIENT_CLOSE_CODE)
         except Exception as error:
             code, message = _public_error(error)
             if code == "internal_error":
@@ -259,7 +500,7 @@ class WebSocketTransport:
                     operation,
                     session.connection_id,
                 )
-            await self._send_error(session.websocket, request_id, code, message)
+            await self._send_error(session, request_id, code, message)
             if isinstance(error, (ControllerFailedError, ControllerNotRunningError)):
                 await _close_socket(session.websocket, 1011)
 
@@ -288,15 +529,25 @@ class WebSocketTransport:
             )
 
         if operation == "create_game":
-            game = await self._controller.submit_request(
+            synchronized = await self._controller.submit_membership_request(
                 CreateGameRequest(token, payload.display_name, session.connection_id)
             )
-            await self.connections.bind_membership(session, game.game_session_id)
-            return _membership_result(self._controller, game.members[token])
+            await self.connections.bind_membership(
+                session,
+                synchronized.update.game_session_id,
+                lambda: self._controller.projection_for_game_member(
+                    synchronized.update.game_session_id,
+                    token,
+                ),
+            )
+            return _membership_result(
+                synchronized.update,
+                synchronized.recipient,
+            )
 
         if operation == "join_game":
             game_id = payload.game_session_id
-            member = await self._controller.submit_request(
+            synchronized = await self._controller.submit_membership_request(
                 JoinGameRequest(
                     game_id,
                     token,
@@ -304,19 +555,36 @@ class WebSocketTransport:
                     payload.display_name,
                 )
             )
-            await self.connections.bind_membership(session, game_id)
-            return _membership_result(self._controller, member)
+            await self.connections.bind_membership(
+                session,
+                game_id,
+                lambda: self._controller.projection_for_game_member(
+                    game_id,
+                    token,
+                ),
+            )
+            return _membership_result(
+                synchronized.update,
+                synchronized.recipient,
+            )
 
         if operation == "reconnect":
             game_id = payload.game_session_id
-            await self._controller.submit_request(
+            synchronized = await self._controller.submit_membership_request(
                 RegisterConnectionRequest(game_id, token, session.connection_id)
             )
-            game = self._controller.game_engine.active_game
-            if game is None:  # pragma: no cover - controller established membership
-                raise RuntimeError("reconnect completed without an active game")
-            await self.connections.bind_membership(session, game_id)
-            return _membership_result(self._controller, game.members[token])
+            await self.connections.bind_membership(
+                session,
+                game_id,
+                lambda: self._controller.projection_for_game_member(
+                    game_id,
+                    token,
+                ),
+            )
+            return _membership_result(
+                synchronized.update,
+                synchronized.recipient,
+            )
 
         game_id = session.game_session_id
         if game_id is None:
@@ -338,18 +606,31 @@ class WebSocketTransport:
             return {"accepted": True, "queued": True}
 
         if isinstance(request, BuzzRequest):
-            result = await self._controller.submit_request(request)
-        else:
-            result = await self._controller.submit_request(
-                CurrentConnectionRequest(request, session.connection_id)
+            synchronized = await self._controller.submit_projected_request(
+                request,
+                token,
             )
-        response = _command_result(self._controller, operation, result)
+        else:
+            synchronized = await self._controller.submit_projected_request(
+                CurrentConnectionRequest(request, session.connection_id),
+                token,
+            )
+        response = _command_result(
+            synchronized.update,
+            operation,
+            synchronized.result,
+        )
         if operation in {"cancel_game", "close_game"}:
             await self.connections.clear_game(game_id)
         return response
 
     async def _cleanup(self, session: TransportSession) -> None:
-        if not await self.connections.release(session):
+        was_current = await self.connections.release(session)
+        sender = session.sender_task
+        if sender is not None and not sender.done():
+            sender.cancel()
+            await asyncio.gather(sender, return_exceptions=True)
+        if not was_current:
             return
         token = session.browser_token
         game_id = session.game_session_id
@@ -367,13 +648,16 @@ class WebSocketTransport:
 
     @staticmethod
     async def _send_error(
-        websocket: WebSocket,
+        session: TransportSession,
         request_id: str | None,
         code: str,
         message: str,
     ) -> None:
-        if websocket.application_state is WebSocketState.CONNECTED:
-            await websocket.send_json(error_response(request_id, code, message))
+        if session.websocket.application_state is WebSocketState.CONNECTED:
+            await WebSocketTransport._send_session_json(
+                session,
+                error_response(request_id, code, message),
+            )
 
 
 class ProtocolOperationError(RuntimeError):
@@ -436,6 +720,13 @@ def _build_member_request(
         )
     if operation == "reveal":
         return RevealRequest(game_id, payload.round_id, token)
+    if operation == "select_score":
+        return SelectProvisionalScoreRequest(
+            game_id,
+            payload.round_id,
+            token,
+            ScoringChoice(payload.scoring_choice),
+        )
     if operation == "accept_score":
         return AcceptScoreRequest(
             game_id,
@@ -458,29 +749,47 @@ def _build_member_request(
         return CloseGameRequest(game_id, token)
     if operation == "retry_completed_game_persistence":
         return RetryCompletedGamePersistenceRequest(game_id, token)
+    if operation == "transfer_songmaster":
+        return TransferSongmasterByPublicIdRequest(
+            game_id,
+            token,
+            payload.recipient_public_participant_id,
+        )
     raise ProtocolOperationError("unknown_operation", "The operation is not supported.")
 
 
-def _membership_result(controller: GameController, member: GameMember) -> dict[str, Any]:
-    game = controller.game_engine.active_game
-    if game is None:  # pragma: no cover - membership response requires a game
-        raise RuntimeError("membership response requires an active game")
+def _membership_result(
+    update: AuthoritativeProjectionUpdate,
+    recipient: CapturedRecipientProjection,
+) -> dict[str, Any]:
+    public = update.public
+    if public is None:  # pragma: no cover - membership dispatch creates an active view
+        raise RuntimeError("membership response requires an active projection")
+    participant = next(
+        item
+        for item in public.participants
+        if item.public_participant_id
+        == recipient.recipient.public_participant_id
+    )
     return {
-        "game_session_id": str(game.game_session_id),
-        "display_name": member.display_name,
-        "is_songmaster": member.browser_token == game.songmaster_browser_token,
-        "state": controller.game_engine.state.value,
+        "game_session_id": str(update.game_session_id),
+        "display_name": participant.display_name,
+        "public_participant_id": str(participant.public_participant_id),
+        "is_songmaster": recipient.recipient.is_songmaster,
+        "state": public.state.value,
     }
 
 
 def _command_result(
-    controller: GameController,
+    update: AuthoritativeProjectionUpdate,
     operation: str,
     result: object,
 ) -> dict[str, Any]:
     response: dict[str, Any] = {"accepted": True}
     if operation not in {"cancel_game", "close_game"}:
-        response["state"] = controller.game_engine.state.value
+        if update.public is None:  # pragma: no cover - only close/cancel invalidate
+            raise RuntimeError("accepted gameplay requires an active projection")
+        response["state"] = update.public.state.value
     if isinstance(result, PendingAudioPreparation):
         response["preparation_id"] = str(result.preparation_id)
     elif isinstance(result, GameFinalizationResult):

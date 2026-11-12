@@ -283,6 +283,7 @@ class GameEngine:
         preparation_id_factory: Callable[[], UUID] | None = None,
         round_id_factory: Callable[[], UUID] | None = None,
         recovery_id_factory: Callable[[], UUID] | None = None,
+        participant_id_factory: Callable[[], UUID] | None = None,
         shuffle: Shuffle | None = None,
     ) -> None:
         self._installation_defaults = deepcopy(
@@ -308,6 +309,10 @@ class GameEngine:
         self._recovery_id_factory = (
             recovery_id_factory if recovery_id_factory is not None else uuid4
         )
+        self._participant_id_factory = (
+            participant_id_factory if participant_id_factory is not None else uuid4
+        )
+        self._issued_public_participant_ids: set[UUID] = set()
         self._shuffle = shuffle if shuffle is not None else random_shuffle
         self._state = GameState.NO_GAME
         self._active_game: GameSession | None = None
@@ -356,6 +361,7 @@ class GameEngine:
             browser_token=token,
             display_name=normalized_name,
             name_uniqueness_key=player_name_uniqueness_key(normalized_name),
+            public_participant_id=self._new_public_participant_id(),
             join_order=0,
             audio_enabled=True,
         )
@@ -1236,6 +1242,10 @@ class GameEngine:
         if winner_token is None or elapsed is None:  # pragma: no cover
             raise DomainInvariantError("SCORING requires winner and elapsed facts")
 
+        # Phase A combined selection and acceptance. Preserve that operation
+        # while using the same provisional choice projected by Phase B.
+        game.provisional_scoring_choice = scoring_choice
+
         awarded_points = self._calculate_round_points(
             active_round,
             elapsed,
@@ -1256,8 +1266,53 @@ class GameEngine:
         game.deck_pointer += 1
         game.active_round = None
         game.round_termination = None
+        game.provisional_scoring_choice = None
         self._transition_to(GameState.ROUND_COMPLETE)
         return completed
+
+    def select_provisional_score(
+        self,
+        game_session_id: UUID,
+        round_id: UUID,
+        requesting_browser_token: str,
+        scoring_choice: ScoringChoice,
+    ) -> int:
+        """Replace the visible provisional award without committing points."""
+
+        self._reject_if_songmaster_recovery_active("provisional scoring")
+        if self._state is not GameState.SCORING:
+            raise ScoringNotAllowedError(
+                "provisional scoring is only allowed in SCORING"
+            )
+        game = self._active_game
+        if game is None or game.game_session_id != game_session_id:
+            raise ScoringNotAllowedError("provisional scoring targets a stale game")
+        token = self._validate_browser_token(
+            requesting_browser_token,
+            error_type=UnauthorizedScoringError,
+        )
+        if token != game.songmaster_browser_token or not game.songmaster.connected:
+            raise UnauthorizedScoringError(
+                "only the current connected Songmaster may select a score"
+            )
+        if not isinstance(scoring_choice, ScoringChoice):
+            raise InvalidScoringDecisionError(
+                "scoring_choice must be a ScoringChoice"
+            )
+        active_round = game.active_round
+        termination = game.round_termination
+        if not isinstance(active_round, ActiveRound) or active_round.round_id != round_id:
+            raise ScoringNotAllowedError("provisional scoring targets a stale round")
+        if not isinstance(termination, RoundTermination):  # pragma: no cover
+            raise DomainInvariantError("SCORING requires a termination outcome")
+        elapsed = termination.buzz_elapsed_seconds
+        if elapsed is None:  # pragma: no cover
+            raise DomainInvariantError("SCORING requires trusted buzz timing")
+        self._validate_state_invariants(GameState.SCORING)
+        points = self._calculate_round_points(active_round, elapsed, scoring_choice)
+        game.provisional_scoring_choice = scoring_choice
+        self._validate_state_invariants(GameState.SCORING)
+        return points
 
     def correct_score(
         self,
@@ -1690,6 +1745,7 @@ class GameEngine:
         game.deck_pointer += 1
         game.active_round = None
         game.round_termination = None
+        game.provisional_scoring_choice = None
         game.buzzing_enabled = False
         if source_state is not GameState.SCORING:
             self._restore_completed_round_display(game)
@@ -1944,6 +2000,7 @@ class GameEngine:
             browser_token=token,
             display_name=normalized_name,
             name_uniqueness_key=name_key,
+            public_participant_id=self._new_public_participant_id(),
             join_order=max(
                 (member.join_order for member in game.members.values()),
                 default=-1,
@@ -2086,6 +2143,21 @@ class GameEngine:
         """Validate the invariants for the engine's current executable state."""
 
         self._validate_state_invariants(self._state)
+
+    def _new_public_participant_id(self) -> UUID:
+        """Issue a process-unique, non-credential game-local public identity."""
+
+        participant_id = self._participant_id_factory()
+        if not isinstance(participant_id, UUID):
+            raise DomainInvariantError(
+                "the participant ID factory must return a UUID"
+            )
+        if participant_id in self._issued_public_participant_ids:
+            raise DomainInvariantError(
+                "the participant ID factory reused an issued public identity"
+            )
+        self._issued_public_participant_ids.add(participant_id)
+        return participant_id
 
     @staticmethod
     def _validate_browser_token(
@@ -2403,6 +2475,7 @@ class GameEngine:
         if game is None or game.active_round is None:
             raise DomainInvariantError("SCORING entry requires an actual round")
         game.buzzing_enabled = False
+        game.provisional_scoring_choice = None
 
     def _take_transition_k(self) -> None:
         """Apply transition K on authorized Play Song after deck exhaustion."""
@@ -2438,6 +2511,7 @@ class GameEngine:
         game.round_termination = None
         game.pending_audio_preparation = None
         game.audio_preparation_responses = None
+        game.provisional_scoring_choice = None
         game.scoring_correction_round_id = None
         game.buzzing_enabled = False
         game.completed_game_history = self._build_completed_game_history(game)
@@ -2855,6 +2929,7 @@ class GameEngine:
             raise DomainInvariantError("game membership keys must be browser tokens")
         name_keys: set[str] = set()
         join_orders: set[int] = set()
+        public_ids: set[UUID] = set()
         for member in game.members.values():
             try:
                 normalized_name = normalize_player_name(member.display_name)
@@ -2884,6 +2959,15 @@ class GameEngine:
                     "game member join orders must be unique non-negative integers"
                 )
             join_orders.add(member.join_order)
+            if not isinstance(member.public_participant_id, UUID):
+                raise DomainInvariantError(
+                    "game members must have UUID public participant IDs"
+                )
+            if member.public_participant_id in public_ids:
+                raise DomainInvariantError(
+                    "public participant IDs must be unique within a game"
+                )
+            public_ids.add(member.public_participant_id)
             if not isinstance(member.connected, bool):
                 raise DomainInvariantError(
                     "game member connection state must be boolean"
@@ -3672,6 +3756,12 @@ class GameEngine:
             raise DomainInvariantError(
                 "the current scoring round cannot already be completed"
             )
+        if game.provisional_scoring_choice is not None and not isinstance(
+            game.provisional_scoring_choice, ScoringChoice
+        ):
+            raise DomainInvariantError(
+                "the provisional scoring choice must be a ScoringChoice"
+            )
 
     def _validate_finished_invariants(self) -> None:
         game = self._active_game
@@ -3691,6 +3781,10 @@ class GameEngine:
         if game.scoring_correction_round_id is not None:
             raise DomainInvariantError(
                 "FINISHED cannot retain a score correction window"
+            )
+        if game.provisional_scoring_choice is not None:
+            raise DomainInvariantError(
+                "FINISHED cannot retain provisional scoring"
             )
         if game.end_reason is GameEndReason.DECK_EXHAUSTED:
             if game.deck_pointer != len(deck) or game.deck_exhausted is not True:

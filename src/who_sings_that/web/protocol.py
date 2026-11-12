@@ -80,6 +80,10 @@ class ScoringPayload(RoundPayload):
     ]
 
 
+class TransferSongmasterPayload(ProtocolModel):
+    recipient_public_participant_id: UUID
+
+
 PAYLOAD_MODELS: Final[dict[str, type[ProtocolModel]]] = {
     "establish_identity": EstablishIdentityPayload,
     "create_game": CreateGamePayload,
@@ -96,12 +100,14 @@ PAYLOAD_MODELS: Final[dict[str, type[ProtocolModel]]] = {
     "acknowledge_audio_preparation_failure": PreparationPayload,
     "buzz": RoundPayload,
     "reveal": RoundPayload,
+    "select_score": ScoringPayload,
     "accept_score": ScoringPayload,
     "correct_score": ScoringPayload,
     "end_game": EmptyPayload,
     "cancel_game": EmptyPayload,
     "close_game": EmptyPayload,
     "retry_completed_game_persistence": EmptyPayload,
+    "transfer_songmaster": TransferSongmasterPayload,
 }
 
 

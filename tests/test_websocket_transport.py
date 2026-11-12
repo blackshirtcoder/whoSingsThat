@@ -28,6 +28,8 @@ from who_sings_that.database import (
 from who_sings_that.domain import GameState, RoundVoidReason
 from who_sings_that.web import ServerSettings, create_app
 
+_UNSOLICITED: dict[int, list[dict]] = {}
+
 
 @dataclass(slots=True)
 class RunningServer:
@@ -108,6 +110,7 @@ async def running_server(tmp_path: Path) -> AsyncIterator[RunningServer]:
 
 async def _connect(server: RunningServer) -> tuple[ClientConnection, dict]:
     websocket = await websockets.connect(server.websocket_url)
+    _UNSOLICITED[id(websocket)] = []
     connected = json.loads(await websocket.recv())
     return websocket, connected
 
@@ -131,7 +134,55 @@ async def _command(
             }
         )
     )
-    return json.loads(await websocket.recv())
+    while True:
+        message = json.loads(await websocket.recv())
+        if (
+            message.get("type") == "result"
+            and message.get("request_id") == correlation_id
+        ):
+            return message
+        _UNSOLICITED[id(websocket)].append(message)
+
+
+async def _next_unsolicited(
+    websocket: ClientConnection,
+    *,
+    message_type: str | None = None,
+    timeout: float = 2.0,
+) -> dict:
+    queued = _UNSOLICITED[id(websocket)]
+    while True:
+        for index, message in enumerate(queued):
+            if message_type is None or message.get("type") == message_type:
+                return queued.pop(index)
+        message = json.loads(await asyncio.wait_for(websocket.recv(), timeout))
+        if message_type is None or message.get("type") == message_type:
+            return message
+        queued.append(message)
+
+
+async def _next_state_after(
+    websocket: ClientConnection,
+    revision: int = 0,
+    *,
+    state: str | None = None,
+    timeout: float = 2.0,
+) -> dict:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while True:
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            raise AssertionError("authoritative state update did not arrive")
+        message = await _next_unsolicited(websocket, timeout=remaining)
+        if message.get("type") not in {"state_snapshot", "state_update"}:
+            continue
+        payload = message["payload"]
+        if payload["revision"] <= revision:
+            continue
+        if state is not None and payload.get("state") != state:
+            continue
+        return message
 
 
 async def _identity(
@@ -577,6 +628,7 @@ async def test_unexpected_failure_is_generic_and_contains_no_traceback(
             raise RuntimeError("sensitive server detail")
 
         running_server.app.state.game_controller.submit_request = explode
+        running_server.app.state.game_controller.submit_membership_request = explode
         response = await _command(
             websocket,
             "create_game",
@@ -588,3 +640,403 @@ async def test_unexpected_failure_is_generic_and_contains_no_traceback(
         assert "Traceback" not in serialized
     finally:
         await websocket.close()
+
+
+@pytest.mark.asyncio
+async def test_initial_snapshots_and_join_broadcast_use_safe_public_ids(
+    running_server: RunningServer,
+) -> None:
+    songmaster, _ = await _connect(running_server)
+    contestant, _ = await _connect(running_server)
+    songmaster_token = await _identity(songmaster)
+    contestant_token = await _identity(contestant)
+    try:
+        created = await _command(
+            songmaster,
+            "create_game",
+            {"display_name": "Songmaster"},
+        )
+        creator_state = await _next_state_after(songmaster)
+        creator_payload = creator_state["payload"]
+        assert creator_state["type"] == "state_snapshot"
+        assert creator_payload["state"] == "lobby"
+        assert creator_payload["recipient"]["is_songmaster"] is True
+        creator_public_id = creator_payload["recipient"][
+            "public_participant_id"
+        ]
+        assert creator_public_id == created["result"]["public_participant_id"]
+
+        await _command(
+            contestant,
+            "join_game",
+            {
+                "game_session_id": created["result"]["game_session_id"],
+                "display_name": "Contestant",
+            },
+        )
+        joined_state = await _next_state_after(contestant)
+        creator_update = await _next_state_after(
+            songmaster,
+            creator_payload["revision"],
+        )
+        joined_payload = joined_state["payload"]
+        assert creator_update["payload"]["revision"] == joined_payload["revision"]
+        participant_ids = {
+            item["public_participant_id"]
+            for item in joined_payload["participants"]
+        }
+        assert len(participant_ids) == 2
+        assert creator_public_id in participant_ids
+        serialized = json.dumps((joined_payload, creator_update["payload"]))
+        assert songmaster_token not in serialized
+        assert contestant_token not in serialized
+
+        impersonation, _ = await _connect(running_server)
+        try:
+            await _identity(impersonation, creator_public_id)
+            rejected = await _command(
+                impersonation,
+                "reconnect",
+                {"game_session_id": created["result"]["game_session_id"]},
+            )
+            assert rejected["error"]["code"] == "invalid_membership"
+        finally:
+            await impersonation.close()
+    finally:
+        await songmaster.close()
+        await contestant.close()
+
+
+@pytest.mark.asyncio
+async def test_public_id_songmaster_transfer_updates_every_recipient(
+    running_server: RunningServer,
+) -> None:
+    songmaster, contestant, _, _, _ = await _create_two_player_game(
+        running_server
+    )
+    try:
+        songmaster_initial = await _next_state_after(songmaster)
+        contestant_initial = await _next_state_after(contestant)
+        if (
+            songmaster_initial["payload"]["revision"]
+            < contestant_initial["payload"]["revision"]
+        ):
+            songmaster_initial = await _next_state_after(
+                songmaster,
+                songmaster_initial["payload"]["revision"],
+            )
+        contestant_id = contestant_initial["payload"]["recipient"][
+            "public_participant_id"
+        ]
+        unauthorized = await _command(
+            contestant,
+            "transfer_songmaster",
+            {"recipient_public_participant_id": contestant_id},
+        )
+        assert unauthorized["error"]["code"] == "not_songmaster"
+
+        transferred = await _command(
+            songmaster,
+            "transfer_songmaster",
+            {"recipient_public_participant_id": contestant_id},
+        )
+        assert transferred["ok"] is True
+        songmaster_update = await _next_state_after(
+            songmaster,
+            songmaster_initial["payload"]["revision"],
+        )
+        contestant_update = await _next_state_after(
+            contestant,
+            contestant_initial["payload"]["revision"],
+        )
+        assert songmaster_update["payload"]["recipient"]["is_songmaster"] is False
+        assert contestant_update["payload"]["recipient"]["is_songmaster"] is True
+        assert (
+            contestant_update["payload"]["songmaster_public_participant_id"]
+            == contestant_id
+        )
+    finally:
+        await songmaster.close()
+        await contestant.close()
+
+
+@pytest.mark.asyncio
+async def test_pre_reveal_payloads_are_secret_and_provisional_score_replaces(
+    running_server: RunningServer,
+) -> None:
+    songmaster, contestant, _, _, _ = await _create_two_player_game(
+        running_server
+    )
+    try:
+        await _next_state_after(songmaster)
+        await _next_state_after(contestant)
+        round_id, _ = await _start_playing_round(running_server, songmaster)
+        songmaster_playing = await _next_state_after(songmaster, state="playing")
+        contestant_playing = await _next_state_after(contestant, state="playing")
+        pre_reveal = json.dumps(
+            (songmaster_playing["payload"], contestant_playing["payload"])
+        )
+        assert "Secret Artist" not in pre_reveal
+        assert "Secret Title" not in pre_reveal
+        assert "Inspected Artist" not in pre_reveal
+        assert "Inspected Title" not in pre_reveal
+        assert "private/" not in pre_reveal
+        assert ".mp3" not in pre_reveal
+
+        assert (await _command(contestant, "buzz", {"round_id": round_id}))["ok"]
+        await _next_state_after(songmaster, state="awaiting_reveal")
+        assert (await _command(songmaster, "reveal", {"round_id": round_id}))["ok"]
+        scoring = await _next_state_after(songmaster, state="scoring")
+        contestant_scoring = await _next_state_after(contestant, state="scoring")
+        assert scoring["payload"]["current_round"]["artist"] == "Secret Artist"
+        assert scoring["payload"]["current_round"]["title"] == "Secret Title"
+
+        unauthorized = await _command(
+            contestant,
+            "select_score",
+            {"round_id": round_id, "scoring_choice": "both"},
+        )
+        assert unauthorized["error"]["code"] == "not_songmaster"
+
+        assert (
+            await _command(
+                songmaster,
+                "select_score",
+                {"round_id": round_id, "scoring_choice": "both"},
+            )
+        )["ok"]
+        both = await _next_state_after(
+            contestant,
+            contestant_scoring["payload"]["revision"],
+            state="scoring",
+        )
+        contestant_id = both["payload"]["recipient"]["public_participant_id"]
+        both_row = next(
+            item
+            for item in both["payload"]["participants"]
+            if item["public_participant_id"] == contestant_id
+        )
+        assert both_row["committed_score"] == 0
+        assert both_row["provisional_score"] > 0
+
+        assert (
+            await _command(
+                songmaster,
+                "select_score",
+                {"round_id": round_id, "scoring_choice": "artist"},
+            )
+        )["ok"]
+        artist = await _next_state_after(
+            contestant,
+            both["payload"]["revision"],
+            state="scoring",
+        )
+        artist_row = next(
+            item
+            for item in artist["payload"]["participants"]
+            if item["public_participant_id"] == contestant_id
+        )
+        assert 0 < artist_row["provisional_score"] < both_row["provisional_score"]
+        assert artist_row["effective_score"] == artist_row["provisional_score"]
+
+        assert (
+            await _command(
+                songmaster,
+                "accept_score",
+                {"round_id": round_id, "scoring_choice": "artist"},
+            )
+        )["ok"]
+        committed = await _next_state_after(
+            contestant,
+            artist["payload"]["revision"],
+            state="round_complete",
+        )
+        committed_row = next(
+            item
+            for item in committed["payload"]["participants"]
+            if item["public_participant_id"] == contestant_id
+        )
+        assert committed_row["committed_score"] == artist_row["effective_score"]
+        assert committed_row["provisional_score"] == 0
+
+        assert (
+            await _command(
+                songmaster,
+                "correct_score",
+                {"round_id": round_id, "scoring_choice": "both"},
+            )
+        )["ok"]
+        corrected = await _next_state_after(
+            contestant,
+            committed["payload"]["revision"],
+            state="round_complete",
+        )
+        corrected_row = next(
+            item
+            for item in corrected["payload"]["participants"]
+            if item["public_participant_id"] == contestant_id
+        )
+        assert corrected_row["committed_score"] > committed_row["committed_score"]
+    finally:
+        await songmaster.close()
+        await contestant.close()
+
+
+@pytest.mark.asyncio
+async def test_mid_round_join_and_reconnect_have_recipient_specific_eligibility(
+    running_server: RunningServer,
+) -> None:
+    songmaster, contestant, _, contestant_token, game_id = (
+        await _create_two_player_game(running_server)
+    )
+    third, _ = await _connect(running_server)
+    replacement: ClientConnection | None = None
+    try:
+        await _next_state_after(songmaster)
+        contestant_initial = await _next_state_after(contestant)
+        original_public_id = contestant_initial["payload"]["recipient"][
+            "public_participant_id"
+        ]
+        await _start_playing_round(running_server, songmaster)
+        await _identity(third)
+        assert (
+            await _command(
+                third,
+                "join_game",
+                {"game_session_id": game_id, "display_name": "Late Player"},
+            )
+        )["ok"]
+        late_snapshot = await _next_state_after(third, state="playing")
+        assert late_snapshot["payload"]["recipient"]["eligible_to_buzz"] is False
+
+        await contestant.close()
+        controller = running_server.app.state.game_controller
+        await _eventually(
+            lambda: not controller.game_engine.active_game.members[
+                contestant_token
+            ].connected
+        )
+        replacement, _ = await _connect(running_server)
+        await _identity(replacement, contestant_token)
+        assert (
+            await _command(
+                replacement,
+                "reconnect",
+                {"game_session_id": game_id},
+            )
+        )["ok"]
+        resumed = await _next_state_after(replacement, state="playing")
+        assert resumed["payload"]["recipient"]["eligible_to_buzz"] is True
+        assert (
+            resumed["payload"]["recipient"]["public_participant_id"]
+            == original_public_id
+        )
+    finally:
+        await songmaster.close()
+        await contestant.close()
+        await third.close()
+        if replacement is not None:
+            await replacement.close()
+
+
+@pytest.mark.asyncio
+async def test_disconnect_recovery_and_cancel_emit_authoritative_updates(
+    running_server: RunningServer,
+) -> None:
+    songmaster, contestant, songmaster_token, _, game_id = (
+        await _create_two_player_game(running_server)
+    )
+    replacement: ClientConnection | None = None
+    try:
+        await _next_state_after(songmaster)
+        contestant_initial = await _next_state_after(contestant)
+        await songmaster.close()
+        recovery = await _next_state_after(
+            contestant,
+            contestant_initial["payload"]["revision"],
+            state="lobby",
+        )
+        assert recovery["payload"]["suspended_for_songmaster_recovery"] is True
+        assert recovery["payload"]["recovery"]["grace_deadline"].endswith("Z")
+
+        replacement, _ = await _connect(running_server)
+        await _identity(replacement, songmaster_token)
+        assert (
+            await _command(
+                replacement,
+                "reconnect",
+                {"game_session_id": game_id},
+            )
+        )["ok"]
+        recovered = await _next_state_after(replacement, state="lobby")
+        assert recovered["payload"]["suspended_for_songmaster_recovery"] is False
+        assert recovered["payload"]["last_recovery_outcome"]["resolution"] == (
+            "original_reconnected"
+        )
+
+        assert (await _command(replacement, "cancel_game"))["ok"]
+        invalidated = await _next_state_after(
+            contestant,
+            recovery["payload"]["revision"],
+            state="no_game",
+        )
+        assert invalidated["payload"]["active"] is False
+        assert invalidated["payload"]["game_session_id"] == game_id
+    finally:
+        await songmaster.close()
+        await contestant.close()
+        if replacement is not None:
+            await replacement.close()
+
+
+@pytest.mark.asyncio
+async def test_finished_member_reconnect_receives_final_standings_snapshot(
+    running_server: RunningServer,
+) -> None:
+    songmaster, contestant, _, contestant_token, game_id = (
+        await _create_two_player_game(running_server)
+    )
+    replacement: ClientConnection | None = None
+    try:
+        await _next_state_after(songmaster)
+        await _next_state_after(contestant)
+        playlist_id = _add_secret_playlist(running_server)
+        assert (
+            await _command(
+                songmaster,
+                "select_playlist",
+                {"playlist_id": playlist_id},
+            )
+        )["ok"]
+        assert (await _command(songmaster, "start_game"))["ok"]
+        assert (await _command(songmaster, "end_game"))["ok"]
+        finished = await _next_state_after(contestant, state="finished")
+        assert len(finished["payload"]["final_standings"]) == 2
+
+        await contestant.close()
+        controller = running_server.app.state.game_controller
+        await _eventually(
+            lambda: not controller.game_engine.active_game.members[
+                contestant_token
+            ].connected
+        )
+        replacement, _ = await _connect(running_server)
+        await _identity(replacement, contestant_token)
+        assert (
+            await _command(
+                replacement,
+                "reconnect",
+                {"game_session_id": game_id},
+            )
+        )["ok"]
+        snapshot = await _next_state_after(replacement, state="finished")
+        assert snapshot["type"] == "state_snapshot"
+        assert snapshot["payload"]["finished"] is True
+        assert snapshot["payload"]["final_standings"] == finished["payload"][
+            "final_standings"
+        ]
+    finally:
+        await songmaster.close()
+        await contestant.close()
+        if replacement is not None:
+            await replacement.close()

@@ -9,6 +9,7 @@ while persistent playlist and media inspection is in progress.
 import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from math import isfinite
 from numbers import Real
 from os import PathLike
@@ -34,6 +35,7 @@ from who_sings_that.domain import (
     PreparationOutcome,
     SongmasterRecovery,
     SongmasterRecoveryStatus,
+    SongmasterTransferNotAllowedError,
     UnknownGameMemberError,
 )
 
@@ -68,11 +70,21 @@ from .messages import (
     RetryCompletedGamePersistenceRequest,
     RevealRequest,
     SelectPlaylistRequest,
+    SelectProvisionalScoreRequest,
     SetAudioPreferenceRequest,
     SongmasterReconnectGraceExpiredEvent,
     StartGameRequest,
     SystemEvent,
+    TransferSongmasterByPublicIdRequest,
     TransferSongmasterRequest,
+)
+from .projections import (
+    AuthoritativeProjectionUpdate,
+    CapturedRecipientProjection,
+    GameEventNotification,
+    MembershipSynchronization,
+    PublicGameProjection,
+    build_authoritative_projection,
 )
 from .start_game import (
     InvalidMusicRootError,
@@ -158,6 +170,7 @@ class _QueuedMessage:
         | _TrustedConnectionSubmission
     )
     response: asyncio.Future[Any] | None
+    projection_browser_token: str | None = None
 
 
 class _StopConsumer:
@@ -252,6 +265,13 @@ class GameController:
         self._playback_timeout_task: asyncio.Task[None] | None = None
         self._songmaster_reconnect_grace_task: asyncio.Task[None] | None = None
         self._owned_timer_tasks: set[asyncio.Task[None]] = set()
+        self._projection_revision = 0
+        self._latest_projection: AuthoritativeProjectionUpdate | None = None
+        self._last_invalidated_projection: AuthoritativeProjectionUpdate | None = None
+        self._projection_listeners: list[
+            Callable[[AuthoritativeProjectionUpdate], None]
+        ] = []
+        self._recovery_deadlines_utc: dict[UUID, datetime] = {}
 
     @property
     def game_engine(self) -> GameEngine:
@@ -283,6 +303,64 @@ class GameController:
         """Return the application-owned registry for diagnostics and adapters."""
 
         return self._connection_registry
+
+    @property
+    def latest_projection(self) -> AuthoritativeProjectionUpdate | None:
+        """Return the last immutable FIFO-boundary capture, if a game exists."""
+
+        return self._latest_projection
+
+    def projection_for(
+        self,
+        browser_token: str,
+    ) -> tuple[AuthoritativeProjectionUpdate, CapturedRecipientProjection]:
+        """Return the latest already-captured view for one current member."""
+
+        update = self._latest_projection
+        recipient = (
+            None if update is None else update.recipient_for_token(browser_token)
+        )
+        if update is None or recipient is None:
+            raise UnknownGameMemberError(
+                "no authoritative projection exists for this member"
+            )
+        return update, recipient
+
+    def projection_for_game_member(
+        self,
+        game_session_id: UUID,
+        browser_token: str,
+    ) -> tuple[AuthoritativeProjectionUpdate, CapturedRecipientProjection]:
+        """Return the newest retained capture for one game/member pair."""
+
+        candidates = (self._latest_projection, self._last_invalidated_projection)
+        for update in candidates:
+            if update is None or update.game_session_id != game_session_id:
+                continue
+            recipient = update.recipient_for_token(browser_token)
+            if recipient is not None:
+                return update, recipient
+        raise UnknownGameMemberError(
+            "no retained projection exists for this game member"
+        )
+
+    def add_projection_listener(
+        self,
+        listener: Callable[[AuthoritativeProjectionUpdate], None],
+    ) -> None:
+        """Register a synchronous, non-network projection enqueue callback."""
+
+        if listener not in self._projection_listeners:
+            self._projection_listeners.append(listener)
+
+    def remove_projection_listener(
+        self,
+        listener: Callable[[AuthoritativeProjectionUpdate], None],
+    ) -> None:
+        """Stop routing future captures to a transport adapter."""
+
+        if listener in self._projection_listeners:
+            self._projection_listeners.remove(listener)
 
     def is_completed_history_persisted(self, game_session_id: UUID) -> bool:
         """Return whether this controller observed a successful archive commit."""
@@ -362,6 +440,44 @@ class GameController:
         caller does not cancel authoritative work that the controller accepted.
         """
 
+        return await self._submit_request(request, projection_browser_token=None)
+
+    async def submit_membership_request(
+        self,
+        request: CreateGameRequest | JoinGameRequest | RegisterConnectionRequest,
+    ) -> MembershipSynchronization:
+        """Return membership result with its exact FIFO-boundary projection."""
+
+        if not isinstance(
+            request,
+            (CreateGameRequest, JoinGameRequest, RegisterConnectionRequest),
+        ):
+            raise TypeError("request must establish game membership")
+        return await self._submit_request(
+            request,
+            projection_browser_token=request.browser_token,
+        )
+
+    async def submit_projected_request(
+        self,
+        request: ClientRequest,
+        browser_token: str,
+    ) -> MembershipSynchronization:
+        """Return a client result with its exact recipient-safe state capture."""
+
+        if not isinstance(browser_token, str) or not browser_token:
+            raise ValueError("browser_token must be a non-empty string")
+        return await self._submit_request(
+            request,
+            projection_browser_token=browser_token,
+        )
+
+    async def _submit_request(
+        self,
+        request: ClientRequest,
+        *,
+        projection_browser_token: str | None,
+    ) -> Any:
         if not isinstance(request, ClientRequest):
             raise TypeError("request must be a ClientRequest")
         if asyncio.current_task() is self._consumer_task:
@@ -386,7 +502,13 @@ class GameController:
                 request=request,
                 received_at_monotonic=self._game_engine.monotonic_time(),
             )
-        self._queue.put_nowait(_QueuedMessage(queued_request, response))
+        self._queue.put_nowait(
+            _QueuedMessage(
+                queued_request,
+                response,
+                projection_browser_token=projection_browser_token,
+            )
+        )
         return await asyncio.shield(response)
 
     def post_system_event(self, event: SystemEvent) -> None:
@@ -416,15 +538,36 @@ class GameController:
             try:
                 if queued is _STOP_CONSUMER:
                     return
+                prior_projection = self._latest_projection
                 try:
                     result = self._dispatch(queued.message)
                 except Exception as error:  # noqa: BLE001 - consumer failure boundary
                     if self._is_expected_operational_error(error):
+                        try:
+                            self._capture_projection_change(prior_projection)
+                        except Exception as projection_error:  # noqa: BLE001
+                            self._fail_controller(queued, projection_error)
+                            return
                         self._complete_expected_rejection(queued, error)
                         continue
                     self._fail_controller(queued, error)
                     return
-                self._complete_response(queued.response, result=result)
+                try:
+                    self._capture_projection_change(prior_projection)
+                    response_result: object = result
+                    if queued.projection_browser_token is not None:
+                        update, recipient = self.projection_for(
+                            queued.projection_browser_token
+                        )
+                        response_result = MembershipSynchronization(
+                            result=result,
+                            update=update,
+                            recipient=recipient,
+                        )
+                except Exception as error:  # noqa: BLE001 - capture failure boundary
+                    self._fail_controller(queued, error)
+                    return
+                self._complete_response(queued.response, result=response_result)
             finally:
                 self._queue.task_done()
 
@@ -542,6 +685,28 @@ class GameController:
                 message.requesting_browser_token,
                 message.recipient_browser_token,
             )
+        if isinstance(message, TransferSongmasterByPublicIdRequest):
+            self._require_target_game(message.game_session_id)
+            game = self._game_engine.active_game
+            if game is None:  # pragma: no cover - target validation established it
+                raise DomainInvariantError("Songmaster transfer requires a game")
+            recipient = next(
+                (
+                    member
+                    for member in game.members.values()
+                    if member.public_participant_id
+                    == message.recipient_public_participant_id
+                ),
+                None,
+            )
+            if recipient is None:
+                raise SongmasterTransferNotAllowedError(
+                    "the public participant ID is not a member of this game"
+                )
+            return self._game_engine.transfer_songmaster(
+                message.requesting_browser_token,
+                recipient.browser_token,
+            )
         if isinstance(message, PlaySongRequest):
             self._require_target_game(message.game_session_id)
             result = self._game_engine.play_song(message.requesting_browser_token)
@@ -657,6 +822,13 @@ class GameController:
                 message.requesting_browser_token,
                 message.scoring_choice,
             )
+        if isinstance(message, SelectProvisionalScoreRequest):
+            return self._game_engine.select_provisional_score(
+                message.game_session_id,
+                message.round_id,
+                message.requesting_browser_token,
+                message.scoring_choice,
+            )
         if isinstance(message, CorrectScoreRequest):
             return self._game_engine.correct_score(
                 message.game_session_id,
@@ -724,6 +896,107 @@ class GameController:
         raise UnsupportedMessageError(
             f"no authoritative handler for {type(message).__name__}"
         )
+
+    def _capture_projection_change(
+        self,
+        prior: AuthoritativeProjectionUpdate | None,
+    ) -> None:
+        """Capture and publish one coherent post-dispatch observable state."""
+
+        game = self._game_engine.active_game
+        captured_at = datetime.now(UTC)
+        if game is None:
+            if prior is None or prior.invalidated:
+                return
+            update = AuthoritativeProjectionUpdate(
+                game_session_id=prior.game_session_id,
+                revision=prior.revision + 1,
+                captured_at=captured_at,
+                public=None,
+                recipients=prior.recipients,
+                notifications=(
+                    GameEventNotification("game_closed", {}),
+                ),
+                invalidated=True,
+            )
+            self._projection_revision = update.revision
+            self._latest_projection = update
+            self._last_invalidated_projection = update
+            self._publish_projection(update)
+            return
+
+        if prior is None or prior.game_session_id != game.game_session_id:
+            self._projection_revision = 0
+
+        recovery_deadline = self._recovery_deadline_for_projection(captured_at)
+        public, recipients = build_authoritative_projection(
+            game,
+            self._game_engine.state,
+            self._connection_registry,
+            recovery_deadline_utc=recovery_deadline,
+        )
+        comparable_prior = (
+            prior
+            if prior is not None
+            and prior.game_session_id == game.game_session_id
+            and not prior.invalidated
+            else None
+        )
+        if (
+            comparable_prior is not None
+            and comparable_prior.public == public
+            and comparable_prior.recipients == recipients
+        ):
+            return
+        self._projection_revision += 1
+        notifications = _derive_notifications(
+            None if comparable_prior is None else comparable_prior.public,
+            public,
+        )
+        update = AuthoritativeProjectionUpdate(
+            game_session_id=game.game_session_id,
+            revision=self._projection_revision,
+            captured_at=captured_at,
+            public=public,
+            recipients=recipients,
+            notifications=notifications,
+        )
+        self._latest_projection = update
+        self._publish_projection(update)
+
+    def _recovery_deadline_for_projection(
+        self,
+        captured_at: datetime,
+    ) -> datetime | None:
+        game = self._game_engine.active_game
+        recovery = game.songmaster_recovery if game is not None else None
+        if (
+            recovery is None
+            or recovery.status is not SongmasterRecoveryStatus.RECONNECT_GRACE
+            or recovery.grace_deadline_monotonic is None
+        ):
+            self._recovery_deadlines_utc.clear()
+            return None
+        self._recovery_deadlines_utc = {
+            key: value
+            for key, value in self._recovery_deadlines_utc.items()
+            if key == recovery.recovery_id
+        }
+        existing = self._recovery_deadlines_utc.get(recovery.recovery_id)
+        if existing is not None:
+            return existing
+        remaining = max(
+            0.0,
+            recovery.grace_deadline_monotonic
+            - self._game_engine.monotonic_time(),
+        )
+        deadline = captured_at + timedelta(seconds=remaining)
+        self._recovery_deadlines_utc[recovery.recovery_id] = deadline
+        return deadline
+
+    def _publish_projection(self, update: AuthoritativeProjectionUpdate) -> None:
+        for listener in tuple(self._projection_listeners):
+            listener(update)
 
     def _persist_finished_history(
         self,
@@ -1257,15 +1530,117 @@ def _connection_bound_request_scope(request: ClientRequest) -> tuple[UUID, str]:
             RetryCompletedGamePersistenceRequest,
             RevealRequest,
             SelectPlaylistRequest,
+            SelectProvisionalScoreRequest,
             SetAudioPreferenceRequest,
             StartGameRequest,
             TransferSongmasterRequest,
+            TransferSongmasterByPublicIdRequest,
         ),
     ):
         return request.game_session_id, request.requesting_browser_token
     raise UnsupportedMessageError(
         f"{type(request).__name__} cannot be wrapped as a current-connection request"
     )
+
+
+def _derive_notifications(
+    previous: PublicGameProjection | None,
+    current: PublicGameProjection,
+) -> tuple[GameEventNotification, ...]:
+    """Derive bounded transient notices only from authoritative fact changes."""
+
+    if previous is None:
+        return (GameEventNotification("game_created", {}),)
+    notifications: list[GameEventNotification] = []
+    old_participants = {
+        item.public_participant_id: item for item in previous.participants
+    }
+    new_participants = {
+        item.public_participant_id: item for item in current.participants
+    }
+    for participant_id, participant in new_participants.items():
+        old = old_participants.get(participant_id)
+        identity = {
+            "public_participant_id": str(participant_id),
+            "display_name": participant.display_name,
+        }
+        if old is None:
+            notifications.append(GameEventNotification("player_joined", identity))
+        elif old.connected and not participant.connected:
+            notifications.append(
+                GameEventNotification("player_disconnected", identity)
+            )
+        elif not old.connected and participant.connected:
+            notifications.append(GameEventNotification("player_reconnected", identity))
+
+    old_recovery = previous.recovery
+    new_recovery = current.recovery
+    if old_recovery is None and new_recovery is not None:
+        notifications.append(
+            GameEventNotification(
+                "songmaster_reconnect_grace_began",
+                {
+                    "recovery_id": new_recovery["recovery_id"],
+                    "grace_deadline": new_recovery["grace_deadline"],
+                    "round_voided": new_recovery["round_voided"],
+                },
+            )
+        )
+    elif (
+        old_recovery is not None
+        and new_recovery is not None
+        and old_recovery["status"] != new_recovery["status"]
+    ):
+        notifications.append(
+            GameEventNotification(
+                "songmaster_recovery_suspended",
+                {"recovery_id": new_recovery["recovery_id"]},
+            )
+        )
+
+    old_outcome = previous.last_recovery_outcome
+    new_outcome = current.last_recovery_outcome
+    if new_outcome is not None and (
+        old_outcome is None
+        or old_outcome["recovery_id"] != new_outcome["recovery_id"]
+    ):
+        resolution = new_outcome["resolution"]
+        event = {
+            "original_reconnected": "songmaster_recovered",
+            "automatic_failover": "songmaster_automatically_changed",
+            "resumed_after_indefinite_suspension": "songmaster_recovery_resumed",
+        }[resolution]
+        notifications.append(GameEventNotification(event, dict(new_outcome)))
+
+    old_void = previous.round_status.get("last_voided_round")
+    new_void = current.round_status.get("last_voided_round")
+    if new_void is not None and new_void != old_void:
+        notifications.append(GameEventNotification("round_voided", dict(new_void)))
+        if new_void["reason"] == "playback_client_lost":
+            notifications.append(
+                GameEventNotification("playback_client_lost", dict(new_void))
+            )
+
+    old_preparation = previous.round_status.get("audio_preparation")
+    new_preparation = current.round_status.get("audio_preparation")
+    if (
+        new_preparation is not None
+        and new_preparation.get("failure_acknowledgement_pending") is True
+        and (
+            old_preparation is None
+            or old_preparation.get("failure_acknowledgement_pending") is not True
+        )
+    ):
+        notifications.append(GameEventNotification("audio_preparation_failed", {}))
+
+    if previous.state is not GameState.FINISHED and current.state is GameState.FINISHED:
+        notifications.append(
+            GameEventNotification(
+                "game_ended",
+                {"end_reason": current.end_reason},
+            )
+        )
+    return tuple(notifications)
 
 
 __all__ = [

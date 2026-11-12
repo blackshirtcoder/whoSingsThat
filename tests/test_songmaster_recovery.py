@@ -437,6 +437,16 @@ async def test_longest_continuously_connected_contestant_is_promoted(
         game.last_songmaster_recovery_outcome.resolution
         is SongmasterRecoveryResolution.AUTOMATIC_FAILOVER
     )
+    assert controller.latest_projection is not None
+    failover_revision = controller.latest_projection.revision
+    assert controller.latest_projection.public is not None
+    assert (
+        controller.latest_projection.public.songmaster_public_participant_id
+        == game.members["p2"].public_participant_id
+    )
+    assert [
+        notice.event for notice in controller.latest_projection.notifications
+    ].count("songmaster_automatically_changed") == 1
     assert controller.songmaster_reconnect_grace_active is False
 
     await controller.submit_request(
@@ -453,6 +463,15 @@ async def test_longest_continuously_connected_contestant_is_promoted(
         SongmasterRecoveryInapplicableError,
     )
     assert game.songmaster_browser_token == "p2"
+    assert controller.latest_projection is not None
+    assert controller.latest_projection.revision > failover_revision
+    late_reconnect_revision = controller.latest_projection.revision
+    controller.post_system_event(
+        SongmasterReconnectGraceExpiredEvent(GAME_ID, recovery_id)
+    )
+    await controller._queue.join()
+    assert controller.latest_projection is not None
+    assert controller.latest_projection.revision == late_reconnect_revision
     await controller.stop()
 
 

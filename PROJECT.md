@@ -342,6 +342,12 @@ Three identities remain distinct:
 - a connection ID identifies one live transport connection and is replaced on
   refresh/reconnect without becoming the member identity.
 
+Live gameplay also assigns every membership a random game-local public
+participant UUID. It is stable for that membership across disconnect,
+reconnect, and Songmaster changes, but is regenerated for later games. It is a
+display/routing handle only: it is not a bearer credential and is never
+accepted in place of the private browser token or trusted current connection.
+
 Transport connection IDs are process-local facts. They are neither persisted
 nor copied into completed history, and cross-device identity recovery remains
 outside V1.
@@ -2188,18 +2194,17 @@ close_game
 retry_completed_game_persistence
 ```
 
-The existing application API combines the scoring selection and score commit,
-so `accept_score` carries `scoring_choice` (`artist`, `title`, `both`, or
-`neither`). `correct_score` uses the same values. No separate speculative
-provisional-selection state machine was added.
+The original application API combines scoring selection and score commit, so
+`accept_score` continues to carry `scoring_choice` (`artist`, `title`, `both`,
+or `neither`) for compatibility. Phase B additionally exposes `select_score`,
+which replaces the current projected provisional choice without committing it.
+`correct_score` uses the same choice values after transition J.
 
-Manual Songmaster transfer is deliberately not a Phase A network operation.
-The existing controller selects its recipient by private browser token, and
-Phase A has no safe public participant identifier or player projection. Asking
-the browser for another member's bearer token would violate token privacy.
-Phase B must project a non-secret member handle and add the bounded translation
-to the existing `TransferSongmasterRequest`; the transport does not fabricate a
-working transfer by disclosing tokens or treating a display name as identity.
+Manual Songmaster transfer was deliberately not a Phase A network operation.
+Phase B adds `transfer_songmaster` with a public participant UUID. The
+controller resolves that UUID inside the active game and delegates to the
+existing token-based authorized domain operation; the recipient's browser token
+is never exposed and the public UUID provides no membership proof.
 
 Browser capability and READY/FAILED reports retain their established
 response-free `SystemEvent` controller semantics. Their WebSocket result means
@@ -2232,3 +2237,221 @@ cannot discover every opaque preparation/round identifier needed to drive a
 whole audio round from responses alone. Phase A tests therefore exercise that
 transport-to-controller boundary using authoritative controller inspection;
 they do not represent deferred audio delivery as implemented.
+
+## 52. Phase B Authoritative State Projection and Notifications
+
+### 52.1 Public participant identity
+
+`GameMember.public_participant_id` is a random UUID issued by the game engine.
+The member record is the one mapping from private browser token to public ID.
+The ID is unique within the game, stable across reconnect and role transfer,
+independent of connection IDs, and never persisted as a cross-game account.
+Issued IDs are not reused by a later live game in the same process.
+
+Public IDs identify participants in projections, standings, buzzer facts,
+recovery facts, and `transfer_songmaster`. Browser tokens remain the authority
+for membership and controller operations. Connection IDs remain private
+transport-routing facts and are not serialized in game state.
+
+### 52.2 Projection capture and revision semantics
+
+After every controller FIFO dispatch, including timer and unsolicited system
+events, the controller constructs explicit immutable projection DTOs directly
+from the now-stable aggregate boundary. It never serializes `GameSession`,
+`ActiveRound`, `Deck`, track references, SQLAlchemy rows, or connection-registry
+records. Expected request failure normally creates no update. If a request
+reaches a legitimate durable state change before a later persistence error,
+the changed state is still captured before the structured error response.
+
+Every current game begins at revision 1. A game-scoped revision advances only
+when public or recipient-visible facts change. Idempotent operations and stale
+system events do not advance it. All recipients of one capture see the same
+revision. Close or Cancel emits one final inactive projection under the former
+game UUID and next revision; a later game has a different game UUID and restarts
+at revision 1. Clients compare both `game_session_id` and `revision`, never a
+browser clock.
+
+Each connected member capture also carries its authoritative connection ID only
+as internal routing metadata. The transport delivers it only if that exact
+connection is still current. A replacement capture therefore cannot reach the
+predecessor socket. This routing metadata never appears in outbound JSON.
+
+### 52.3 State payload
+
+`state_snapshot` and `state_update` have protocol version 1, no request ID, and
+a payload with projection schema version 1. The top-level fields are:
+
+```text
+schema_version
+game_session_id
+revision
+server_time
+active
+state
+suspended_for_songmaster_recovery
+songmaster_public_participant_id
+participants
+scoreboard_order
+deck
+started
+finished
+selected_playlist_ids
+selected_playlists
+settings
+displayed_song
+current_round
+recovery
+last_recovery_outcome
+end_reason
+final_standings
+recipient
+```
+
+Participants contain public participant ID, display name, committed score,
+current provisional contribution, displayed effective score, connected state,
+and Songmaster state. Scoreboard order is the ordered list of public IDs using
+effective score during `SCORING` and committed score otherwise. Ties retain
+game join order for deterministic display without inventing a competitive
+tiebreaker. Final standings retain their authoritative frozen ranks.
+
+The deck projection exposes size, next original position, exhaustion, and
+started state, but never deck entries. Playlist snapshots expose playlist
+metadata, not track membership. Settings are copied primitive values.
+
+`displayed_song` follows the state-entry display rules: it may contain the
+previous revealed answer through `ROUND_COMPLETE` and `AUDIO_PREPARING`; the
+new current answer is blank in `PLAYING` and `AWAITING_REVEAL`; Reveal makes it
+visible in `SCORING` or the completed-round display. `current_round` contains
+only safe status, opaque preparation/round UUIDs, public buzzer identity,
+termination status, preparation counts, and provisional adjudication facts.
+
+### 52.4 Recipient facts
+
+The `recipient` object contains only the receiving member's public participant
+ID and advisory UI facts:
+
+```text
+is_songmaster
+eligible_to_buzz
+has_authoritative_connection
+has_control_privileges
+audio_enabled
+browser_audio_usable
+can_act
+available_songmaster_operations
+```
+
+Buzz eligibility combines the transition-C token snapshot, current connection,
+current `PLAYING` state, and enabled buzzing. A new mid-round member is false;
+an originally snapshotted contestant who reconnects during the still-live
+round becomes true again. These fields do not replace domain/controller
+validation of incoming commands.
+
+### 52.5 Answer-secrecy boundary
+
+Before authorized Reveal, no projection or notification contains the current
+artist, title, relative path, filename, track ID, catalog lookup handle, future
+deck entry, or unrestricted internal object. This applies equally to the
+Songmaster. Opaque round and preparation UUIDs do not resolve media or metadata
+through any Phase B endpoint. A voided unrevealed round projects only its reason
+and safe participant identity; its answer stays hidden. After Reveal, the
+current artist/title may be projected, and an already completed revealed song
+may remain in `displayed_song` under the normal state-entry rules.
+
+### 52.6 Initial synchronization and unsolicited messages
+
+Successful Create, Join, or Reconnect first completes membership/connection
+registration in the controller. The transport then binds the physical socket
+and enqueues the controller's latest already-captured recipient view as
+`state_snapshot`. No transport task reads mutable engine state. The bind and
+snapshot enqueue are one event-loop critical section, so a later broadcast
+cannot be followed by an older initial snapshot. Reconnect in `FINISHED`
+receives final standings; reconnect during recovery receives the normalized
+state and overlay; indefinite suspended state remains capturable for the first
+later connection.
+
+Later observable captures use `state_update`. Command `result` records retain
+their request IDs; unsolicited records always have `request_id: null`, so one
+socket can distinguish responses from state and events.
+
+`game_event` is a transient structured notice containing game UUID, associated
+state revision, event category, and a small safe payload. Implemented categories
+are:
+
+```text
+game_created
+player_joined
+player_disconnected
+player_reconnected
+songmaster_reconnect_grace_began
+songmaster_recovery_suspended
+songmaster_recovered
+songmaster_automatically_changed
+songmaster_recovery_resumed
+round_voided
+playback_client_lost
+audio_preparation_failed
+game_ended
+game_closed
+```
+
+Notifications are derived from changed authoritative facts, so stale recovery
+expiries or repeated idempotent events do not duplicate them. They are never the
+source of current truth; a reconnect recovers entirely from `state_snapshot`.
+
+### 52.7 Delivery and backpressure
+
+The FIFO consumer invokes only synchronous enqueue callbacks after building a
+projection. It never awaits a WebSocket send. Every socket owns one sender task,
+one mandatory not-yet-sent initial snapshot, one replaceable later-state slot,
+and a bounded queue of at most 32 transient events. Rapid state revisions
+coalesce to the newest pending capture while an initial or already-sending older
+revision completes first; revision ordering therefore never regresses. Command
+responses share a per-socket send lock but a slow response affects only that
+socket's handler, not the controller.
+
+If a socket cannot drain its transient queue, the server closes it with 1013.
+An individual socket send also has a five-second deadline; expiry closes that
+socket instead of retaining a permanently blocked sender.
+Normal current-socket cleanup then posts the existing authoritative disconnect
+event, including playback-client voiding or Songmaster recovery as applicable.
+Replacement cleanup is stale and cannot disconnect the successor. Shutdown
+detaches projection delivery, closes mailboxes and sockets, awaits sender/close
+tasks, then lets the existing lifespan retire controller timers and dispose the
+database.
+
+### 52.8 Recovery visibility
+
+During reconnect grace, the stable normalized `GameState` remains in `state`
+and `suspended_for_songmaster_recovery` is true. `recovery` contains its UUID,
+status, original Songmaster public ID, interrupted and normalized states,
+preparation-discarded/round-voided facts, and a server-derived UTC grace
+deadline. `server_time` lets a browser render an advisory countdown; the server
+monotonic deadline remains authoritative. Indefinite suspension has no
+deadline. A completed recovery clears the overlay and retains one safe
+`last_recovery_outcome` with public participant IDs.
+
+### 52.9 Provisional scoring and transfer commands
+
+`select_score` carries `round_id` and `scoring_choice`. In `SCORING`, the
+connected Songmaster may replace the choice repeatedly. Projection arithmetic
+shows one provisional contribution on the immutable buzz winner and sorts by
+committed plus provisional score; choices never accumulate. `accept_score`
+commits its supplied/current choice through the existing transition J and
+clears provisional facts. End Game or Songmaster-loss normalization also clears
+them. `correct_score` remains the existing `ROUND_COMPLETE` replacement and
+produces a new committed-score projection.
+
+`transfer_songmaster` carries only `recipient_public_participant_id`. The
+controller resolves it against current membership, then invokes the existing
+`transfer_songmaster` domain operation with its private token. Songmaster
+authority, target connection, legal state, and recovery suspension checks are
+unchanged.
+
+### 52.10 Remaining Phase C/D limits
+
+Phase B does not provide HTML/CSS/JavaScript UI, HTTP media delivery, opaque
+media authorization, browser preload/play/stop delivery, actual playback,
+multi-location synchronization, `/admin`, or history browsing. Preparation and
+round UUIDs are projected only to describe current state and route the existing
+Phase A response commands. Audio bytes and filenames remain unavailable.

@@ -506,6 +506,8 @@ async def test_timer_expiry_posts_fifo_event_and_takes_transition_g(
     controller, engine, clock, _, playback_sleep = (
         await start_playback_through_controller(controller_storage)
     )
+    assert controller.latest_projection is not None
+    playing_revision = controller.latest_projection.revision
     clock.value = 130.0
 
     playback_sleep.release.set()
@@ -518,6 +520,10 @@ async def test_timer_expiry_posts_fifo_event_and_takes_transition_g(
     assert engine.active_game.round_termination.reason is (
         RoundTerminationReason.PLAYBACK_TIMEOUT
     )
+    assert controller.latest_projection is not None
+    assert controller.latest_projection.revision > playing_revision
+    assert controller.latest_projection.public is not None
+    assert controller.latest_projection.public.state is GameState.AWAITING_REVEAL
     await controller.stop()
 
 

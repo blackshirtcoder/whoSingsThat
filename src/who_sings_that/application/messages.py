@@ -114,6 +114,15 @@ class TransferSongmasterRequest(ClientRequest):
 
 
 @dataclass(frozen=True, slots=True)
+class TransferSongmasterByPublicIdRequest(ClientRequest):
+    """Transport-safe voluntary transfer resolved inside the controller."""
+
+    game_session_id: UUID
+    requesting_browser_token: str
+    recipient_public_participant_id: UUID
+
+
+@dataclass(frozen=True, slots=True)
 class PlaySongRequest(ClientRequest):
     """Request transition C or K from the connected Songmaster."""
 
@@ -171,6 +180,16 @@ class RevealRequest(ClientRequest):
 @dataclass(frozen=True, slots=True)
 class AcceptScoreRequest(ClientRequest):
     """Request transition J for the current revealed buzz round."""
+
+    game_session_id: UUID
+    round_id: UUID
+    requesting_browser_token: str
+    scoring_choice: ScoringChoice
+
+
+@dataclass(frozen=True, slots=True)
+class SelectProvisionalScoreRequest(ClientRequest):
+    """Replace the current SCORING display choice without committing it."""
 
     game_session_id: UUID
     round_id: UUID
@@ -288,9 +307,11 @@ __all__ = [
     "RetryCompletedGamePersistenceRequest",
     "RevealRequest",
     "SelectPlaylistRequest",
+    "SelectProvisionalScoreRequest",
     "SetAudioPreferenceRequest",
     "SongmasterReconnectGraceExpiredEvent",
     "StartGameRequest",
     "SystemEvent",
+    "TransferSongmasterByPublicIdRequest",
     "TransferSongmasterRequest",
 ]

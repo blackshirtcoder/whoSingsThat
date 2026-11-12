@@ -10,6 +10,7 @@ from sqlalchemy import Engine
 
 from who_sings_that.application import (
     BrowserAudioCapabilityChangedEvent,
+    CancelGameRequest,
     ClientRequest,
     ConsumerAlreadyRunningError,
     ConsumerSelfRequestError,
@@ -178,6 +179,50 @@ async def test_waiting_empty_consumer_wakes_for_a_successful_request(
 
     assert game is controller.game_engine.active_game
     assert controller.game_engine.state is GameState.LOBBY
+    await controller.stop()
+
+
+@pytest.mark.asyncio
+async def test_membership_sync_retains_old_game_invalidation_across_new_game(
+    controller_storage: tuple[Engine, Path],
+) -> None:
+    game_ids = iter((uuid4(), uuid4()))
+    engine = GameEngine(
+        clock=lambda: CREATED_AT,
+        game_id_factory=lambda: next(game_ids),
+    )
+    controller = make_controller(controller_storage, game_engine=engine)
+    await controller.start()
+
+    first = await controller.submit_membership_request(
+        CreateGameRequest("browser-token", "First", "first-connection")
+    )
+    first_game_id = first.update.game_session_id
+    first_public_id = first.recipient.recipient.public_participant_id
+    assert first.update.revision == 1
+
+    await controller.submit_request(
+        CancelGameRequest(first_game_id, "browser-token")
+    )
+    invalidated, invalidated_recipient = controller.projection_for_game_member(
+        first_game_id,
+        "browser-token",
+    )
+    assert invalidated.invalidated is True
+    assert invalidated_recipient.connection_id == "first-connection"
+
+    second = await controller.submit_membership_request(
+        CreateGameRequest("browser-token", "Second", "second-connection")
+    )
+    assert second.update.game_session_id != first_game_id
+    assert second.update.revision == 1
+    assert second.recipient.recipient.public_participant_id != first_public_id
+
+    retained, _ = controller.projection_for_game_member(
+        first_game_id,
+        "browser-token",
+    )
+    assert retained is invalidated
     await controller.stop()
 
 

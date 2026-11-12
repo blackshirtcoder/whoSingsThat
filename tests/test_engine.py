@@ -171,6 +171,29 @@ def test_default_game_session_ids_are_unique() -> None:
     assert first_game.game_session_id != second_game.game_session_id
 
 
+def test_public_participant_ids_are_unique_stable_and_not_reused_by_new_game() -> None:
+    engine = GameEngine()
+    first_game = engine.create_game("creator-token", "Creator")
+    contestant = engine.join_game("contestant-token", "Contestant")
+    creator_id = first_game.members["creator-token"].public_participant_id
+    contestant_id = contestant.public_participant_id
+
+    engine.disconnect_member("contestant-token")
+    reconnected = engine.join_game("contestant-token")
+    engine.transfer_songmaster("creator-token", "contestant-token")
+
+    assert creator_id != contestant_id
+    assert reconnected.public_participant_id == contestant_id
+    assert first_game.songmaster.public_participant_id == contestant_id
+
+    engine.cancel_game(first_game.game_session_id, "contestant-token")
+    second_game = engine.create_game("creator-token", "Creator Again")
+    assert second_game.members["creator-token"].public_participant_id not in {
+        creator_id,
+        contestant_id,
+    }
+
+
 @pytest.mark.parametrize(
     ("entered", "displayed"),
     [

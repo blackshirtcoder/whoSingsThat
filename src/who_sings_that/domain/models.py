@@ -6,7 +6,7 @@ from decimal import Decimal
 from enum import Enum
 from typing import Final
 from unicodedata import category, normalize
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from .deck import Deck, DeckEntry, TrackReference
 from .scoring import ScoringChoice
@@ -160,6 +160,7 @@ class GameMember:
     browser_token: str
     display_name: str
     name_uniqueness_key: str
+    public_participant_id: UUID = field(default_factory=uuid4)
     join_order: int = 0
     committed_score: int = 0
     connected: bool = True
@@ -494,6 +495,7 @@ class GameSession:
     last_voided_round: VoidedRound | None = None
     completed_rounds: tuple[CompletedRound, ...] = ()
     voided_rounds: tuple[VoidedRound, ...] = ()
+    provisional_scoring_choice: ScoringChoice | None = None
     scoring_correction_round_id: UUID | None = None
     pending_audio_preparation: PendingAudioPreparation | None = None
     audio_preparation_responses: AudioPreparationResponseState | None = None
