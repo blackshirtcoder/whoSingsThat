@@ -57,6 +57,7 @@ from .messages import (
     CloseGameRequest,
     CorrectScoreRequest,
     CreateGameRequest,
+    CurrentConnectionRequest,
     DeselectPlaylistRequest,
     EndGameRequest,
     JoinGameRequest,
@@ -437,6 +438,17 @@ class GameController:
     ) -> object:
         """Route one message to existing application or domain operations."""
 
+        if isinstance(message, CurrentConnectionRequest):
+            game_session_id, browser_token = _connection_bound_request_scope(
+                message.request
+            )
+            self._require_current_connection(
+                game_session_id,
+                browser_token,
+                message.source_connection_id,
+            )
+            return self._dispatch(message.request)
+
         if isinstance(message, _TrustedBuzzSubmission):
             request = message.request
             self._require_current_connection(
@@ -804,6 +816,7 @@ class GameController:
         message: RegisterConnectionRequest,
         received_at_monotonic: float,
     ) -> ConnectionRegistration:
+        self._require_target_game(message.game_session_id)
         game = self._game_engine.active_game
         if game is None or message.browser_token not in game.members:
             raise UnknownGameMemberError(
@@ -1225,6 +1238,34 @@ def _observe_response_exception(response: asyncio.Future[Any]) -> None:
 
     if not response.cancelled():
         response.exception()
+
+
+def _connection_bound_request_scope(request: ClientRequest) -> tuple[UUID, str]:
+    """Return the explicit membership scope for a transport-wrapped request."""
+
+    if isinstance(
+        request,
+        (
+            AcceptScoreRequest,
+            AcknowledgeAudioPreparationFailureRequest,
+            CancelGameRequest,
+            CloseGameRequest,
+            CorrectScoreRequest,
+            DeselectPlaylistRequest,
+            EndGameRequest,
+            PlaySongRequest,
+            RetryCompletedGamePersistenceRequest,
+            RevealRequest,
+            SelectPlaylistRequest,
+            SetAudioPreferenceRequest,
+            StartGameRequest,
+            TransferSongmasterRequest,
+        ),
+    ):
+        return request.game_session_id, request.requesting_browser_token
+    raise UnsupportedMessageError(
+        f"{type(request).__name__} cannot be wrapped as a current-connection request"
+    )
 
 
 __all__ = [

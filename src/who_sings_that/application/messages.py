@@ -56,6 +56,20 @@ class RegisterConnectionRequest(ClientRequest):
 
 
 @dataclass(frozen=True, slots=True)
+class CurrentConnectionRequest(ClientRequest):
+    """Run an existing member request only for its current live connection.
+
+    Transport adapters use this wrapper for requests whose original application
+    record predates physical connection authentication.  Validation and the
+    wrapped dispatch occur in one FIFO item, so a queued connection replacement
+    cannot race a later command from the superseded socket.
+    """
+
+    request: ClientRequest
+    source_connection_id: str
+
+
+@dataclass(frozen=True, slots=True)
 class SelectPlaylistRequest(ClientRequest):
     """Request selection of one persistent playlist in the lobby."""
 
@@ -263,6 +277,7 @@ __all__ = [
     "CloseGameRequest",
     "CorrectScoreRequest",
     "CreateGameRequest",
+    "CurrentConnectionRequest",
     "DeselectPlaylistRequest",
     "EndGameRequest",
     "JoinGameRequest",

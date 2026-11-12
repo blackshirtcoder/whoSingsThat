@@ -116,9 +116,8 @@ Buzz timing uses a trusted server-side receipt timestamp captured at the
 authoritative application ingress boundary before the request waits in the
 global queue. The public client request contains no timestamp, elapsed time,
 playback position, or speed claim. The current ingress boundary is
-`GameController.submit_request`; future WebSocket transport integration must
-capture the timestamp promptly when a received message first reaches trusted
-server code.
+`GameController.submit_request`; the Phase A WebSocket adapter calls this
+boundary promptly after validation and never accepts client timing claims.
 
 Playback start, playback deadline, buzz receipt, elapsed buzz time, and timer
 scheduling use one monotonic clock domain. The UTC playback-start timestamp is
@@ -152,9 +151,9 @@ same live connection is idempotent. Registering a different connection replaces
 the predecessor, and a delayed event from the predecessor is then stale.
 
 Connection-establishment records and connection-loss/capability/preparation
-events are trusted transport-facing inputs. Future WebSocket code must generate
-and authenticate connection IDs and translate observed transport occurrences
-into these messages; a browser must not be allowed to assert an arbitrary
+events are trusted transport-facing inputs. The Phase A WebSocket transport
+generates and authenticates connection IDs and translates observed transport
+occurrences into these messages; a browser cannot assert an arbitrary
 connection ID. Registration alone never creates membership. Create Game or Join
 Game remains responsible for validated membership creation, while an existing
 member's trusted registration may resume that member's current connection.
@@ -1558,12 +1557,12 @@ efficiency only: game ID, recovery UUID, state, connection ID, preparation ID,
 and round ID checks make duplicate, superseded, cross-game, and late queued
 events harmless expected rejections.
 
-Future transport/UI work must notify clients when grace starts, a round is
+Future state-projection/UI work must notify clients when grace starts, a round is
 voided, the incumbent returns, authority transfers, indefinite suspension
 begins, and a later connection resumes the game. It must project the structured
-recovery facts without exposing pre-reveal track metadata. No WebSocket,
-browser, audio-stop message, or generic notification infrastructure is part of
-this implementation.
+recovery facts without exposing pre-reveal track metadata. Phase A provides the
+request/response WebSocket ingress only; browser state projection, audio-stop
+messages, and generic notification infrastructure remain deferred.
 
 V1 does not persist active-game state across server restart/crash.
 
@@ -1750,9 +1749,10 @@ game engine directly.
 READY/FAILED events identify the reporting member and source connection. The
 controller validates that source against its current-connection registry before
 domain preparation applicability checks. The same validation applies to
-connection loss, capability updates, and buzz ingress. Real transport remains
-responsible for creating authenticated connection IDs; no WebSocket layer is
-implemented yet.
+connection loss, capability updates, and buzz ingress. The Phase A transport
+creates authenticated connection IDs and submits these events with the trusted
+physical-connection identity. Full browser audio command delivery and state
+projection are not implemented yet.
 
 Active-state new membership, contestant disconnect, same-token reconnect,
 contestant playback-client connection-loss voiding, and Songmaster
@@ -2020,3 +2020,215 @@ It should leave human judgment and conversation to the players:
 The Songmaster controls pacing.
 
 Timers govern guessing, not conversation.
+
+## 51. Phase A FastAPI and WebSocket Transport
+
+### 51.1 Application entrypoint and lifecycle
+
+The importable FastAPI application is `who_sings_that.web:app`. Tests and other
+embedders may call `who_sings_that.web.create_app(ServerSettings(...))` to inject
+a temporary SQLite path, music root, or controller factory without module-import
+startup work.
+
+FastAPI's lifespan performs the process lifecycle in this order:
+
+1. upgrade the configured SQLite database to the current Alembic revision;
+2. create one SQLAlchemy engine;
+3. create exactly one authoritative `GameController` and its transport map;
+4. start the controller's existing global FIFO consumer;
+5. accept WebSocket work;
+6. on shutdown, stop transport acceptance and close live sockets;
+7. drain/stop the controller and retire its owned timers; and
+8. dispose the database engine.
+
+No database migration, controller, timer, background task, or listening socket
+starts merely by importing the module. V1 requires exactly one Uvicorn worker;
+multiple workers would create multiple incompatible authoritative controllers.
+
+Environment settings are:
+
+```text
+WST_DATABASE_PATH                  default: wst.sqlite3
+WST_MUSIC_ROOT                     default: .
+WST_HOST                           default: 127.0.0.1
+WST_PORT                           default: 8000
+WST_LOG_LEVEL                      default: info
+WST_MAX_WEBSOCKET_MESSAGE_BYTES    default: 65536
+```
+
+The basic environment-backed launch command is:
+
+```bash
+WST_DATABASE_PATH=/path/to/wst.sqlite3 \
+WST_MUSIC_ROOT=/path/to/music \
+uv run python -m who_sings_that.web
+```
+
+The equivalent direct Uvicorn form is:
+
+```bash
+uv run uvicorn who_sings_that.web:app \
+  --host 127.0.0.1 --port 8000 --workers 1 --ws-max-size 65536
+```
+
+Use `--host 0.0.0.0` (or `WST_HOST=0.0.0.0` with the module runner) for LAN
+access. This is an unauthenticated bearer-token game service designed for a
+trusted LAN. Do not expose it directly to the public internet; Phase A does not
+provision TLS, accounts, OAuth, or an internet-security boundary.
+
+### 51.2 Endpoint, identity, and membership
+
+The primary endpoint is `/ws`. On acceptance the server sends an unsolicited
+`transport_connected` record containing a new opaque process-local
+`connection_id` and the configured application message-size limit. A client
+cannot choose or override that ID.
+
+Before membership operations, the client sends `establish_identity`. Omitting
+`browser_token` causes the server to generate a cryptographically opaque token
+and return it only on that socket; the browser is responsible for retaining it
+locally. Supplying a retained token establishes only a browser-token claim. It
+does not create membership or prove a display name.
+
+`create_game` creates fresh membership and makes its member Songmaster.
+`join_game` creates membership under the active game using normal immutable-name
+validation. `reconnect` accepts a game UUID and proves membership only when the
+claimed token already belongs to that current game. Unknown tokens and stale
+game UUIDs are rejected. Reconnect never accepts or changes a display name.
+
+After successful create, join, or reconnect, the socket is bound to that
+game-local membership. Controller registration/replacement remains the
+authoritative decision. The transport then makes the new physical socket
+current and closes a replaced predecessor with private close code `4001`.
+Every member command that did not historically carry a source connection ID is
+wrapped in a `CurrentConnectionRequest`; source validation and existing request
+dispatch occur in one controller FIFO item. A command queued after replacement
+therefore cannot authenticate as the old socket. Late predecessor cleanup is
+also transport-current checked and cannot disconnect the replacement.
+
+Current-socket close posts the existing trusted `MemberDisconnectedEvent`.
+Controller/domain code—not the WebSocket handler—owns contestant round voiding,
+Songmaster grace, normalization, automatic failover, and stale-event rejection.
+
+### 51.3 Protocol envelopes
+
+Protocol version is `1`. Client commands are JSON text records:
+
+```json
+{
+  "version": 1,
+  "request_id": "client-correlation-id",
+  "type": "buzz",
+  "payload": {"round_id": "round-uuid"}
+}
+```
+
+Success uses an explicit bounded result DTO:
+
+```json
+{
+  "version": 1,
+  "request_id": "client-correlation-id",
+  "type": "result",
+  "ok": true,
+  "result": {"accepted": true, "state": "awaiting_reveal"}
+}
+```
+
+Expected rejection uses a stable code and safe public message:
+
+```json
+{
+  "version": 1,
+  "request_id": "client-correlation-id",
+  "type": "result",
+  "ok": false,
+  "error": {
+    "code": "buzz_not_allowed",
+    "message": "Buzzing is not allowed for this member or round."
+  }
+}
+```
+
+Envelopes and operation payloads reject undeclared fields. Unknown operation
+names are looked up only in an explicit table and cannot dynamically invoke
+Python methods or classes. Malformed JSON, invalid UUIDs/payloads, unsupported
+versions, and ordinary expected domain failures normally leave the socket
+usable. Unexpected failures are logged without browser tokens, return only
+`internal_error`, and close the socket when controller continuation is unsafe.
+
+The application rejects JSON text larger than
+`WST_MAX_WEBSOCKET_MESSAGE_BYTES`; Uvicorn must use the matching `--ws-max-size`
+listener setting. Binary messages are rejected as invalid commands.
+
+### 51.4 Supported operations
+
+The explicit Phase A operation table is:
+
+```text
+establish_identity
+create_game
+join_game
+reconnect
+select_playlist
+deselect_playlist
+start_game
+set_audio_preference
+set_audio_capability
+play_song
+audio_preparation_ready
+audio_preparation_failed
+acknowledge_audio_preparation_failure
+buzz
+reveal
+accept_score
+correct_score
+end_game
+cancel_game
+close_game
+retry_completed_game_persistence
+```
+
+The existing application API combines the scoring selection and score commit,
+so `accept_score` carries `scoring_choice` (`artist`, `title`, `both`, or
+`neither`). `correct_score` uses the same values. No separate speculative
+provisional-selection state machine was added.
+
+Manual Songmaster transfer is deliberately not a Phase A network operation.
+The existing controller selects its recipient by private browser token, and
+Phase A has no safe public participant identifier or player projection. Asking
+the browser for another member's bearer token would violate token privacy.
+Phase B must project a non-secret member handle and add the bounded translation
+to the existing `TransferSongmasterRequest`; the transport does not fabricate a
+working transfer by disclosing tokens or treating a display name as identity.
+
+Browser capability and READY/FAILED reports retain their established
+response-free `SystemEvent` controller semantics. Their WebSocket result means
+the trusted event was accepted onto the authoritative FIFO (`queued: true`),
+not that a future outbound state projection has confirmed the resulting domain
+state. All other listed gameplay requests await their controller result.
+
+Buzz payloads contain only `round_id`; client timestamps, elapsed time,
+playback position, and speed claims are not accepted. `GameController` captures
+the monotonic timestamp synchronously in `submit_request` before the buzz waits
+in the one global FIFO. The WebSocket layer introduces no second command queue.
+
+### 51.5 Privacy and Phase A limits
+
+Transport responses are hand-built primitive DTOs. They never serialize a
+`GameSession`, deck entry, active round, track reference, connection registry,
+or SQLAlchemy object. Pre-reveal results contain no artist, title, future deck
+contents, local media path, another member's browser token, or internal timing
+facts. Authorized Reveal changes domain state but Phase A still returns only
+bounded acknowledgement/state facts; answer delivery belongs to per-player
+Phase B projection.
+
+Phase A intentionally does not provide general state broadcasts, per-player
+state projection, browser UI, audio HTTP delivery, remote preparation/play
+commands, synchronized playback, audio-stop messages, or Songmaster recovery
+countdown notifications. The socket handler and transport map permit future
+unsolicited server messages, but no speculative broadcast framework exists.
+Until Phase B/C supplies preparation and playback events, a standalone browser
+cannot discover every opaque preparation/round identifier needed to drive a
+whole audio round from responses alone. Phase A tests therefore exercise that
+transport-to-controller boundary using authoritative controller inspection;
+they do not represent deferred audio delivery as implemented.
