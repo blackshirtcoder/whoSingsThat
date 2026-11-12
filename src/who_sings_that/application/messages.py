@@ -35,7 +35,6 @@ class CancelGameRequest(ClientRequest):
 class JoinGameRequest(ClientRequest):
     """Join a new member or reconnect an existing browser identity."""
 
-    game_session_id: UUID
     browser_token: str
     source_connection_id: str
     display_name: str | None = None

@@ -1,0 +1,119 @@
+:root {
+  color-scheme: light dark;
+  font-family: system-ui, sans-serif;
+  line-height: 1.4;
+}
+
+body {
+  margin: 0;
+  background: Canvas;
+  color: CanvasText;
+}
+
+main {
+  max-width: 58rem;
+  margin: 0 auto;
+  padding: 1rem;
+}
+
+section {
+  border: 1px solid color-mix(in srgb, CanvasText 25%, transparent);
+  border-radius: 0.5rem;
+  margin: 1rem 0;
+  padding: 1rem;
+}
+
+h1,
+h2,
+h3 {
+  margin-top: 0;
+}
+
+h2 {
+  font-size: 1.1rem;
+}
+
+h3 {
+  font-size: 1rem;
+  margin-bottom: 0.35rem;
+  margin-top: 1rem;
+}
+
+.scoreboard {
+  margin: 0;
+  padding-left: 2rem;
+}
+
+.scoreboard li {
+  padding: 0.15rem 0;
+}
+
+.status-grid {
+  display: grid;
+  grid-template-columns: minmax(10rem, 1fr) minmax(12rem, 2fr);
+  gap: 0.35rem 1rem;
+}
+
+.status-grid span {
+  font-weight: 650;
+}
+
+.controls,
+.form-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: end;
+  gap: 0.5rem;
+  margin-top: 0.8rem;
+}
+
+label {
+  display: grid;
+  gap: 0.2rem;
+}
+
+input {
+  min-width: 16rem;
+  padding: 0.4rem;
+}
+
+button {
+  min-height: 2.5rem;
+  padding: 0.4rem 0.75rem;
+}
+
+fieldset {
+  margin-top: 0.8rem;
+}
+
+.playlist-option {
+  display: block;
+  margin: 0.35rem 0;
+}
+
+.notice {
+  color: color-mix(in srgb, CanvasText 72%, transparent);
+}
+
+#error {
+  color: #d33;
+  min-height: 1.4em;
+}
+
+.log {
+  font-family: ui-monospace, monospace;
+  max-height: 18rem;
+  overflow: auto;
+  padding-left: 2rem;
+}
+
+@media (max-width: 36rem) {
+  .status-grid {
+    grid-template-columns: 1fr;
+  }
+
+  input {
+    min-width: 0;
+    width: 100%;
+  }
+}

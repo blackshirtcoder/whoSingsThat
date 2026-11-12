@@ -436,7 +436,6 @@ async def test_fifo_mid_song_join_is_observer_until_later_transition_c(
 
     late_member = await controller.submit_request(
         JoinGameRequest(
-            GAME_IDS[0],
             "late-token",
             "late-connection",
             "Late Player",

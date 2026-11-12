@@ -424,6 +424,17 @@ def _round_status(
 ) -> dict[str, Any]:
     active_round = game.active_round
     termination = game.round_termination
+    correction_round_id = game.scoring_correction_round_id
+    if (
+        termination is None
+        and state is GameState.ROUND_COMPLETE
+        and correction_round_id is not None
+        and game.last_completed_round is not None
+        and game.last_completed_round.active_round.round_id == correction_round_id
+    ):
+        # Transition J clears the live round facts, but the correctable completed
+        # round remains authoritative until the next successful advance.
+        termination = game.last_completed_round.termination
     pending = game.pending_audio_preparation
     responses = game.audio_preparation_responses
     buzzer = None
@@ -432,6 +443,9 @@ def _round_status(
     result: dict[str, Any] = {
         "status": state.value,
         "round_id": None if active_round is None else str(active_round.round_id),
+        "scoring_correction_round_id": (
+            None if correction_round_id is None else str(correction_round_id)
+        ),
         "preparation_id": (
             None if pending is None else str(pending.preparation_id)
         ),

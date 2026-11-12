@@ -14,6 +14,7 @@ from who_sings_that.application import (
     BuzzRequest,
     ControllerFailedError,
     GameController,
+    PlayAudioCommand,
     PlaybackTimeoutEvent,
     PlaySongRequest,
     StopAudioCommand,
@@ -506,6 +507,66 @@ async def test_delayed_timer_task_uses_remaining_authoritative_deadline(
 
 
 @pytest.mark.asyncio
+async def test_early_timer_wake_rechecks_deadline_before_posting_timeout(
+    controller_storage: tuple[Engine, Path],
+) -> None:
+    clock = MutableMonotonicClock(100.0)
+    sleep_calls: list[float] = []
+    first_wake = asyncio.Event()
+    final_wake = asyncio.Event()
+
+    async def early_waking_sleep(delay: float) -> None:
+        sleep_calls.append(delay)
+        if len(sleep_calls) == 1:
+            clock.value = 129.999
+            first_wake.set()
+            return
+        await final_wake.wait()
+
+    engine = round_complete_engine(clock)
+    database_engine, music_root = controller_storage
+    controller = ObservingController(
+        database_engine,
+        music_root,
+        game_engine=engine,
+        playback_timeout_sleep=early_waking_sleep,
+        monotonic_clock=clock,
+    )
+    controller.connection_registry.register(
+        GAME_ID, "songmaster-token", "songmaster-connection"
+    )
+    controller.connection_registry.register(
+        GAME_ID, "player-token", "player-connection"
+    )
+    await controller.start()
+    pending = await controller.submit_request(
+        PlaySongRequest(GAME_ID, "songmaster-token")
+    )
+    controller.post_system_event(
+        AudioPreparationReadyEvent(
+            GAME_ID,
+            pending.preparation_id,
+            "songmaster-token",
+            "songmaster-connection",
+        )
+    )
+    await controller.ready_processed.wait()
+    await first_wake.wait()
+    await asyncio.sleep(0)
+
+    assert engine.state is GameState.PLAYING
+    assert sleep_calls == pytest.approx([30.0, 0.001])
+    assert controller.system_event_rejections == ()
+
+    clock.value = 130.0
+    final_wake.set()
+    await controller.playback_timeout_processed.wait()
+
+    assert engine.state is GameState.AWAITING_REVEAL
+    await controller.stop()
+
+
+@pytest.mark.asyncio
 async def test_timer_expiry_posts_fifo_event_and_takes_transition_g(
     controller_storage: tuple[Engine, Path],
 ) -> None:
@@ -534,6 +595,77 @@ async def test_timer_expiry_posts_fifo_event_and_takes_transition_g(
     assert controller.latest_projection.revision > playing_revision
     assert controller.latest_projection.public is not None
     assert controller.latest_projection.public.state is GameState.AWAITING_REVEAL
+    await controller.stop()
+
+
+@pytest.mark.asyncio
+async def test_two_audio_clients_play_and_receive_timeout_stop(
+    controller_storage: tuple[Engine, Path],
+) -> None:
+    clock = MutableMonotonicClock(100.0)
+    engine = round_complete_engine(clock)
+    engine.set_audio_preference("player-token", True)
+    engine.set_browser_audio_capability("player-token", True)
+    preparation_sleep = ControlledSleep()
+    playback_sleep = ControlledSleep()
+    database_engine, music_root = controller_storage
+    controller = ObservingController(
+        database_engine,
+        music_root,
+        game_engine=engine,
+        preparation_timeout_sleep=preparation_sleep,
+        playback_timeout_sleep=playback_sleep,
+        monotonic_clock=clock,
+    )
+    controller.connection_registry.register(
+        GAME_ID, "songmaster-token", "songmaster-connection"
+    )
+    controller.connection_registry.register(
+        GAME_ID, "player-token", "player-connection"
+    )
+    controls = []
+    controller.add_audio_control_listener(controls.append)
+    await controller.start()
+
+    pending = await controller.submit_request(
+        PlaySongRequest(GAME_ID, "songmaster-token")
+    )
+    for browser_token, connection_id in (
+        ("songmaster-token", "songmaster-connection"),
+        ("player-token", "player-connection"),
+    ):
+        controller.post_system_event(
+            AudioPreparationReadyEvent(
+                GAME_ID,
+                pending.preparation_id,
+                browser_token,
+                connection_id,
+            )
+        )
+    await controller.ready_processed.wait()
+    await playback_sleep.started.wait()
+
+    plays = [command for command in controls if isinstance(command, PlayAudioCommand)]
+    assert {command.browser_token for command in plays} == {
+        "songmaster-token",
+        "player-token",
+    }
+    assert len({command.round_id for command in plays}) == 1
+
+    clock.value = 130.0
+    playback_sleep.release.set()
+    await controller.playback_timeout_processed.wait()
+
+    assert engine.state is GameState.AWAITING_REVEAL
+    stops = [command for command in controls if isinstance(command, StopAudioCommand)]
+    assert {command.browser_token for command in stops} == {
+        "songmaster-token",
+        "player-token",
+    }
+    assert {command.reason for command in stops} == {
+        AudioStopReason.PLAYBACK_TIMEOUT
+    }
+    assert {command.round_id for command in stops} == {plays[0].round_id}
     await controller.stop()
 
 

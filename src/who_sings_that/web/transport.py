@@ -73,7 +73,7 @@ _SEND_TIMEOUT_SECONDS: Final = 5.0
 
 @dataclass(frozen=True, slots=True)
 class _OutboundRecord:
-    game_session_id: UUID
+    game_session_id: UUID | None
     message: dict[str, Any]
 
 
@@ -84,6 +84,7 @@ class _OutboundMailbox:
         self._max_events = max_events
         self._state: _OutboundRecord | None = None
         self._state_after_snapshot: _OutboundRecord | None = None
+        self._discovery: _OutboundRecord | None = None
         self._events: deque[_OutboundRecord] = deque()
         self._controls: deque[_OutboundRecord] = deque()
         self._wake = asyncio.Event()
@@ -95,6 +96,7 @@ class _OutboundMailbox:
         return (
             (1 if self._state is not None else 0)
             + (1 if self._state_after_snapshot is not None else 0)
+            + (1 if self._discovery is not None else 0)
             + len(self._events)
             + len(self._controls)
         )
@@ -129,6 +131,18 @@ class _OutboundMailbox:
         else:
             self._state = record
         self._wake.set()
+
+    def put_discovery(self, update: AuthoritativeProjectionUpdate | None) -> None:
+        if self._closed:
+            return
+        self._discovery = _OutboundRecord(
+            game_session_id=None,
+            message=_game_discovery_message(update),
+        )
+        self._wake.set()
+
+    def clear_discovery(self) -> None:
+        self._discovery = None
 
     def put_event(
         self,
@@ -178,10 +192,19 @@ class _OutboundMailbox:
                 self._state = self._state_after_snapshot
                 self._state_after_snapshot = None
                 return record
+            if self._discovery is not None:
+                record = self._discovery
+                self._discovery = None
+                return record
             if self._events:
                 return self._events.popleft()
             self._wake.clear()
-            if self._controls or self._state is not None or self._events:
+            if (
+                self._controls
+                or self._state is not None
+                or self._discovery is not None
+                or self._events
+            ):
                 continue
             await self._wake.wait()
 
@@ -189,6 +212,7 @@ class _OutboundMailbox:
         self._closed = True
         self._state = None
         self._state_after_snapshot = None
+        self._discovery = None
         self._events.clear()
         self._controls.clear()
         self._wake.set()
@@ -249,6 +273,7 @@ class TransportConnections:
                     "membership synchronization does not match this socket"
                 )
             session.mailbox.put_state("state_snapshot", update, recipient)
+            session.mailbox.clear_discovery()
             if update.invalidated:
                 return
             key = (game_id, token)
@@ -289,6 +314,30 @@ class TransportConnections:
                     overloaded.append(session)
                     break
         return tuple(overloaded)
+
+    def publish_discovery(
+        self,
+        update: AuthoritativeProjectionUpdate | None,
+    ) -> None:
+        """Coalesce public status for identity-established nonmembers."""
+
+        if not self._accepting:
+            return
+        for session in self._sessions.values():
+            if session.browser_token is not None and session.game_session_id is None:
+                session.mailbox.put_discovery(update)
+
+    def publish_discovery_to(
+        self,
+        session: TransportSession,
+        update: AuthoritativeProjectionUpdate | None,
+    ) -> None:
+        if (
+            self._accepting
+            and session.browser_token is not None
+            and session.game_session_id is None
+        ):
+            session.mailbox.put_discovery(update)
 
     def publish_audio(
         self,
@@ -446,6 +495,7 @@ class WebSocketTransport:
     ) -> None:
         """Controller callback: enqueue only; never perform network I/O."""
 
+        self.connections.publish_discovery(update)
         for session in self.connections.publish(update):
             if session.overload_task is None or session.overload_task.done():
                 session.overload_task = asyncio.create_task(
@@ -574,6 +624,10 @@ class WebSocketTransport:
                     "identity_already_established",
                     "This transport already has a browser identity.",
                 )
+            self.connections.publish_discovery_to(
+                session,
+                self._controller.latest_projection,
+            )
             return {"browser_token": session.browser_token}
 
         token = session.browser_token
@@ -601,15 +655,14 @@ class WebSocketTransport:
             )
 
         if operation == "join_game":
-            game_id = payload.game_session_id
             synchronized = await self._controller.submit_membership_request(
                 JoinGameRequest(
-                    game_id,
                     token,
                     session.connection_id,
                     payload.display_name,
                 )
             )
+            game_id = synchronized.update.game_session_id
             await self.connections.bind_membership(
                 session,
                 game_id,
@@ -834,6 +887,39 @@ def _membership_result(
     }
 
 
+def _game_discovery_message(
+    update: AuthoritativeProjectionUpdate | None,
+) -> dict[str, Any]:
+    public = None if update is None else update.public
+    songmaster_name = None
+    if public is not None:
+        songmaster = next(
+            (
+                participant
+                for participant in public.participants
+                if participant.public_participant_id
+                == public.songmaster_public_participant_id
+            ),
+            None,
+        )
+        if songmaster is not None:
+            songmaster_name = songmaster.display_name
+    payload = {
+        "schema_version": 1,
+        "revision": 0 if update is None else update.revision,
+        "active_game_exists": public is not None,
+        "joinable": public is not None and not public.finished,
+        "state": "no_game" if public is None else public.state.value,
+        "songmaster_display_name": songmaster_name,
+    }
+    return {
+        "version": PROTOCOL_VERSION,
+        "request_id": None,
+        "type": "game_discovery",
+        "payload": payload,
+    }
+
+
 def _command_result(
     update: AuthoritativeProjectionUpdate,
     operation: str,
@@ -918,6 +1004,7 @@ def _audio_control_message(command: AudioControlCommand) -> dict[str, Any]:
 
 _ERROR_CODES_BY_CLASS: Final[dict[str, str]] = {
     "ActiveGameExistsError": "game_unavailable",
+    "NoActiveGameError": "game_unavailable",
     "DuplicatePlayerNameError": "duplicate_player_name",
     "UnknownGameMemberError": "invalid_membership",
     "StaleGameSessionError": "wrong_game",

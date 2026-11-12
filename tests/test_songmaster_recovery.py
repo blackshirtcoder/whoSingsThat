@@ -515,7 +515,7 @@ async def test_zero_connected_expiry_suspends_then_first_new_join_resumes(
     assert controller.songmaster_reconnect_grace_active is False
 
     member = await controller.submit_request(
-        JoinGameRequest(GAME_ID, "new", "new-a", "New Player")
+        JoinGameRequest("new", "new-a", "New Player")
     )
     assert member.browser_token == "new"
     assert game.songmaster_browser_token == "new"
@@ -542,7 +542,7 @@ async def test_solo_game_can_resume_after_indefinite_suspension(
     )
     await controller._queue.join()
 
-    await controller.submit_request(JoinGameRequest(GAME_ID, "sm", "sm-returned"))
+    await controller.submit_request(JoinGameRequest("sm", "sm-returned"))
     game = engine.active_game
     assert game is not None
     assert game.songmaster_browser_token == "sm"

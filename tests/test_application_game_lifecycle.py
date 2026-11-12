@@ -184,7 +184,7 @@ async def test_controller_cancel_rejections_and_success_keep_consumer_running(
         CreateGameRequest("songmaster-token", "Songmaster", "connection-1")
     )
     await controller.submit_request(
-        JoinGameRequest(GAME_IDS[0], "player-token", "player-connection", "Player")
+        JoinGameRequest("player-token", "player-connection", "Player")
     )
 
     with pytest.raises(StaleGameSessionError):

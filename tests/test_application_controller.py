@@ -241,7 +241,6 @@ async def test_expected_request_rejection_does_not_stop_later_processing(
 
     member = await controller.submit_request(
         JoinGameRequest(
-            game.game_session_id,
             "player-token",
             "player-connection",
             "Player",
@@ -463,7 +462,7 @@ async def test_cancelled_waiter_does_not_cancel_accepted_authoritative_work(
     controller.release_consumer.set()
     # A later request is a barrier proving the abandoned Create Game completed.
     member = await controller.submit_request(
-        JoinGameRequest(GAME_ID, "player-token", "player-connection", "Player")
+        JoinGameRequest("player-token", "player-connection", "Player")
     )
 
     assert member.browser_token == "player-token"
@@ -516,7 +515,6 @@ async def test_dispatches_membership_playlist_and_connection_operations(
 
     player = await controller.submit_request(
         JoinGameRequest(
-            game.game_session_id,
             "player-token",
             "connection-1",
             "Player",
@@ -555,7 +553,7 @@ async def test_dispatches_membership_playlist_and_connection_operations(
         )
     )
     reconnected = await controller.submit_request(
-        JoinGameRequest(game.game_session_id, "player-token", "connection-2")
+        JoinGameRequest("player-token", "connection-2")
     )
 
     assert player is reconnected

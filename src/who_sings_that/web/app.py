@@ -3,13 +3,17 @@
 import logging
 from collections.abc import Callable
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI, Request, WebSocket
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 from sqlalchemy import Engine
 
 from who_sings_that.application import GameController
 from who_sings_that.database import (
     create_sqlite_engine,
+    list_playlists,
     upgrade_database,
 )
 
@@ -18,6 +22,7 @@ from .media import media_response
 from .transport import WebSocketTransport
 
 ControllerFactory = Callable[[Engine, ServerSettings], GameController]
+_STATIC_DIRECTORY = Path(__file__).with_name("static")
 
 
 def create_app(
@@ -55,6 +60,30 @@ def create_app(
 
     application = FastAPI(title="Who Sings That?", lifespan=lifespan)
 
+    @application.get("/audio-test", include_in_schema=False)
+    async def audio_test_page() -> FileResponse:
+        return FileResponse(
+            _STATIC_DIRECTORY / "audio-test.html",
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @application.get("/api/playlists", include_in_schema=False)
+    async def diagnostic_playlist_metadata(request: Request) -> JSONResponse:
+        playlists = list_playlists(request.app.state.database_engine)
+        return JSONResponse(
+            {
+                "playlists": [
+                    {
+                        "playlist_id": playlist.playlist_id,
+                        "name": playlist.name,
+                        "song_count": playlist.song_count,
+                    }
+                    for playlist in playlists
+                ]
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+
     @application.websocket("/ws")
     async def websocket_endpoint(websocket: WebSocket) -> None:
         await websocket.app.state.websocket_transport.handle(websocket)
@@ -65,6 +94,12 @@ def create_app(
         opaque_capability: str,
     ):
         return await media_response(request, opaque_capability)
+
+    application.mount(
+        "/static",
+        StaticFiles(directory=_STATIC_DIRECTORY),
+        name="static",
+    )
 
     return application
 

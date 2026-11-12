@@ -1393,22 +1393,26 @@ class GameController:
         message: JoinGameRequest,
         received_at_monotonic: float,
     ) -> object:
-        self._require_target_game(message.game_session_id)
+        game = self._game_engine.active_game
+        if game is None:
+            # Let the domain retain authority over the public lifecycle error.
+            return self._game_engine.join_game(
+                message.browser_token,
+                message.display_name,
+            )
+        game_session_id = game.game_session_id
         status = self._connection_registry.registration_status(
-            message.game_session_id,
+            game_session_id,
             message.browser_token,
             message.source_connection_id,
         )
         prior_state = self._game_engine.state
         handled = self._prepare_songmaster_connection(
-            message.game_session_id,
+            game_session_id,
             message.browser_token,
             status,
             received_at_monotonic,
         )
-        game = self._game_engine.active_game
-        if game is None:  # pragma: no cover - target validation established it
-            raise DomainInvariantError("Join Game requires an active game")
         resume_indefinite = (
             game.songmaster_recovery is not None
             and game.songmaster_recovery.status
@@ -1426,7 +1430,7 @@ class GameController:
                 resume_indefinite_as_songmaster=resume_indefinite,
             )
         self._connection_registry.register(
-            message.game_session_id,
+            game_session_id,
             message.browser_token,
             message.source_connection_id,
         )
@@ -1692,12 +1696,16 @@ class GameController:
         round_id: UUID,
         deadline_monotonic: float,
     ) -> None:
-        remaining_seconds = max(
-            0.0,
-            deadline_monotonic - self._game_engine.monotonic_time(),
-        )
         try:
-            await self._playback_timeout_sleep(remaining_seconds)
+            while (
+                remaining_seconds := (
+                    deadline_monotonic - self._game_engine.monotonic_time()
+                )
+            ) > 0.0:
+                # Event-loop timers may fire up to one clock-resolution early.
+                # Recheck the authoritative clock so an early wake cannot post
+                # the one-shot event before the domain will accept it.
+                await self._playback_timeout_sleep(remaining_seconds)
         except asyncio.CancelledError:
             return
         try:

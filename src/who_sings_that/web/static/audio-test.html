@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Who Sings That? — Audio Diagnostic</title>
+    <link rel="stylesheet" href="/static/audio-test.css">
+  </head>
+  <body>
+    <main>
+      <h1>Who Sings That? Audio Diagnostic</h1>
+      <p class="notice">Developer utility. It uses the real game controller and protected media path.</p>
+
+      <section>
+        <h2>Connection and identity</h2>
+        <div class="status-grid">
+          <span>Socket</span><output id="connection-status">disconnected</output>
+          <span>Browser identity</span><output id="identity-status">not established</output>
+          <span>Game</span><output id="game-id">none</output>
+        </div>
+        <div class="controls">
+          <button id="connect" type="button">Connect</button>
+          <button id="disconnect" type="button" disabled>Disconnect</button>
+        </div>
+        <div class="form-row">
+          <label>Display name <input id="display-name" maxlength="24" autocomplete="nickname"></label>
+          <button id="create-game" type="button" disabled>Create Game</button>
+          <button id="join-game" type="button" disabled>Join Game</button>
+        </div>
+      </section>
+
+      <section>
+        <h2>Authoritative game</h2>
+        <div class="status-grid">
+          <span>State</span><output id="game-state">no game</output>
+          <span>Songmaster</span><output id="songmaster">—</output>
+          <span>Winning buzzer</span><output id="winning-buzzer">—</output>
+          <span>Selected playlists</span><output id="selected-playlists">none</output>
+          <span>Displayed song</span><output id="displayed-song">hidden / none</output>
+        </div>
+        <h3>Scores</h3>
+        <ol id="scoreboard" class="scoreboard">
+          <li>No players</li>
+        </ol>
+        <fieldset id="playlist-list" disabled>
+          <legend>Development playlists</legend>
+          <p>Loading playlist metadata…</p>
+        </fieldset>
+        <div class="controls">
+          <button id="start-game" type="button" disabled>Start Game</button>
+          <button id="play-song" type="button" disabled>Play Next / Finish</button>
+          <button id="ack-failure" type="button" disabled>Acknowledge Prepare Failure</button>
+          <button id="buzz" type="button" disabled>Buzz</button>
+          <button id="reveal" type="button" disabled>Reveal</button>
+          <button id="end-game" type="button" disabled>End Game</button>
+          <button id="cancel-game" type="button" disabled>Cancel Game</button>
+          <button id="close-game" type="button" disabled>Close Game</button>
+        </div>
+        <div id="scoring" class="controls" hidden>
+          <span id="scoring-label">Accept score:</span>
+          <button type="button" data-score="artist">Artist</button>
+          <button type="button" data-score="title">Title</button>
+          <button type="button" data-score="both">Both</button>
+          <button type="button" data-score="neither">Neither</button>
+        </div>
+      </section>
+
+      <section>
+        <h2>Browser audio</h2>
+        <div class="status-grid">
+          <span>Audio preference</span><output id="audio-preference">false</output>
+          <span>Connection capability</span><output id="audio-capability">false</output>
+          <span>Local lifecycle</span><output id="audio-state">idle</output>
+          <span>Local detail</span><output id="audio-detail">Audio is not enabled.</output>
+        </div>
+        <div class="controls">
+          <button id="enable-audio" type="button" disabled>Enable audio on this device</button>
+          <button id="disable-audio" type="button" disabled>Disable local audio</button>
+        </div>
+        <p class="notice">Enabling plays a brief audible confirmation tone. It does not begin a game round.</p>
+      </section>
+
+      <section>
+        <h2>Safe event log</h2>
+        <p id="error" role="alert"></p>
+        <ol id="event-log" class="log" aria-live="polite"></ol>
+      </section>
+    </main>
+    <script type="module" src="/static/audio-test.js"></script>
+  </body>
+</html>

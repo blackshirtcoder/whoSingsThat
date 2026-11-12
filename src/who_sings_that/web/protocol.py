@@ -45,7 +45,6 @@ class CreateGamePayload(ProtocolModel):
 
 
 class JoinGamePayload(ProtocolModel):
-    game_session_id: UUID
     display_name: DisplayName
 
 

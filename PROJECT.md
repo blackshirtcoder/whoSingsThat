@@ -2094,10 +2094,17 @@ locally. Supplying a retained token establishes only a browser-token claim. It
 does not create membership or prove a display name.
 
 `create_game` creates fresh membership and makes its member Songmaster.
-`join_game` creates membership under the active game using normal immutable-name
+`join_game` carries only a display name; the serialized controller resolves the
+one current active game and creates membership using normal immutable-name
 validation. `reconnect` accepts a game UUID and proves membership only when the
 claimed token already belongs to that current game. Unknown tokens and stale
 game UUIDs are rejected. Reconnect never accepts or changes a display name.
+
+After identity establishment, nonmember sockets receive coalesced
+`game_discovery` records derived from authoritative projection revisions. They
+contain only active/joinable status, lifecycle state, and the Songmaster display
+name. They expose no game UUID, browser token, playlist, score, song, or media
+capability data.
 
 After successful create, join, or reconnect, the socket is bound to that
 game-local membership. Controller registration/replacement remains the
@@ -2314,8 +2321,11 @@ metadata, not track membership. Settings are copied primitive values.
 previous revealed answer through `ROUND_COMPLETE` and `AUDIO_PREPARING`; the
 new current answer is blank in `PLAYING` and `AWAITING_REVEAL`; Reveal makes it
 visible in `SCORING` or the completed-round display. `current_round` contains
-only safe status, opaque preparation/round UUIDs, public buzzer identity,
-termination status, preparation counts, and provisional adjudication facts.
+only safe status, opaque preparation/active-round/correction-round UUIDs,
+public buzzer identity, termination status, preparation counts, and provisional
+adjudication facts. During an open `ROUND_COMPLETE` correction window, the
+public buzzer identity and `scoring_correction_round_id` refer to that completed
+round; both clear at the successful next-song advance boundary.
 
 ### 52.4 Recipient facts
 
@@ -2582,3 +2592,174 @@ Phase C2 must implement browser preload/readiness, autoplay unlocking, offset
 seeking, actual Play/Stop behavior, and UI error reporting. C1 deliberately
 does not fabricate READY, execute JavaScript audio, or resynchronize playback
 after reconnect.
+
+## 54. Phase C2 Browser Audio and Diagnostic Harness
+
+### 54.1 Browser modules and ownership
+
+Phase C2 adds three small vanilla-JavaScript modules under the FastAPI-served
+`/static` path:
+
+- `audio-player.js` owns one reusable `HTMLAudioElement` and its local lifecycle
+  (`idle`, `preparing`, `ready`, `playing`, `stopped`, and `failed`);
+- `audio-protocol.js` routes unsolicited Prepare/Play/Stop controls and creates
+  the existing preparation READY/FAILED commands; and
+- `socket-client.js` owns protocol envelopes, request-ID correlation, retained
+  browser identity, conservative reconnect, and unsolicited-message routing.
+
+The audio player owns no authoritative game state, scoring, or transition
+decision. The socket helper treats server connection IDs as informational and
+never creates one. The diagnostic UI in `audio-test.js` only renders projections
+and invokes the existing public operations.
+
+### 54.2 Autoplay initialization, preference, capability, and READY
+
+`Enable audio on this device` calls the media initialization method directly
+from its click handler. The method plays a brief, low-volume audible confirmation
+tone generated in memory. Capability is set locally only after the media element
+provides playback evidence; a resolved arbitrary Promise or a silent workaround
+is not treated as proof. Failure leaves capability false and shows a local safe
+error. The tone is not a game track and does not start a round.
+
+After that output check, the diagnostic sends the existing
+`set_audio_preference(true)` and then `set_audio_capability(true)` commands.
+These remain different facts:
+
+- preference says that the member wants this device selected as an audio target;
+- capability says that this authoritative connection has established a usable
+  browser output path; and
+- READY says that one particular preparation identity has additionally loaded,
+  sought, and become promptly playable.
+
+Capability and local media are reset on every socket loss, explicit disconnect,
+connection replacement, or session reset. Reconnect retains the server-side
+preference but requires another explicit audio-enable gesture before a later
+round. Disabling is exposed only in `LOBBY` and `ROUND_COMPLETE`, where the
+existing preference operation is legal.
+
+### 54.3 Prepare, Play, Stop, and cleanup
+
+Prepare validates the game/preparation UUIDs, numeric settings, and the opaque
+same-origin `/media/...` URL. It assigns the URL directly to the reusable media
+element with `preload=auto`, allowing the browser to use C1 byte ranges without
+copying the MP3 into a JavaScript buffer. It waits for metadata, seeks to the
+authoritative effective offset, waits for `seeked` when necessary, and requires
+`canplay`/future-data evidence. It never calls `play()` during preparation.
+Only then does the protocol router send `audio_preparation_ready`; load, seek,
+media, or local deadline failure sends `audio_preparation_failed` with only the
+preparation UUID.
+
+Every preparation has a generation and exact game/preparation identity. A new
+preparation, Stop, disconnect, or reset removes listeners, cancels timers,
+halts loading, clears the source, and prevents late events from reporting READY.
+The local deadline uses the supplied timeout and cannot extend the server's
+authoritative five-second collection deadline; a response that nevertheless
+arrives too late remains subject to normal server rejection.
+
+Play is accepted only for the currently READY game/preparation identity. It
+reasserts the effective offset, invokes the real media-element `play()` method,
+and enters local `playing` only after that Promise succeeds. The supplied UTC
+start is advisory and is not used for clock synchronization, future scheduling,
+or scoring. The browser starts promptly on receipt; the server monotonic interval
+remains authoritative.
+
+Stop checks the game, preparation, and optional round identities. Matching Stop
+increments the generation before pausing and releasing the source, so a pending
+Play Promise cannot restart output. Duplicate Stop is harmless, while an old
+Stop cannot affect a newer preparation/round. Socket loss and page navigation
+perform the same immediate local halt. No interrupted round is resumed after
+reconnect.
+
+After successful Play, a local failsafe pauses and releases media after the
+supplied duration if the authoritative Stop is delayed or lost. Natural media
+completion stops locally and is reported as an issue rather than proof that the
+whole interval played. A post-READY media error or rejected Play Promise becomes
+a local failure. Protocol version 1 has no genuine post-READY playback-failure
+operation, so C2 documents and displays that condition instead of misusing
+preparation FAILED or inventing a game transition.
+
+### 54.4 WebSocket lifecycle and storage
+
+The browser stores only the opaque browser token and current game UUID in
+`localStorage`. On connect it waits for the server-generated
+`transport_connected`, establishes/restores the token, and uses the existing
+`reconnect` operation for remembered membership. Create, Join, and every other
+command use unique request IDs and resolve only their matching result. State,
+events, and audio controls use separate unsolicited routes.
+
+Unexpected closure immediately resets audio. Automatic reconnect is bounded to
+four exponential-backoff attempts (0.5, 1, 2, and 4 seconds) and stops on page
+unload, explicit disconnect, or the private connection-replaced close code.
+Successful reconnect does not restore old playback or capability.
+
+Diagnostic logging records only operation/message type, safe state/revision,
+and public event category. It never prints the browser token, media URL, raw
+catalog path, filename, or pre-reveal answer. DOM display uses `textContent` and
+the answer is shown only when it is present in an authoritative revealed
+projection.
+
+### 54.5 Diagnostic page and playlist discovery
+
+`GET /audio-test` serves the developer harness from the existing FastAPI
+process. It provides Connect/Disconnect, identity restore, Create/Join, current
+state and Songmaster display, separate preference/capability display, the local
+audio lifecycle, playlist selection, Start Game, Play Song, preparation-failure
+acknowledgement, Buzz, Reveal, basic score acceptance, End/Cancel/Close, and a
+bounded safe event log. It is deliberately not the phone game interface.
+
+`GET /api/playlists` is the smallest read-only addition needed to select the
+existing development library without hand-editing an ID. It returns only
+playlist ID, display name, and song count, sorted by the existing database read
+function. It returns no description, tracks, artist/title, catalog paths, deck
+contents, or media authorization. Selection still uses `select_playlist`, Start
+Game still uses the normal persistent-playlist resolver and deck rules, and
+audio still arrives only through C1 capabilities.
+
+### 54.6 Manual real-media test
+
+Use the already-populated catalog database and its matching music root; opening
+the page never scans or changes either:
+
+```bash
+WST_DATABASE_PATH=/absolute/path/to/wst.sqlite3 \
+WST_MUSIC_ROOT=/absolute/path/to/music \
+uv run python -m who_sings_that.web
+```
+
+Then:
+
+1. Open `http://127.0.0.1:8000/audio-test` in Firefox (or use the configured LAN
+   host from the intended playback device).
+2. Press **Connect**. The page establishes a new opaque browser identity or
+   restores the retained one; the token is never displayed.
+3. Enter a display name and press **Create Game**. On another browser, connect,
+   enter a display name, and use **Join Game** when discovery reports the active
+   game as joinable; no game UUID entry is required.
+4. Select one of the names under **Development playlists**. Do not paste or
+   hardcode a playlist ID.
+5. Press **Enable audio on this device** and confirm that the short tone is
+   audible and both preference and connection capability become `true`.
+6. Press **Start Game**, then **Play Next / Finish**. Observe `preparing` and
+   `ready`; transition E then supplies Play and the authorized MP3 should begin
+   at the projected effective offset.
+7. Press **Buzz** while eligible to exercise authoritative Stop immediately, or
+   let the configured interval expire to observe server Stop/local failsafe.
+   Reveal and the basic score buttons can complete the round if desired.
+
+Automated tests use controllable media and socket fakes and require no sound
+hardware. They do not prove audible playback. Phase C2 was not manually verified
+against a physical audio device as part of automated implementation.
+
+### 54.7 Compatibility and remaining UI work
+
+The implementation targets current Firefox and Chromium browsers with ES
+modules, `HTMLAudioElement`, Blob/Object URL support for the confirmation tone,
+Promises, and ordinary media events. Readiness event timing and buffering remain
+browser/network dependent, and LAN clients still have no sample-accurate shared
+start. Safari/iOS behavior and background-tab/device-route changes have not yet
+been physically verified. A successful confirmation tone cannot guarantee that
+a later MP3 or output-device change will work; every track still has to prepare.
+
+The production phone-first views, complete state-dependent controls and
+scoreboard, polished Songmaster dashboard, playlist administration, history UI,
+and broader browser/device usability testing remain future work.
