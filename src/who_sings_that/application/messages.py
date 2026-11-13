@@ -3,7 +3,7 @@
 from dataclasses import dataclass
 from uuid import UUID
 
-from who_sings_that.domain import ScoringChoice
+from who_sings_that.domain import GameSettings, ScoringChoice
 
 
 class ClientRequest:
@@ -101,6 +101,16 @@ class SetAudioPreferenceRequest(ClientRequest):
     game_session_id: UUID
     requesting_browser_token: str
     audio_enabled: bool
+
+
+@dataclass(frozen=True, slots=True)
+class SetGameSettingsRequest(ClientRequest):
+    """Propose or confirm authoritative per-game settings."""
+
+    game_session_id: UUID
+    requesting_browser_token: str
+    settings: GameSettings
+    duration_warning_confirmation_token: UUID | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -308,6 +318,7 @@ __all__ = [
     "SelectPlaylistRequest",
     "SelectProvisionalScoreRequest",
     "SetAudioPreferenceRequest",
+    "SetGameSettingsRequest",
     "SongmasterReconnectGraceExpiredEvent",
     "StartGameRequest",
     "SystemEvent",

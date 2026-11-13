@@ -413,6 +413,135 @@ async def test_handshake_identity_and_protocol_rejections_keep_socket_usable(
 
 
 @pytest.mark.asyncio
+async def test_authoritative_settings_protocol_permissions_warning_and_broadcast(
+    running_server: RunningServer,
+) -> None:
+    songmaster, contestant, *_ = await _create_two_player_game(running_server)
+    try:
+        initial = await _next_state_after(contestant, state="lobby")
+        unauthorized = await _command(
+            contestant,
+            "set_game_settings",
+            {
+                "playback_offset_seconds": 5,
+                "playback_duration_seconds": 25,
+                "speed_bonus_plateau_percent": 20,
+            },
+        )
+        assert unauthorized["error"]["code"] == "not_songmaster"
+
+        malformed = await _command(
+            songmaster,
+            "set_game_settings",
+            {
+                "playback_offset_seconds": 5,
+                "playback_duration_seconds": "25",
+                "speed_bonus_plateau_percent": 20,
+            },
+        )
+        assert malformed["error"]["code"] == "invalid_command"
+
+        changed = await _command(
+            songmaster,
+            "set_game_settings",
+            {
+                "playback_offset_seconds": 5,
+                "playback_duration_seconds": 25,
+                "speed_bonus_plateau_percent": 20.5,
+            },
+        )
+        assert changed["result"]["applied"] is True
+        state = await _next_state_after(
+            contestant,
+            initial["payload"]["revision"],
+            state="lobby",
+        )
+        assert state["payload"]["settings"] == {
+            "playback_offset_seconds": 5,
+            "playback_duration_seconds": 25,
+            "speed_bonus_plateau_percent": "20.5",
+        }
+        assert (
+            "set_game_settings"
+            not in state["payload"]["recipient"]["available_songmaster_operations"]
+        )
+
+        playlist_id = _add_secret_playlist(
+            running_server,
+            include_second_track=True,
+        )
+        assert (
+            await _command(songmaster, "select_playlist", {"playlist_id": playlist_id})
+        )["ok"]
+        assert (await _command(songmaster, "start_game"))["ok"]
+        started = await _next_state_after(
+            contestant,
+            state["payload"]["revision"],
+            state="round_complete",
+        )
+
+        warning = await _command(
+            songmaster,
+            "set_game_settings",
+            {
+                "playback_offset_seconds": 300,
+                "playback_duration_seconds": 121,
+                "speed_bonus_plateau_percent": 20.5,
+            },
+        )
+        assert warning["ok"] is True
+        assert warning["result"]["applied"] is False
+        warning_facts = warning["result"]["warning"]
+        assert warning_facts["code"] == "multiple_settings_warnings"
+        assert warning_facts["remaining_song_count"] == 2
+        assert warning_facts["ineligible_song_count"] == 2
+        assert warning_facts["playback_offset_seconds"] == 300
+        assert warning_facts["threshold_seconds"] == 120
+        assert warning_facts["conditions"] == [
+            {
+                "code": "duration_ineligible_majority",
+                "remaining_song_count": 2,
+                "ineligible_song_count": 2,
+            },
+            {
+                "code": "large_playback_offset",
+                "playback_offset_seconds": 300,
+                "threshold_seconds": 120,
+            },
+        ]
+        serialized = json.dumps(warning)
+        assert "Secret Artist" not in serialized
+        assert "Secret Title" not in serialized
+        assert "relative_path" not in serialized
+        assert "track_id" not in serialized
+
+        confirmed = await _command(
+            songmaster,
+            "set_game_settings",
+            {
+                "playback_offset_seconds": 300,
+                "playback_duration_seconds": 121,
+                "speed_bonus_plateau_percent": 20.5,
+                "duration_warning_confirmation_token": warning_facts[
+                    "confirmation_token"
+                ],
+            },
+        )
+        assert confirmed["result"]["applied"] is True
+        exhausted = await _next_state_after(
+            contestant,
+            started["payload"]["revision"],
+            state="round_complete",
+        )
+        assert exhausted["payload"]["settings"]["playback_duration_seconds"] == 121
+        assert exhausted["payload"]["settings"]["playback_offset_seconds"] == 300
+        assert exhausted["payload"]["deck"]["exhausted"] is True
+    finally:
+        await songmaster.close()
+        await contestant.close()
+
+
+@pytest.mark.asyncio
 async def test_oversized_application_message_is_rejected_without_losing_socket(
     running_server: RunningServer,
 ) -> None:
@@ -1321,22 +1450,24 @@ async def test_pre_reveal_payloads_are_secret_and_provisional_score_replaces(
             == round_id
         )
         assert (
-            committed["payload"]["current_round"][
-                "buzzer_public_participant_id"
-            ]
+            committed["payload"]["current_round"]["buzzer_public_participant_id"]
             == contestant_id
         )
-        assert "correct_score" not in committed["payload"]["recipient"][
-            "available_songmaster_operations"
-        ]
+        assert (
+            "correct_score"
+            not in committed["payload"]["recipient"]["available_songmaster_operations"]
+        )
 
         songmaster_complete = await _next_state_after(
             songmaster,
             state="round_complete",
         )
-        assert "correct_score" in songmaster_complete["payload"]["recipient"][
-            "available_songmaster_operations"
-        ]
+        assert (
+            "correct_score"
+            in songmaster_complete["payload"]["recipient"][
+                "available_songmaster_operations"
+            ]
+        )
 
         assert (
             await _command(
@@ -1418,15 +1549,11 @@ async def test_pre_reveal_payloads_are_secret_and_provisional_score_replaces(
             state="playing",
         )
         assert (
-            next_playing["payload"]["current_round"][
-                "buzzer_public_participant_id"
-            ]
+            next_playing["payload"]["current_round"]["buzzer_public_participant_id"]
             is None
         )
         assert (
-            next_playing["payload"]["current_round"][
-                "scoring_correction_round_id"
-            ]
+            next_playing["payload"]["current_round"]["scoring_correction_round_id"]
             is None
         )
         next_payload = json.dumps(next_playing["payload"])

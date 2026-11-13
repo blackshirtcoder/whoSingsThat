@@ -82,6 +82,7 @@ from .messages import (
     SelectPlaylistRequest,
     SelectProvisionalScoreRequest,
     SetAudioPreferenceRequest,
+    SetGameSettingsRequest,
     SongmasterReconnectGraceExpiredEvent,
     StartGameRequest,
     SystemEvent,
@@ -764,6 +765,15 @@ class GameController:
             return self._game_engine.set_audio_preference(
                 message.requesting_browser_token,
                 message.audio_enabled,
+            )
+        if isinstance(message, SetGameSettingsRequest):
+            self._require_target_game(message.game_session_id)
+            return self._game_engine.set_game_settings(
+                message.requesting_browser_token,
+                message.settings,
+                duration_warning_confirmation_token=(
+                    message.duration_warning_confirmation_token
+                ),
             )
         if isinstance(message, TransferSongmasterRequest):
             self._require_target_game(message.game_session_id)
@@ -1893,6 +1903,7 @@ def _connection_bound_request_scope(request: ClientRequest) -> tuple[UUID, str]:
             SelectPlaylistRequest,
             SelectProvisionalScoreRequest,
             SetAudioPreferenceRequest,
+            SetGameSettingsRequest,
             StartGameRequest,
             TransferSongmasterRequest,
             TransferSongmasterByPublicIdRequest,

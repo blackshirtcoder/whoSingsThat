@@ -3,7 +3,14 @@
 from typing import Annotated, Any, Final
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, StrictBool, StringConstraints
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    StrictBool,
+    StrictFloat,
+    StrictInt,
+    StringConstraints,
+)
 
 PROTOCOL_VERSION: Final = 1
 
@@ -60,6 +67,13 @@ class AudioPreferencePayload(ProtocolModel):
     audio_enabled: StrictBool
 
 
+class GameSettingsPayload(ProtocolModel):
+    playback_offset_seconds: StrictInt
+    playback_duration_seconds: StrictInt
+    speed_bonus_plateau_percent: StrictInt | StrictFloat
+    duration_warning_confirmation_token: UUID | None = None
+
+
 class AudioCapabilityPayload(ProtocolModel):
     browser_audio_usable: StrictBool
 
@@ -92,6 +106,7 @@ PAYLOAD_MODELS: Final[dict[str, type[ProtocolModel]]] = {
     "deselect_playlist": PlaylistPayload,
     "start_game": EmptyPayload,
     "set_audio_preference": AudioPreferencePayload,
+    "set_game_settings": GameSettingsPayload,
     "set_audio_capability": AudioCapabilityPayload,
     "play_song": EmptyPayload,
     "audio_preparation_ready": PreparationPayload,

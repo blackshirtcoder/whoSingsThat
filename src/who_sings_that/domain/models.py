@@ -62,9 +62,7 @@ class SongmasterRecoveryResolution(Enum):
 
     ORIGINAL_RECONNECTED = "original_reconnected"
     AUTOMATIC_FAILOVER = "automatic_failover"
-    RESUMED_AFTER_INDEFINITE_SUSPENSION = (
-        "resumed_after_indefinite_suspension"
-    )
+    RESUMED_AFTER_INDEFINITE_SUSPENSION = "resumed_after_indefinite_suspension"
 
 
 class RoundTerminationReason(Enum):
@@ -90,9 +88,7 @@ class SongmasterEventReason(Enum):
     MANUAL_TRANSFER = "manual_transfer"
     AUTOMATIC_FAILOVER = "automatic_failover"
     ORIGINAL_RECONNECTED = "original_reconnected"
-    RESUMED_AFTER_INDEFINITE_SUSPENSION = (
-        "resumed_after_indefinite_suspension"
-    )
+    RESUMED_AFTER_INDEFINITE_SUSPENSION = "resumed_after_indefinite_suspension"
 
 
 class InvalidPlayerNameError(ValueError):
@@ -151,6 +147,44 @@ class GameSettings:
     playback_offset_seconds: int = 30
     playback_duration_seconds: int = 30
     speed_bonus_plateau_percent: Decimal = Decimal(10)
+
+
+@dataclass(frozen=True, slots=True)
+class DurationChangeWarning:
+    """Safe confirmation facts for a settings proposal that was not applied.
+
+    The historical name is retained because duration eligibility was the first
+    warning condition.  ``warning_codes`` makes the token cover every advisory
+    condition identified for the proposal.
+    """
+
+    confirmation_token: UUID
+    warning_codes: tuple[str, ...]
+    remaining_song_count: int | None = None
+    ineligible_song_count: int | None = None
+    playback_offset_seconds: int | None = None
+    playback_offset_warning_threshold_seconds: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class PendingGameSettingsConfirmation:
+    """Internal snapshot binding an opaque confirmation to authoritative facts."""
+
+    confirmation_token: UUID
+    proposed_settings: GameSettings
+    deck_pointer: int
+    remaining_song_count: int
+    ineligible_song_count: int
+    warning_codes: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class GameSettingsMutationResult:
+    """Outcome of an authoritative settings proposal or confirmation."""
+
+    applied: bool
+    settings: GameSettings
+    warning: DurationChangeWarning | None = None
 
 
 @dataclass(slots=True)
@@ -474,6 +508,7 @@ class GameSession:
     settings: GameSettings
     members: dict[str, GameMember]
     songmaster_browser_token: str
+    pending_settings_confirmation: PendingGameSettingsConfirmation | None = None
     songmaster_recovery: SongmasterRecovery | None = None
     last_songmaster_recovery_outcome: SongmasterRecoveryOutcome | None = None
     songmaster_events: tuple[SongmasterEvent, ...] = ()

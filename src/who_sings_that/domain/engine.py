@@ -20,12 +20,14 @@ from .models import (
     CompletedGameHistory,
     CompletedRound,
     DeckSkipReason,
+    DurationChangeWarning,
     FinalStanding,
     GameEndReason,
     GameFinalizationResult,
     GameMember,
     GameSession,
     GameSettings,
+    GameSettingsMutationResult,
     GameState,
     HistoricalDeckEntry,
     HistoricalDeckOutcome,
@@ -33,6 +35,7 @@ from .models import (
     HistoricalSongmasterEvent,
     InvalidPlayerNameError,
     PendingAudioPreparation,
+    PendingGameSettingsConfirmation,
     ResolvedPlaylist,
     RoundTermination,
     RoundTerminationReason,
@@ -60,6 +63,10 @@ from .scoring import (
     calculate_points,
     exact_speed_multiplier,
 )
+
+LARGE_PLAYBACK_OFFSET_WARNING_THRESHOLD_SECONDS = 120
+DURATION_INELIGIBLE_MAJORITY_WARNING = "duration_ineligible_majority"
+LARGE_PLAYBACK_OFFSET_WARNING = "large_playback_offset"
 
 
 class GameEngineError(RuntimeError):
@@ -148,6 +155,22 @@ class InvalidAudioPreferenceRequestError(GameEngineError, ValueError):
 
 class UnauthorizedAudioPreferenceError(GameEngineError):
     """Raised when a browser tries to change a preference it does not own."""
+
+
+class GameSettingsNotAllowedError(GameEngineError):
+    """Raised when game settings cannot change in the current state."""
+
+
+class UnauthorizedGameSettingsError(GameEngineError):
+    """Raised when someone other than the connected Songmaster changes settings."""
+
+
+class InvalidGameSettingsError(GameEngineError, ValueError):
+    """Raised when a settings proposal violates the documented constraints."""
+
+
+class GameSettingsConfirmationStaleError(GameEngineError):
+    """Raised when a warning confirmation no longer matches authoritative facts."""
 
 
 class AudioCapabilityNotAllowedError(GameEngineError):
@@ -286,10 +309,12 @@ class GameEngine:
         participant_id_factory: Callable[[], UUID] | None = None,
         shuffle: Shuffle | None = None,
     ) -> None:
-        self._installation_defaults = deepcopy(
-            installation_defaults
-            if installation_defaults is not None
-            else GameSettings()
+        self._installation_defaults = self._validated_game_settings(
+            deepcopy(
+                installation_defaults
+                if installation_defaults is not None
+                else GameSettings()
+            )
         )
         self._clock = clock if clock is not None else lambda: datetime.now(UTC)
         self._monotonic_clock = (
@@ -299,9 +324,7 @@ class GameEngine:
             game_id_factory if game_id_factory is not None else uuid4
         )
         self._preparation_id_factory = (
-            preparation_id_factory
-            if preparation_id_factory is not None
-            else uuid4
+            preparation_id_factory if preparation_id_factory is not None else uuid4
         )
         self._round_id_factory = (
             round_id_factory if round_id_factory is not None else uuid4
@@ -572,9 +595,7 @@ class GameEngine:
             )
         game = self._active_game
         if game is None:
-            raise DomainInvariantError(
-                f"{self._state.name} requires an active game"
-            )
+            raise DomainInvariantError(f"{self._state.name} requires an active game")
         token = self._validate_browser_token(
             requesting_browser_token,
             error_type=InvalidAudioPreferenceRequestError,
@@ -585,9 +606,7 @@ class GameEngine:
                 "a member may change only their own audio preference"
             )
         if not isinstance(audio_enabled, bool):
-            raise InvalidAudioPreferenceRequestError(
-                "audio_enabled must be a boolean"
-            )
+            raise InvalidAudioPreferenceRequestError("audio_enabled must be a boolean")
 
         previous_value = member.audio_enabled
         member.audio_enabled = audio_enabled
@@ -597,6 +616,181 @@ class GameEngine:
             member.audio_enabled = previous_value
             raise
         return member
+
+    def set_game_settings(
+        self,
+        requesting_browser_token: str,
+        proposed_settings: GameSettings,
+        *,
+        duration_warning_confirmation_token: UUID | None = None,
+    ) -> GameSettingsMutationResult:
+        """Validate and atomically apply settings for future rounds only.
+
+        A proposal with advisory warning conditions is retained as an opaque
+        confirmation snapshot. No configured setting or deck fact changes
+        until that exact snapshot is confirmed while it is authoritative.
+        """
+
+        self._reject_if_songmaster_recovery_active("game settings changes")
+        if self._state not in {GameState.LOBBY, GameState.ROUND_COMPLETE}:
+            raise GameSettingsNotAllowedError(
+                "game settings may only change in LOBBY or ROUND_COMPLETE"
+            )
+        game = self._active_game
+        if game is None:
+            raise DomainInvariantError(f"{self._state.name} requires an active game")
+        token = self._validate_browser_token(
+            requesting_browser_token,
+            error_type=UnauthorizedGameSettingsError,
+        )
+        if token != game.songmaster_browser_token or not game.songmaster.connected:
+            raise UnauthorizedGameSettingsError(
+                "only the current connected Songmaster may change game settings"
+            )
+
+        candidate = self._validated_game_settings(proposed_settings)
+        confirmation = game.pending_settings_confirmation
+        deck = game.deck
+        remaining_count = 0
+        ineligible_count = 0
+        if deck is not None:
+            remaining_entries = deck[game.deck_pointer :]
+            remaining_count = len(remaining_entries)
+            ineligible_count = sum(
+                not is_duration_eligible(
+                    entry.track, candidate.playback_duration_seconds
+                )
+                for entry in remaining_entries
+            )
+
+        warning_codes: list[str] = []
+        if (
+            deck is not None
+            and candidate.playback_duration_seconds
+            != game.settings.playback_duration_seconds
+            and ineligible_count * 2 > remaining_count
+        ):
+            warning_codes.append(DURATION_INELIGIBLE_MAJORITY_WARNING)
+        if (
+            candidate.playback_offset_seconds != game.settings.playback_offset_seconds
+            and candidate.playback_offset_seconds
+            > LARGE_PLAYBACK_OFFSET_WARNING_THRESHOLD_SECONDS
+        ):
+            warning_codes.append(LARGE_PLAYBACK_OFFSET_WARNING)
+        required_warnings = tuple(warning_codes)
+
+        if duration_warning_confirmation_token is not None:
+            if (
+                confirmation is None
+                or duration_warning_confirmation_token
+                != confirmation.confirmation_token
+                or candidate != confirmation.proposed_settings
+                or game.deck_pointer != confirmation.deck_pointer
+                or remaining_count != confirmation.remaining_song_count
+                or ineligible_count != confirmation.ineligible_song_count
+                or required_warnings != confirmation.warning_codes
+            ):
+                raise GameSettingsConfirmationStaleError(
+                    "the settings warning confirmation is stale"
+                )
+        elif required_warnings:
+            warning = DurationChangeWarning(
+                confirmation_token=uuid4(),
+                warning_codes=required_warnings,
+                remaining_song_count=(
+                    remaining_count
+                    if DURATION_INELIGIBLE_MAJORITY_WARNING in required_warnings
+                    else None
+                ),
+                ineligible_song_count=(
+                    ineligible_count
+                    if DURATION_INELIGIBLE_MAJORITY_WARNING in required_warnings
+                    else None
+                ),
+                playback_offset_seconds=(
+                    candidate.playback_offset_seconds
+                    if LARGE_PLAYBACK_OFFSET_WARNING in required_warnings
+                    else None
+                ),
+                playback_offset_warning_threshold_seconds=(
+                    LARGE_PLAYBACK_OFFSET_WARNING_THRESHOLD_SECONDS
+                    if LARGE_PLAYBACK_OFFSET_WARNING in required_warnings
+                    else None
+                ),
+            )
+            game.pending_settings_confirmation = PendingGameSettingsConfirmation(
+                confirmation_token=warning.confirmation_token,
+                proposed_settings=deepcopy(candidate),
+                deck_pointer=game.deck_pointer,
+                remaining_song_count=remaining_count,
+                ineligible_song_count=ineligible_count,
+                warning_codes=required_warnings,
+            )
+            return GameSettingsMutationResult(
+                applied=False,
+                settings=deepcopy(game.settings),
+                warning=warning,
+            )
+
+        previous_settings = game.settings
+        previous_pointer = game.deck_pointer
+        previous_exhausted = game.deck_exhausted
+        previous_skips = game.skipped_deck_entries
+        previous_confirmation = game.pending_settings_confirmation
+        game.settings = candidate
+        game.pending_settings_confirmation = None
+        try:
+            if self._state is GameState.ROUND_COMPLETE:
+                self._enter_round_complete()
+            self._validate_state_invariants(self._state)
+        except Exception:
+            game.settings = previous_settings
+            game.deck_pointer = previous_pointer
+            game.deck_exhausted = previous_exhausted
+            game.skipped_deck_entries = previous_skips
+            game.pending_settings_confirmation = previous_confirmation
+            raise
+        return GameSettingsMutationResult(
+            applied=True,
+            settings=deepcopy(game.settings),
+        )
+
+    @staticmethod
+    def _validated_game_settings(settings: GameSettings) -> GameSettings:
+        if not isinstance(settings, GameSettings):
+            raise InvalidGameSettingsError("settings must be GameSettings")
+        offset = settings.playback_offset_seconds
+        duration = settings.playback_duration_seconds
+        plateau = settings.speed_bonus_plateau_percent
+        if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+            raise InvalidGameSettingsError(
+                "playback_offset_seconds must be a non-negative integer"
+            )
+        if isinstance(duration, bool) or not isinstance(duration, int) or duration <= 0:
+            raise InvalidGameSettingsError(
+                "playback_duration_seconds must be a positive integer"
+            )
+        if isinstance(plateau, bool) or not isinstance(plateau, (int, float, Decimal)):
+            raise InvalidGameSettingsError(
+                "speed_bonus_plateau_percent must be numeric"
+            )
+        try:
+            plateau_decimal = Decimal(str(plateau))
+        except Exception as error:  # Decimal conversion is the validation boundary.
+            raise InvalidGameSettingsError(
+                "speed_bonus_plateau_percent must be finite"
+            ) from error
+        if not plateau_decimal.is_finite() or not Decimal(
+            0
+        ) <= plateau_decimal <= Decimal(100):
+            raise InvalidGameSettingsError(
+                "speed_bonus_plateau_percent must be between 0 and 100 inclusive"
+            )
+        return GameSettings(
+            playback_offset_seconds=offset,
+            playback_duration_seconds=duration,
+            speed_bonus_plateau_percent=plateau_decimal,
+        )
 
     def set_browser_audio_capability(
         self, browser_token: str, browser_audio_usable: bool
@@ -617,14 +811,11 @@ class GameEngine:
             GameState.SCORING,
         }:
             raise AudioCapabilityNotAllowedError(
-                "browser audio capability updates are not allowed in the "
-                "current state"
+                "browser audio capability updates are not allowed in the current state"
             )
         game = self._active_game
         if game is None:
-            raise DomainInvariantError(
-                f"{self._state.name} requires an active game"
-            )
+            raise DomainInvariantError(f"{self._state.name} requires an active game")
         token = self._validate_browser_token(
             browser_token,
             error_type=InvalidAudioCapabilityRequestError,
@@ -665,9 +856,7 @@ class GameEngine:
         self._reject_if_songmaster_recovery_active("Play Song")
 
         if self._state is not GameState.ROUND_COMPLETE:
-            raise PlaySongNotAllowedError(
-                "Play Song is only allowed in ROUND_COMPLETE"
-            )
+            raise PlaySongNotAllowedError("Play Song is only allowed in ROUND_COMPLETE")
         game = self._active_game
         if game is None:
             raise DomainInvariantError("ROUND_COMPLETE requires an active game")
@@ -676,10 +865,7 @@ class GameEngine:
             requesting_browser_token,
             error_type=UnauthorizedPlaySongError,
         )
-        if (
-            token != game.songmaster_browser_token
-            or not game.songmaster.connected
-        ):
+        if token != game.songmaster_browser_token or not game.songmaster.connected:
             raise UnauthorizedPlaySongError(
                 "only the current connected Songmaster may request Play Song"
             )
@@ -690,9 +876,7 @@ class GameEngine:
         self._validate_state_invariants(GameState.ROUND_COMPLETE)
         deck = game.deck
         if deck is None:
-            raise DomainInvariantError(
-                "Play Song requires an established deck"
-            )
+            raise DomainInvariantError("Play Song requires an established deck")
         if game.deck_exhausted:
             self._take_transition_k()
             return GameFinalizationResult(
@@ -734,21 +918,15 @@ class GameEngine:
             ) from error
         preparation_id = self._preparation_id_factory()
         if not isinstance(preparation_id, UUID):
-            raise DomainInvariantError(
-                "the preparation ID factory must return a UUID"
-            )
+            raise DomainInvariantError("the preparation ID factory must return a UUID")
 
         pending = PendingAudioPreparation(
             preparation_id=preparation_id,
             deck_entry=deck_entry,
-            configured_playback_offset_seconds=(
-                game.settings.playback_offset_seconds
-            ),
+            configured_playback_offset_seconds=(game.settings.playback_offset_seconds),
             effective_playback_offset_seconds=effective_offset,
             playback_duration_seconds=game.settings.playback_duration_seconds,
-            speed_bonus_plateau_percent=(
-                game.settings.speed_bonus_plateau_percent
-            ),
+            speed_bonus_plateau_percent=(game.settings.speed_bonus_plateau_percent),
             buzz_eligible_browser_tokens=frozenset(
                 member.browser_token
                 for member in game.members.values()
@@ -842,9 +1020,7 @@ class GameEngine:
         self._reject_if_songmaster_recovery_active("Close Game")
 
         if self._state is not GameState.FINISHED:
-            raise CloseGameNotAllowedError(
-                "Close Game is only allowed in FINISHED"
-            )
+            raise CloseGameNotAllowedError("Close Game is only allowed in FINISHED")
         game = self._active_game
         if game is None or game.game_session_id != game_session_id:
             raise CloseGameNotAllowedError("Close Game targets a stale game")
@@ -889,11 +1065,7 @@ class GameEngine:
             error_type=SongmasterTransferNotAllowedError,
         )
         recipient = game.members.get(recipient_token)
-        if (
-            recipient is None
-            or not recipient.connected
-            or recipient_token == requester
-        ):
+        if recipient is None or not recipient.connected or recipient_token == requester:
             raise SongmasterTransferNotAllowedError(
                 "the recipient must be another connected game member"
             )
@@ -1030,9 +1202,7 @@ class GameEngine:
                     pending.effective_playback_offset_seconds
                 ),
                 playback_duration_seconds=pending.playback_duration_seconds,
-                speed_bonus_plateau_percent=(
-                    pending.speed_bonus_plateau_percent
-                ),
+                speed_bonus_plateau_percent=(pending.speed_bonus_plateau_percent),
             ),
         )
         game.deck_pointer += 1
@@ -1088,9 +1258,7 @@ class GameEngine:
         termination = RoundTermination(
             reason=RoundTerminationReason.BUZZ,
             winning_browser_token=token,
-            buzz_elapsed_seconds=(
-                receipt - active_round.playback_started_monotonic
-            ),
+            buzz_elapsed_seconds=(receipt - active_round.playback_started_monotonic),
         )
         game.round_termination = termination
         self._transition_to(GameState.AWAITING_REVEAL)
@@ -1140,9 +1308,7 @@ class GameEngine:
         self._reject_if_songmaster_recovery_active("Reveal")
 
         if self._state is not GameState.AWAITING_REVEAL:
-            raise RevealNotAllowedError(
-                "Reveal is only allowed in AWAITING_REVEAL"
-            )
+            raise RevealNotAllowedError("Reveal is only allowed in AWAITING_REVEAL")
         game = self._active_game
         if game is None or game.game_session_id != game_session_id:
             raise RevealNotAllowedError("Reveal targets a stale game")
@@ -1168,9 +1334,7 @@ class GameEngine:
         artist, title = self._answer_for_reveal(active_round)
         termination = game.round_termination
         if not isinstance(termination, RoundTermination):
-            raise DomainInvariantError(
-                "AWAITING_REVEAL requires a termination outcome"
-            )
+            raise DomainInvariantError("AWAITING_REVEAL requires a termination outcome")
 
         # Revealing the answer is transition-specific work shared by H and I.
         # The established display position already identifies this actual round.
@@ -1224,9 +1388,7 @@ class GameEngine:
                 "only the current connected Songmaster may accept a score"
             )
         if not isinstance(scoring_choice, ScoringChoice):
-            raise InvalidScoringDecisionError(
-                "scoring_choice must be a ScoringChoice"
-            )
+            raise InvalidScoringDecisionError("scoring_choice must be a ScoringChoice")
 
         active_round = game.active_round
         if not isinstance(active_round, ActiveRound):
@@ -1296,12 +1458,13 @@ class GameEngine:
                 "only the current connected Songmaster may select a score"
             )
         if not isinstance(scoring_choice, ScoringChoice):
-            raise InvalidScoringDecisionError(
-                "scoring_choice must be a ScoringChoice"
-            )
+            raise InvalidScoringDecisionError("scoring_choice must be a ScoringChoice")
         active_round = game.active_round
         termination = game.round_termination
-        if not isinstance(active_round, ActiveRound) or active_round.round_id != round_id:
+        if (
+            not isinstance(active_round, ActiveRound)
+            or active_round.round_id != round_id
+        ):
             raise ScoringNotAllowedError("provisional scoring targets a stale round")
         if not isinstance(termination, RoundTermination):  # pragma: no cover
             raise DomainInvariantError("SCORING requires a termination outcome")
@@ -1331,7 +1494,9 @@ class GameEngine:
             )
         game = self._active_game
         if game is None or game.game_session_id != game_session_id:
-            raise ScoreCorrectionNotAllowedError("score correction targets a stale game")
+            raise ScoreCorrectionNotAllowedError(
+                "score correction targets a stale game"
+            )
 
         token = self._validate_browser_token(
             requesting_browser_token,
@@ -1342,9 +1507,7 @@ class GameEngine:
                 "only the current connected Songmaster may correct a score"
             )
         if not isinstance(scoring_choice, ScoringChoice):
-            raise InvalidScoringDecisionError(
-                "scoring_choice must be a ScoringChoice"
-            )
+            raise InvalidScoringDecisionError("scoring_choice must be a ScoringChoice")
 
         completed = game.last_completed_round
         if (
@@ -1500,9 +1663,7 @@ class GameEngine:
             GameState.AWAITING_REVEAL,
             GameState.SCORING,
         }:
-            voided_round_id = self._void_round_for_songmaster_loss(
-                interrupted_state
-            )
+            voided_round_id = self._void_round_for_songmaster_loss(interrupted_state)
             normalized_state = GameState.ROUND_COMPLETE
 
         member.connected = False
@@ -1669,8 +1830,7 @@ class GameEngine:
         if (
             game is None
             or recovery is None
-            or recovery.status
-            is not SongmasterRecoveryStatus.INDEFINITE_SUSPENSION
+            or recovery.status is not SongmasterRecoveryStatus.INDEFINITE_SUSPENSION
         ):
             raise SongmasterRecoveryInapplicableError(
                 "the game is not indefinitely suspended"
@@ -1717,9 +1877,7 @@ class GameEngine:
             original_songmaster_browser_token=(
                 recovery.original_songmaster_browser_token
             ),
-            resulting_songmaster_browser_token=(
-                resulting_songmaster_browser_token
-            ),
+            resulting_songmaster_browser_token=(resulting_songmaster_browser_token),
             interrupted_state=recovery.interrupted_state,
             resumed_state=recovery.normalized_state,
             voided_round_id=recovery.voided_round_id,
@@ -2072,9 +2230,7 @@ class GameEngine:
                 "browser_token does not belong to the active game"
             )
         if not isinstance(connection_changed, bool):
-            raise InvalidJoinGameRequestError(
-                "connection_changed must be a boolean"
-            )
+            raise InvalidJoinGameRequestError("connection_changed must be a boolean")
         if not connection_changed:
             self._validate_state_invariants(self._state)
             return member
@@ -2149,9 +2305,7 @@ class GameEngine:
 
         participant_id = self._participant_id_factory()
         if not isinstance(participant_id, UUID):
-            raise DomainInvariantError(
-                "the participant ID factory must return a UUID"
-            )
+            raise DomainInvariantError("the participant ID factory must return a UUID")
         if participant_id in self._issued_public_participant_ids:
             raise DomainInvariantError(
                 "the participant ID factory reused an issued public identity"
@@ -2264,9 +2418,7 @@ class GameEngine:
                 try:
                     # This validates the duration without using eligibility as a
                     # Start Game filter; short tracks remain in the deck.
-                    is_duration_eligible(
-                        track, game.settings.playback_duration_seconds
-                    )
+                    is_duration_eligible(track, game.settings.playback_duration_seconds)
                 except (TypeError, ValueError) as error:
                     raise InvalidResolvedPlaylistError(
                         "resolved tracks must have valid positive durations"
@@ -2320,9 +2472,7 @@ class GameEngine:
         if not isinstance(started_at, datetime):
             raise DomainInvariantError("the engine clock must return a datetime")
 
-    def _game_for_membership_operation(
-        self, *, allow_finished: bool
-    ) -> GameSession:
+    def _game_for_membership_operation(self, *, allow_finished: bool) -> GameSession:
         game = self._active_game
         if game is None:
             raise NoActiveGameError("there is no active game")
@@ -2367,6 +2517,11 @@ class GameEngine:
     def _transition_to(self, target: GameState) -> None:
         """Enter a target state and execute its entry actions and invariants."""
 
+        if self._active_game is not None and target not in {
+            GameState.LOBBY,
+            GameState.ROUND_COMPLETE,
+        }:
+            self._active_game.pending_settings_confirmation = None
         self._state = target
         self._enter_state(target)
         self._validate_state_invariants(target)
@@ -2413,12 +2568,8 @@ class GameEngine:
                 configured_playback_offset_seconds=(
                     game.settings.playback_offset_seconds
                 ),
-                playback_duration_seconds=(
-                    game.settings.playback_duration_seconds
-                ),
-                speed_bonus_plateau_percent=(
-                    game.settings.speed_bonus_plateau_percent
-                ),
+                playback_duration_seconds=(game.settings.playback_duration_seconds),
+                speed_bonus_plateau_percent=(game.settings.speed_bonus_plateau_percent),
             )
             for entry in selection.skipped_entries
         )
@@ -2456,11 +2607,7 @@ class GameEngine:
         """Disable buzzing while preserving the unconsumed current round."""
 
         game = self._active_game
-        if (
-            game is None
-            or game.active_round is None
-            or game.round_termination is None
-        ):
+        if game is None or game.active_round is None or game.round_termination is None:
             raise DomainInvariantError(
                 "AWAITING_REVEAL entry requires a terminated actual round"
             )
@@ -2525,13 +2672,10 @@ class GameEngine:
 
         round_id = completed.active_round.round_id
         if any(
-            item.active_round.round_id == round_id
-            for item in game.completed_rounds
+            item.active_round.round_id == round_id for item in game.completed_rounds
         ):
             raise DomainInvariantError("a completed round cannot be recorded twice")
-        if any(
-            item.active_round.round_id == round_id for item in game.voided_rounds
-        ):
+        if any(item.active_round.round_id == round_id for item in game.voided_rounds):
             raise DomainInvariantError("a voided round cannot later be completed")
         game.last_completed_round = completed
         game.completed_rounds += (completed,)
@@ -2541,13 +2685,10 @@ class GameEngine:
         """Retain one void without duplicating or contradicting its round."""
 
         round_id = voided.active_round.round_id
-        if any(
-            item.active_round.round_id == round_id for item in game.voided_rounds
-        ):
+        if any(item.active_round.round_id == round_id for item in game.voided_rounds):
             raise DomainInvariantError("a voided round cannot be recorded twice")
         if any(
-            item.active_round.round_id == round_id
-            for item in game.completed_rounds
+            item.active_round.round_id == round_id for item in game.completed_rounds
         ):
             raise DomainInvariantError("a completed round cannot later be voided")
         game.last_voided_round = voided
@@ -2693,9 +2834,7 @@ class GameEngine:
                         effective_playback_offset_seconds=(
                             active.effective_playback_offset_seconds
                         ),
-                        playback_duration_seconds=(
-                            active.playback_duration_seconds
-                        ),
+                        playback_duration_seconds=(active.playback_duration_seconds),
                         speed_bonus_plateau_percent=(
                             active.speed_bonus_plateau_percent
                         ),
@@ -2738,9 +2877,7 @@ class GameEngine:
                         effective_playback_offset_seconds=(
                             active.effective_playback_offset_seconds
                         ),
-                        playback_duration_seconds=(
-                            active.playback_duration_seconds
-                        ),
+                        playback_duration_seconds=(active.playback_duration_seconds),
                         speed_bonus_plateau_percent=(
                             active.speed_bonus_plateau_percent
                         ),
@@ -2776,9 +2913,7 @@ class GameEngine:
                         effective_playback_offset_seconds=(
                             skipped.effective_playback_offset_seconds
                         ),
-                        playback_duration_seconds=(
-                            skipped.playback_duration_seconds
-                        ),
+                        playback_duration_seconds=(skipped.playback_duration_seconds),
                         speed_bonus_plateau_percent=(
                             skipped.speed_bonus_plateau_percent
                         ),
@@ -2801,9 +2936,7 @@ class GameEngine:
             end_reason=game.end_reason,
             playback_offset_seconds=game.settings.playback_offset_seconds,
             playback_duration_seconds=game.settings.playback_duration_seconds,
-            speed_bonus_plateau_percent=(
-                game.settings.speed_bonus_plateau_percent
-            ),
+            speed_bonus_plateau_percent=(game.settings.speed_bonus_plateau_percent),
             participants=participants,
             selected_playlists=game.selected_playlist_snapshots,
             songmaster_events=songmaster_events,
@@ -2922,9 +3055,7 @@ class GameEngine:
             raise DomainInvariantError("LOBBY player-facing song display must be blank")
 
     @staticmethod
-    def _validate_active_game_members(
-        game: GameSession, *, state_name: str
-    ) -> None:
+    def _validate_active_game_members(game: GameSession, *, state_name: str) -> None:
         if any(token != member.browser_token for token, member in game.members.items()):
             raise DomainInvariantError("game membership keys must be browser tokens")
         name_keys: set[str] = set()
@@ -3002,9 +3133,7 @@ class GameEngine:
             )
         recovery = game.songmaster_recovery
         if recovery is None and not game.songmaster.connected:
-            raise DomainInvariantError(
-                f"{state_name} requires a connected Songmaster"
-            )
+            raise DomainInvariantError(f"{state_name} requires a connected Songmaster")
         GameEngine._validate_songmaster_recovery(game, state_name=state_name)
 
     @staticmethod
@@ -3105,9 +3234,8 @@ class GameEngine:
                     "deck entries must retain TrackReference identities"
                 )
 
-        if (
-            isinstance(game.original_deck_size, bool)
-            or game.original_deck_size != len(deck)
+        if isinstance(game.original_deck_size, bool) or game.original_deck_size != len(
+            deck
         ):
             raise DomainInvariantError(
                 "original deck size must equal the immutable deck size"
@@ -3130,7 +3258,9 @@ class GameEngine:
             not isinstance(playlist_id, str) or not playlist_id.strip()
             for playlist_id in game.selected_playlist_ids
         ):
-            raise DomainInvariantError("selected playlist IDs must be non-empty strings")
+            raise DomainInvariantError(
+                "selected playlist IDs must be non-empty strings"
+            )
         if game.playlist_selection_editable is not False:
             raise DomainInvariantError(
                 "playlist selection must be locked after Start Game"
@@ -3216,7 +3346,10 @@ class GameEngine:
                 "a completed round must retain its actual-round facts"
             )
         position = active_round.original_deck_position
-        if not 1 <= position <= len(deck) or active_round.deck_entry is not deck[position - 1]:
+        if (
+            not 1 <= position <= len(deck)
+            or active_round.deck_entry is not deck[position - 1]
+        ):
             raise DomainInvariantError(
                 "a completed round must retain its original deck entry"
             )
@@ -3313,9 +3446,7 @@ class GameEngine:
         game = self._active_game
         if game is None:
             raise DomainInvariantError("ROUND_COMPLETE requires an active game")
-        deck = self._validate_started_game_facts(
-            game, state_name="ROUND_COMPLETE"
-        )
+        deck = self._validate_started_game_facts(game, state_name="ROUND_COMPLETE")
         if game.active_round is not None:
             raise DomainInvariantError("ROUND_COMPLETE cannot have an active round")
         if game.last_voided_round is not None:
@@ -3340,9 +3471,7 @@ class GameEngine:
                 "ROUND_COMPLETE cannot have preparation responses"
             )
         if game.buzzing_enabled is not False:
-            raise DomainInvariantError(
-                "buzzing must be disabled in ROUND_COMPLETE"
-            )
+            raise DomainInvariantError("buzzing must be disabled in ROUND_COMPLETE")
         if game.ended_at is not None or game.end_reason is not None:
             raise DomainInvariantError(
                 "ROUND_COMPLETE cannot have game finalization facts"
@@ -3363,8 +3492,7 @@ class GameEngine:
             )
         if not (
             game.last_voided_round is not None
-            and game.last_voided_round.reason
-            is RoundVoidReason.SONGMASTER_DISCONNECTED
+            and game.last_voided_round.reason is RoundVoidReason.SONGMASTER_DISCONNECTED
             and game.last_voided_round.answer_revealed
         ):
             self._validate_completed_round_display(
@@ -3392,9 +3520,7 @@ class GameEngine:
         game = self._active_game
         if game is None:
             raise DomainInvariantError("AUDIO_PREPARING requires an active game")
-        deck = self._validate_started_game_facts(
-            game, state_name="AUDIO_PREPARING"
-        )
+        deck = self._validate_started_game_facts(game, state_name="AUDIO_PREPARING")
         if game.deck_exhausted is not False or game.deck_pointer >= len(deck):
             raise DomainInvariantError(
                 "AUDIO_PREPARING requires a non-exhausted candidate under the pointer"
@@ -3410,17 +3536,13 @@ class GameEngine:
                 "AUDIO_PREPARING cannot have round termination facts"
             )
         if game.buzzing_enabled is not False:
-            raise DomainInvariantError(
-                "buzzing must be disabled in AUDIO_PREPARING"
-            )
+            raise DomainInvariantError("buzzing must be disabled in AUDIO_PREPARING")
         if game.ended_at is not None or game.end_reason is not None:
             raise DomainInvariantError(
                 "AUDIO_PREPARING cannot have game finalization facts"
             )
         if game.final_standings != ():
-            raise DomainInvariantError(
-                "AUDIO_PREPARING cannot have final standings"
-            )
+            raise DomainInvariantError("AUDIO_PREPARING cannot have final standings")
         if game.scoring_correction_round_id is not None:
             raise DomainInvariantError(
                 "AUDIO_PREPARING cannot retain a score correction window"
@@ -3444,9 +3566,7 @@ class GameEngine:
             raise DomainInvariantError(
                 "preparation target statuses must be a mutable mapping"
             )
-        if set(responses.target_statuses) != set(
-            pending.audio_target_browser_tokens
-        ):
+        if set(responses.target_statuses) != set(pending.audio_target_browser_tokens):
             raise DomainInvariantError(
                 "preparation response targets must match the immutable snapshot"
             )
@@ -3521,9 +3641,7 @@ class GameEngine:
             raise DomainInvariantError(
                 "buzz eligibility must contain only game members"
             )
-        if game.songmaster_browser_token not in (
-            pending.buzz_eligible_browser_tokens
-        ):
+        if game.songmaster_browser_token not in (pending.buzz_eligible_browser_tokens):
             raise DomainInvariantError(
                 "the connected Songmaster must be prospectively buzz eligible"
             )
@@ -3559,7 +3677,10 @@ class GameEngine:
             raise DomainInvariantError(
                 "the actual round must bind the unconsumed deck entry under the pointer"
             )
-        if active_round.original_deck_position != active_round.deck_entry.original_position:
+        if (
+            active_round.original_deck_position
+            != active_round.deck_entry.original_position
+        ):
             raise DomainInvariantError("actual round deck position is inconsistent")
         if active_round.track_id != active_round.deck_entry.track.track_id:
             raise DomainInvariantError("actual round track identity is inconsistent")
@@ -3615,7 +3736,10 @@ class GameEngine:
             raise DomainInvariantError(
                 f"{state_name} requires at least one playback client"
             )
-        if not active_round.playback_clients <= active_round.buzz_eligible_browser_tokens:
+        if (
+            not active_round.playback_clients
+            <= active_round.buzz_eligible_browser_tokens
+        ):
             raise DomainInvariantError(
                 "playback clients must belong to the frozen eligible player set"
             )
@@ -3635,17 +3759,12 @@ class GameEngine:
             )
         if answer_revealed:
             artist, title = self._answer_for_reveal(active_round)
-            if (
-                game.displayed_artist != artist
-                or game.displayed_title != title
-            ):
+            if game.displayed_artist != artist or game.displayed_title != title:
                 raise DomainInvariantError(
                     f"{state_name} must display the actual round answer"
                 )
         elif game.displayed_artist is not None or game.displayed_title is not None:
-            raise DomainInvariantError(
-                f"{state_name} answer display must remain blank"
-            )
+            raise DomainInvariantError(f"{state_name} answer display must remain blank")
         if game.ended_at is not None or game.end_reason is not None:
             raise DomainInvariantError(
                 f"{state_name} cannot have game finalization facts"
@@ -3676,9 +3795,7 @@ class GameEngine:
             game, state_name="AWAITING_REVEAL"
         )
         if game.buzzing_enabled is not False:
-            raise DomainInvariantError(
-                "buzzing must be disabled in AWAITING_REVEAL"
-            )
+            raise DomainInvariantError("buzzing must be disabled in AWAITING_REVEAL")
         termination = game.round_termination
         if not isinstance(termination, RoundTermination):
             raise DomainInvariantError(
@@ -3728,17 +3845,13 @@ class GameEngine:
         if not isinstance(termination, RoundTermination) or (
             termination.reason is not RoundTerminationReason.BUZZ
         ):
-            raise DomainInvariantError(
-                "SCORING requires a buzz termination outcome"
-            )
+            raise DomainInvariantError("SCORING requires a buzz termination outcome")
         winner = termination.winning_browser_token
         if (
             winner not in game.members
             or winner not in active_round.buzz_eligible_browser_tokens
         ):
-            raise DomainInvariantError(
-                "SCORING requires an eligible winning member"
-            )
+            raise DomainInvariantError("SCORING requires an eligible winning member")
         elapsed = self._validated_monotonic_timestamp(
             termination.buzz_elapsed_seconds,
             error_type=DomainInvariantError,
@@ -3750,8 +3863,7 @@ class GameEngine:
             )
         if (
             game.last_completed_round is not None
-            and game.last_completed_round.active_round.round_id
-            == active_round.round_id
+            and game.last_completed_round.active_round.round_id == active_round.round_id
         ):
             raise DomainInvariantError(
                 "the current scoring round cannot already be completed"
@@ -3783,9 +3895,7 @@ class GameEngine:
                 "FINISHED cannot retain a score correction window"
             )
         if game.provisional_scoring_choice is not None:
-            raise DomainInvariantError(
-                "FINISHED cannot retain provisional scoring"
-            )
+            raise DomainInvariantError("FINISHED cannot retain provisional scoring")
         if game.end_reason is GameEndReason.DECK_EXHAUSTED:
             if game.deck_pointer != len(deck) or game.deck_exhausted is not True:
                 raise DomainInvariantError(
@@ -3793,13 +3903,10 @@ class GameEngine:
                 )
             if game.last_voided_round is not None:
                 self._validate_last_voided_round(game, deck)
-                if (
-                    game.last_voided_round.reason
-                    not in {
-                        RoundVoidReason.PLAYBACK_CLIENT_LOST,
-                        RoundVoidReason.SONGMASTER_DISCONNECTED,
-                    }
-                ):
+                if game.last_voided_round.reason not in {
+                    RoundVoidReason.PLAYBACK_CLIENT_LOST,
+                    RoundVoidReason.SONGMASTER_DISCONNECTED,
+                }:
                     raise DomainInvariantError(
                         "natural completion may retain only a connection-loss void"
                     )
@@ -3901,9 +4008,7 @@ class GameEngine:
             active_round.playback_duration_seconds,
         )
         if active_round.effective_playback_offset_seconds != expected_offset:
-            raise DomainInvariantError(
-                "voided round effective offset is inconsistent"
-            )
+            raise DomainInvariantError("voided round effective offset is inconsistent")
         if not isinstance(
             active_round.buzz_eligible_browser_tokens, frozenset
         ) or not isinstance(active_round.playback_clients, frozenset):
@@ -3938,9 +4043,7 @@ class GameEngine:
         termination = voided.termination
         if termination is not None:
             if not isinstance(termination, RoundTermination):
-                raise DomainInvariantError(
-                    "voided termination facts must be immutable"
-                )
+                raise DomainInvariantError("voided termination facts must be immutable")
             if termination.reason is RoundTerminationReason.BUZZ:
                 winner = termination.winning_browser_token
                 if (
@@ -3972,8 +4075,7 @@ class GameEngine:
                     "voided-round termination reason is not supported"
                 )
         if voided.answer_revealed and (
-            termination is None
-            or termination.reason is not RoundTerminationReason.BUZZ
+            termination is None or termination.reason is not RoundTerminationReason.BUZZ
         ):
             raise DomainInvariantError(
                 "a revealed void requires the prior buzz termination"

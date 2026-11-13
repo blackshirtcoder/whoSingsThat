@@ -2184,6 +2184,7 @@ select_playlist
 deselect_playlist
 start_game
 set_audio_preference
+set_game_settings
 set_audio_capability
 play_song
 audio_preparation_ready
@@ -2852,3 +2853,82 @@ controls, catalog administration, or history. Those remain later Phase D
 increments. The production page also does not yet consume Prepare/Play/Stop;
 the preserved diagnostic page remains the integration surface for the Phase C2
 mystery-song player until D3b.
+
+## 56. Phase D3a Authoritative Game-Settings Mutation
+
+Phase D3a adds the protocol operation `set_game_settings`; it does not add the
+production settings sheet. The operation is a current-connection client request
+on the controller's existing serialized FIFO. Its ordinary proposal payload is:
+
+```json
+{
+  "playback_offset_seconds": 30,
+  "playback_duration_seconds": 30,
+  "speed_bonus_plateau_percent": 10
+}
+```
+
+All three configured values are supplied together. Offset and duration are
+strict JSON integers; booleans, strings, fractional values, and undeclared
+fields are malformed. Offset must be non-negative, duration must be positive,
+and plateau must be a finite JSON number from 0 through 100 inclusive. The
+authoritative V1 specification does not define an additional numerical maximum
+for offset or duration, so D3a does not invent one and in particular does not
+adopt the previously discussed 600-second limit. Installation defaults pass
+the same domain validation before they can be copied into a new game.
+
+Changing the configured playback offset to a value greater than **120 seconds**
+requires explicit Songmaster confirmation. Values from 0 through 120 seconds
+do not produce this warning. The threshold is fixed: it does not use average
+song duration or any other adaptive calculation. The warning is advisory, so a
+confirmed offset has no upper limit. An already-confirmed large offset does not
+warn again when a later proposal leaves the offset unchanged.
+
+Only the current connected Songmaster may apply settings, and only in `LOBBY`
+or `ROUND_COMPLETE` while Songmaster recovery is not active. The operation is
+listed in that recipient's `available_songmaster_operations` only in those
+states. A successful mutation broadcasts the normal authoritative projection;
+the public `settings` object remains the configured per-game values. A round
+that has reached transition C retains its immutable configured/effective
+snapshot and cannot be changed. Offset remains configured until transition C,
+when the effective value is `min(O, L - D)`, and plateau remains a percentage
+whose scoring fraction is obtained by dividing by 100. Deck construction and
+ordering are never changed by this operation.
+
+When a proposal changes duration after the immutable deck exists, the engine
+counts every entry from the current unconsumed pointer through the end. It does
+not inspect already-consumed entries. If `ineligible_song_count * 2` is greater
+than `remaining_song_count`, the success result has `applied: false` and a safe
+warning object:
+
+```json
+{
+  "code": "duration_ineligible_majority",
+  "confirmation_token": "opaque-uuid",
+  "remaining_song_count": 43,
+  "ineligible_song_count": 27
+}
+```
+
+Large-offset and duration-eligibility warnings share the same opaque token. The
+WebSocket warning includes a `conditions` array of structured, non-secret facts
+with code `large_playback_offset`, `duration_ineligible_majority`, or both. A
+combined warning uses top-level code `multiple_settings_warnings`, and one
+confirmation of the exact proposal satisfies every listed condition. The
+large-offset condition reports only `playback_offset_seconds` and the fixed
+`threshold_seconds: 120`; the duration condition reports only the aggregate
+counts shown above.
+
+No configured setting, deck pointer, skip record, or public projection changes
+at that point. The warning contains no track IDs, metadata, paths, or ordering.
+Exactly half does not warn. To confirm, the Songmaster resubmits the same three
+values and adds `duration_warning_confirmation_token` (the field name is kept
+for D3a protocol compatibility even when the only condition is the offset).
+Inside the serialized dispatch the engine rechecks the current Songmaster,
+legal state, proposed values, warning conditions, deck pointer, remaining
+count, and ineligible count against the warning snapshot. A mismatch returns
+`stale_settings_confirmation` without mutation. Beginning a round also expires
+the pending confirmation. A valid confirmation applies the settings and
+immediately executes the ordinary `ROUND_COMPLETE` candidate scan, permanently
+recording newly duration-ineligible entries under the new settings. Previously
+consumed or skipped entries are never revived.

@@ -512,12 +512,15 @@ def _songmaster_operations(
                 "select_playlist",
                 "deselect_playlist",
                 "start_game",
+                "set_game_settings",
                 "cancel_game",
                 "transfer_songmaster",
             )
         )
     if state is GameState.ROUND_COMPLETE:
-        operations.extend(("play_song", "transfer_songmaster"))
+        operations.extend(
+            ("play_song", "set_game_settings", "transfer_songmaster")
+        )
         if not game.deck_exhausted:
             operations.append("end_game")
         if game.scoring_correction_round_id is not None:

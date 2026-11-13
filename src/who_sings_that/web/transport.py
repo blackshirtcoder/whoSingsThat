@@ -44,12 +44,15 @@ from who_sings_that.application import (
     SelectPlaylistRequest,
     SelectProvisionalScoreRequest,
     SetAudioPreferenceRequest,
+    SetGameSettingsRequest,
     StartGameRequest,
     StopAudioCommand,
     TransferSongmasterByPublicIdRequest,
 )
 from who_sings_that.domain import (
     GameFinalizationResult,
+    GameSettings,
+    GameSettingsMutationResult,
     PendingAudioPreparation,
     ScoringChoice,
 )
@@ -790,6 +793,17 @@ def _build_member_request(
         return StartGameRequest(game_id, token)
     if operation == "set_audio_preference":
         return SetAudioPreferenceRequest(game_id, token, payload.audio_enabled)
+    if operation == "set_game_settings":
+        return SetGameSettingsRequest(
+            game_id,
+            token,
+            GameSettings(
+                playback_offset_seconds=payload.playback_offset_seconds,
+                playback_duration_seconds=payload.playback_duration_seconds,
+                speed_bonus_plateau_percent=payload.speed_bonus_plateau_percent,
+            ),
+            payload.duration_warning_confirmation_token,
+        )
     if operation == "set_audio_capability":
         return BrowserAudioCapabilityChangedEvent(
             game_id,
@@ -932,6 +946,57 @@ def _command_result(
         response["state"] = update.public.state.value
     if isinstance(result, PendingAudioPreparation):
         response["preparation_id"] = str(result.preparation_id)
+    elif isinstance(result, GameSettingsMutationResult):
+        response["applied"] = result.applied
+        response["settings"] = {
+            "playback_offset_seconds": result.settings.playback_offset_seconds,
+            "playback_duration_seconds": result.settings.playback_duration_seconds,
+            "speed_bonus_plateau_percent": str(
+                result.settings.speed_bonus_plateau_percent
+            ),
+        }
+        if result.warning is not None:
+            conditions: list[dict[str, Any]] = []
+            if "duration_ineligible_majority" in result.warning.warning_codes:
+                conditions.append(
+                    {
+                        "code": "duration_ineligible_majority",
+                        "remaining_song_count": result.warning.remaining_song_count,
+                        "ineligible_song_count": result.warning.ineligible_song_count,
+                    }
+                )
+            if "large_playback_offset" in result.warning.warning_codes:
+                conditions.append(
+                    {
+                        "code": "large_playback_offset",
+                        "playback_offset_seconds": (
+                            result.warning.playback_offset_seconds
+                        ),
+                        "threshold_seconds": (
+                            result.warning.playback_offset_warning_threshold_seconds
+                        ),
+                    }
+                )
+            warning: dict[str, Any] = {
+                "code": (
+                    result.warning.warning_codes[0]
+                    if len(result.warning.warning_codes) == 1
+                    else "multiple_settings_warnings"
+                ),
+                "confirmation_token": str(result.warning.confirmation_token),
+                "conditions": conditions,
+            }
+            if result.warning.remaining_song_count is not None:
+                warning["remaining_song_count"] = result.warning.remaining_song_count
+                warning["ineligible_song_count"] = result.warning.ineligible_song_count
+            if result.warning.playback_offset_seconds is not None:
+                warning["playback_offset_seconds"] = (
+                    result.warning.playback_offset_seconds
+                )
+                warning["threshold_seconds"] = (
+                    result.warning.playback_offset_warning_threshold_seconds
+                )
+            response["warning"] = warning
     elif isinstance(result, GameFinalizationResult):
         response["end_reason"] = result.end_reason.value
         response["final_standings"] = [
@@ -1020,6 +1085,7 @@ _ERROR_CODES_BY_CLASS: Final[dict[str, str]] = {
     "CompletedGamePersistenceNotAllowedError": "illegal_state",
     "ControllerNotRunningError": "server_shutting_down",
     "ControllerFailedError": "internal_error",
+    "GameSettingsConfirmationStaleError": "stale_settings_confirmation",
 }
 
 
@@ -1040,6 +1106,7 @@ _PUBLIC_MESSAGES: Final[dict[str, str]] = {
     "not_songmaster": "Only the current connected Songmaster may do that.",
     "illegal_state": "That operation is not allowed in the current game state.",
     "invalid_command": "The command contains an invalid value.",
+    "stale_settings_confirmation": "The settings confirmation is stale; review the current warning.",
     "internal_error": "The server could not safely complete the command.",
 }
 
