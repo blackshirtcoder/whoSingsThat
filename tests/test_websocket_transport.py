@@ -843,7 +843,12 @@ async def test_audio_diagnostic_assets_and_safe_playlist_metadata_are_served(
         description="Private notes must not be projected.",
     )
     async with httpx.AsyncClient(base_url=running_server.http_url) as client:
+        production_page = await client.get("/")
         page = await client.get("/audio-test")
+        production_script = await client.get("/static/production-ui.js")
+        notification_script = await client.get("/static/notification-sounds.js")
+        connected_sound = await client.get("/static/sounds/connected.wav")
+        audio_ready_sound = await client.get("/static/sounds/audio-ready.wav")
         player = await client.get("/static/audio-player.js")
         audio_protocol = await client.get("/static/audio-protocol.js")
         socket_module = await client.get("/static/socket-client.js")
@@ -851,6 +856,10 @@ async def test_audio_diagnostic_assets_and_safe_playlist_metadata_are_served(
         stylesheet = await client.get("/static/audio-test.css")
         playlists = await client.get("/api/playlists")
 
+    assert production_page.status_code == 200
+    assert "Connect to game" in production_page.text
+    assert "no-store" in production_page.headers["cache-control"]
+    assert "uuid" not in production_page.text.lower()
     assert page.status_code == 200
     assert "Enable audio on this device" in page.text
     assert "no-store" in page.headers["cache-control"]
@@ -863,6 +872,14 @@ async def test_audio_diagnostic_assets_and_safe_playlist_metadata_are_served(
     assert diagnostic.status_code == 200
     assert 'command("play_song")' in diagnostic.text
     assert stylesheet.status_code == 200
+    assert production_script.status_code == 200
+    assert "class ProductionApp" in production_script.text
+    assert notification_script.status_code == 200
+    assert "game-created.wav" in notification_script.text
+    assert connected_sound.status_code == 200
+    assert connected_sound.content.startswith(b"RIFF")
+    assert audio_ready_sound.status_code == 200
+    assert audio_ready_sound.content.startswith(b"RIFF")
     assert playlists.status_code == 200
     assert playlists.json() == {
         "playlists": [

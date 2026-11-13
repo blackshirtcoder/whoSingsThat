@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <meta name="theme-color" content="#171812">
+    <title>Who Sings That?</title>
+    <link rel="stylesheet" href="/static/production.css">
+  </head>
+  <body>
+    <main class="app-shell">
+      <header class="topbar">
+        <a class="brand" href="/" aria-label="Who Sings That? home">
+          <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>
+          <span>Who Sings That?</span>
+        </a>
+        <button id="sound-toggle" class="icon-button" type="button" aria-pressed="true" aria-label="Turn interface sounds off">
+          <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M5 9v6h4l5 4V5L9 9H5Zm12.2-.8a5.4 5.4 0 0 1 0 7.6M19.8 5.6a9 9 0 0 1 0 12.8"/></svg>
+        </button>
+      </header>
+
+      <div class="connection-strip" aria-live="polite">
+        <span id="connection-dot" class="status-dot"></span>
+        <span id="connection-label">Not connected</span>
+        <button id="disconnect" class="text-button" type="button" hidden>Disconnect</button>
+      </div>
+
+      <section id="connection-view" class="view hero-view">
+        <div class="vinyl" aria-hidden="true"><span></span></div>
+        <h1>Connect to the game server</h1>
+        <p class="lede">Create a game or join the Songmaster when a game is active.</p>
+        <button id="connect" class="primary-button" type="button">Connect to game</button>
+      </section>
+
+      <section id="entry-view" class="view" hidden>
+        <div class="entry-heading">
+          <p id="entry-eyebrow" class="eyebrow">Server connected</p>
+          <h1 id="entry-title">Finding the room…</h1>
+          <p id="entry-detail" class="lede">Checking the server’s current game.</p>
+        </div>
+        <form id="membership-form" class="action-card" hidden>
+          <label for="display-name">Your display name</label>
+          <input id="display-name" name="display-name" type="text" maxlength="24" autocomplete="nickname" enterkeyhint="go" placeholder="Name everyone will see">
+          <button id="membership-action" class="primary-button" type="submit">Continue</button>
+        </form>
+      </section>
+
+      <section id="lobby-view" class="view" hidden>
+        <div class="lobby-heading">
+          <div>
+            <p id="game-phase" class="eyebrow">Lobby</p>
+            <h1 id="lobby-title">Game lobby</h1>
+          </div>
+          <span id="role-badge" class="role-badge">Contestant</span>
+        </div>
+        <div class="waiting-card">
+          <span class="pulse-ring" aria-hidden="true"></span>
+          <div>
+            <strong id="waiting-title">Waiting for the Songmaster</strong>
+            <p id="waiting-detail">The Songmaster will start the game.</p>
+          </div>
+        </div>
+        <div class="participants-heading">
+          <h2>Players</h2>
+          <span id="participant-count">0 here</span>
+        </div>
+        <ul id="participant-list" class="participant-list"></ul>
+      </section>
+
+      <div id="error" class="message error-message" role="alert" hidden></div>
+      <div id="notice" class="message notice-message" aria-live="polite" hidden></div>
+      <div id="sound-issue" class="sound-issue" hidden>
+        <span id="sound-issue-text">Sound could not play.</span>
+        <button id="retry-sound" class="text-button" type="button">Try sound again</button>
+      </div>
+    </main>
+    <script type="module" src="/static/production.js"></script>
+  </body>
+</html>

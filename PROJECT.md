@@ -2763,3 +2763,92 @@ a later MP3 or output-device change will work; every track still has to prepare.
 The production phone-first views, complete state-dependent controls and
 scoreboard, polished Songmaster dashboard, playlist administration, history UI,
 and broader browser/device usability testing remain future work.
+
+## 55. Phase D2.1 Production Connection UI and Notification Foundation
+
+### 55.1 Production route and visual foundation
+
+`GET /` now serves the first production, phone-first interface. It uses a warm
+dark palette, a narrow mobile composition, large touch targets, safe-area
+padding, and responsive behavior down through a 360×640 viewport. The shared
+design tokens use deep olive charcoal `#171812` for the background, warm
+charcoal `#202119` and `#292A20` for surfaces, cream `#F5F0DF` for primary text,
+muted warm gray `#B1AA98` for secondary text, amber-gold `#F3B84B` for actions
+and Songmaster identity, and bronze-gray `#4A4635` for borders. Semantic status
+colors are separate and exact: OK/Connected is green `#22C55E`, Warning is
+yellow `#FACC15`, and Error is red `#EF4444`. Status indicators receive no
+amber overlay, and every status retains a text label.
+The page is intentionally not a compressed desktop dashboard. The existing
+`GET /audio-test` developer harness and its mystery-song audio path remain
+unchanged.
+
+The production page exposes only this increment's workflow: explicit server
+connection, Create or Join selection, and an initial participant lobby. It does
+not render game/session UUIDs, browser tokens, connection IDs, media URLs,
+round identities, deck facts, or answer-bearing projection fields. Dynamic
+content is assigned with `textContent`.
+
+### 55.2 Connection, discovery, and membership
+
+The user must press **Connect to game**. The existing `WstSocketClient` then
+establishes or restores the private browser identity and attempts the existing
+remembered-membership reconnect before reporting the connection complete.
+Routine socket-loss reconnection remains bounded and automatic as specified in
+Phase C2, but it is not treated as another local Connect action.
+
+An identity-established nonmember renders the existing authoritative
+`game_discovery` payload. No active game produces exactly one Create action; a
+joinable active game produces exactly one Join action and names the current
+Songmaster; a finished retained game offers neither. Create and Join send only
+the entered display name. A local pending-action guard disables the name and
+action controls before awaiting the correlated command result, preventing
+duplicate submissions. Rejections remain on the entry view with their safe
+server message and never show premature success.
+
+Create, Join, and remembered Reconnect enter the same projection-rendered room
+view. `state_snapshot` and later `state_update` messages remain the only source
+for participant names, current Songmaster, recipient role, game phase, and
+connection states. Songmaster and contestant copy differs, but this increment
+provides no game controls for either role. In particular, no Songmaster-only
+control is accidentally exposed to contestants.
+
+### 55.3 Interface notification audio
+
+`notification-sounds.js` owns interface notifications independently of
+`BrowserAudioPlayer`. It creates a separate `AudioContext`, never receives the
+mystery-song `HTMLAudioElement`, and has one centralized logical mapping:
+
+```text
+connected   -> /static/sounds/connected.wav
+gameCreated -> /static/sounds/game-created.wav
+welcome     -> /static/sounds/welcome.wav
+audioReady  -> /static/sounds/audio-ready.wav
+```
+
+The files are ordinary packaged mono PCM WAV assets. They may be replaced in
+place with other WAV recordings, including spoken announcements; distribution
+does not rely on symlinks. `audioReady` is packaged but deliberately unused
+until the separate D3b music-output enablement workflow.
+
+Interface sounds default on and have their own local-storage preference and
+header toggle. Every explicit Connect, Create, or Join handler calls the sound
+manager's initialization method before starting asynchronous WebSocket work.
+That method creates/resumes its `AudioContext` synchronously in the user-gesture
+stack. The corresponding file is decoded and played only after the correlated
+authoritative command succeeds. Rejected commands, discovery broadcasts,
+player broadcasts, remembered restoration, and routine automatic reconnects do
+not play these local-success sounds.
+
+Blocked autoplay, missing files, decode errors, and output failures are caught
+inside the notification subsystem and cannot reject or roll back connection or
+membership work. The page shows a small **Try sound again** action which resumes
+audio in a fresh gesture and retries only the last requested notification.
+
+### 55.4 Deferred production work
+
+D2.1 does not add playlist selection, settings changes, music-output enablement,
+Buzz/reveal/scoring/game-completion screens, full Songmaster controls, recovery
+controls, catalog administration, or history. Those remain later Phase D
+increments. The production page also does not yet consume Prepare/Play/Stop;
+the preserved diagnostic page remains the integration surface for the Phase C2
+mystery-song player until D3b.

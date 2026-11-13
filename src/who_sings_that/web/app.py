@@ -60,6 +60,13 @@ def create_app(
 
     application = FastAPI(title="Who Sings That?", lifespan=lifespan)
 
+    @application.get("/", include_in_schema=False)
+    async def production_page() -> FileResponse:
+        return FileResponse(
+            _STATIC_DIRECTORY / "index.html",
+            headers={"Cache-Control": "no-store"},
+        )
+
     @application.get("/audio-test", include_in_schema=False)
     async def audio_test_page() -> FileResponse:
         return FileResponse(
