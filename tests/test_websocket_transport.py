@@ -976,8 +976,9 @@ async def test_audio_diagnostic_assets_and_safe_playlist_metadata_are_served(
         page = await client.get("/audio-test")
         production_script = await client.get("/static/production-ui.js")
         notification_script = await client.get("/static/notification-sounds.js")
-        connected_sound = await client.get("/static/sounds/connected.wav")
-        audio_ready_sound = await client.get("/static/sounds/audio-ready.wav")
+        sound_assets = await client.get("/static/sound-assets.js")
+        connected_sound = await client.get("/static/sounds/connected.wav?v=1")
+        audio_ready_sound = await client.get("/static/sounds/audio-ready.wav?v=1")
         player = await client.get("/static/audio-player.js")
         audio_protocol = await client.get("/static/audio-protocol.js")
         socket_module = await client.get("/static/socket-client.js")
@@ -1004,7 +1005,10 @@ async def test_audio_diagnostic_assets_and_safe_playlist_metadata_are_served(
     assert production_script.status_code == 200
     assert "class ProductionApp" in production_script.text
     assert notification_script.status_code == 200
-    assert "game-created.wav" in notification_script.text
+    assert "NOTIFICATION_SOUND_FILES" in notification_script.text
+    assert sound_assets.status_code == 200
+    assert 'SOUND_ASSET_VERSION = "1"' in sound_assets.text
+    assert "game-created.wav" in sound_assets.text
     assert connected_sound.status_code == 200
     assert connected_sound.content.startswith(b"RIFF")
     assert audio_ready_sound.status_code == 200

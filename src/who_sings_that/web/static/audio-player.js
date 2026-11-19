@@ -64,6 +64,25 @@ export class BrowserAudioPlayer {
     };
   }
 
+  /**
+   * Record a human-confirmed output check performed by a separate media element.
+   * The production UI owns that full-length check and calls this only from its
+   * explicit "I heard it" action. This does not prepare or play mystery audio.
+   */
+  confirmOutputFromDedicatedCheck() {
+    ++this._generation;
+    this._cancelAsyncWork();
+    this.media.pause();
+    this._releaseMedia();
+    this._cleanupUnlockSource();
+    this._identity = null;
+    this._capable = true;
+    this._setState(
+      AudioState.IDLE,
+      "Music output was confirmed. Each track must still prepare successfully.",
+    );
+  }
+
   /** Must be called directly from a click/tap handler. Plays a brief audible tone. */
   async initializeFromUserGesture() {
     const generation = ++this._generation;

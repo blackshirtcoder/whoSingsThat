@@ -47,10 +47,10 @@ function successfulFetch(urls) {
 
 test("logical event mappings use four replaceable packaged files", () => {
   assert.deepEqual(NOTIFICATION_SOUND_FILES, {
-    connected: "/static/sounds/connected.wav",
-    gameCreated: "/static/sounds/game-created.wav",
-    welcome: "/static/sounds/welcome.wav",
-    audioReady: "/static/sounds/audio-ready.wav",
+    connected: "/static/sounds/connected.wav?v=1",
+    gameCreated: "/static/sounds/game-created.wav?v=1",
+    welcome: "/static/sounds/welcome.wav?v=1",
+    audioReady: "/static/sounds/audio-ready.wav?v=1",
   });
 });
 
@@ -69,7 +69,7 @@ test("gesture initialization resumes audio before later successful playback", as
   assert.equal(urls.length, 0, "success asset is not played before acknowledgment");
   await activation;
   assert.equal(await manager.play("connected"), true);
-  assert.deepEqual(urls, ["/static/sounds/connected.wav"]);
+  assert.deepEqual(urls, ["/static/sounds/connected.wav?v=1"]);
   assert.equal(context.sources[0].starts, 1);
 });
 

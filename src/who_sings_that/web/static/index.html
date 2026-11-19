@@ -45,7 +45,7 @@
         </form>
       </section>
 
-      <section id="lobby-view" class="view" hidden>
+      <section id="lobby-view" class="view room-view" hidden>
         <div class="lobby-heading">
           <div>
             <p id="game-phase" class="eyebrow">Lobby</p>
@@ -53,18 +53,88 @@
           </div>
           <span id="role-badge" class="role-badge">Contestant</span>
         </div>
-        <div class="waiting-card">
+
+        <div id="waiting-card" class="waiting-card">
           <span class="pulse-ring" aria-hidden="true"></span>
           <div>
             <strong id="waiting-title">Waiting for the Songmaster</strong>
             <p id="waiting-detail">The Songmaster will start the game.</p>
           </div>
         </div>
-        <div class="participants-heading">
-          <h2>Players</h2>
-          <span id="participant-count">0 here</span>
-        </div>
-        <ul id="participant-list" class="participant-list"></ul>
+
+        <section class="room-card" aria-labelledby="music-output-title">
+          <div class="section-heading">
+            <div>
+              <p class="section-kicker">On this device</p>
+              <h2 id="music-output-title">Play music</h2>
+            </div>
+            <span id="music-status" class="status-pill">Off</span>
+          </div>
+          <p id="music-detail" class="card-detail">Mystery songs will play somewhere else.</p>
+          <button id="music-action" class="secondary-button" type="button">Check music output</button>
+        </section>
+
+        <section class="room-card" aria-labelledby="playlist-title">
+          <div class="section-heading">
+            <div>
+              <p class="section-kicker">Game setup</p>
+              <h2 id="playlist-title">Playlists</h2>
+            </div>
+            <span id="playlist-count" class="subtle-count">None selected</span>
+          </div>
+          <div id="selected-playlists" class="selected-list" aria-live="polite"></div>
+          <div id="playlist-controls" hidden>
+            <p class="card-detail">Choose one or more playlists for this game.</p>
+            <div id="playlist-options" class="choice-list"></div>
+          </div>
+        </section>
+
+        <section class="room-card" aria-labelledby="settings-title">
+          <div class="section-heading">
+            <div>
+              <p class="section-kicker">Round timing</p>
+              <h2 id="settings-title">Game settings</h2>
+            </div>
+            <button id="edit-settings" class="text-button" type="button" hidden>Edit</button>
+          </div>
+          <dl class="settings-summary">
+            <div><dt>Offset</dt><dd id="setting-offset">—</dd></div>
+            <div><dt>Duration</dt><dd id="setting-duration">—</dd></div>
+            <div><dt>Speed plateau</dt><dd id="setting-plateau">—</dd></div>
+          </dl>
+        </section>
+
+        <section id="started-card" class="room-card started-card" hidden>
+          <p class="section-kicker">Game in progress</p>
+          <h2>Game started</h2>
+          <p>Gameplay controls arrive in D4. This setup view will keep authoritative room information current.</p>
+        </section>
+
+        <section aria-labelledby="players-title">
+          <div class="participants-heading">
+            <h2 id="players-title">Players</h2>
+            <span id="participant-count">0 here</span>
+          </div>
+          <ul id="participant-list" class="participant-list"></ul>
+        </section>
+
+        <section id="songmaster-actions" class="songmaster-panel" hidden aria-labelledby="songmaster-actions-title">
+          <p class="section-kicker">Songmaster controls</p>
+          <h2 id="songmaster-actions-title">Ready to play?</h2>
+          <div id="start-readiness" class="readiness-row">
+            <span id="readiness-dot" class="status-dot"></span>
+            <span id="readiness-text">Complete game setup first.</span>
+          </div>
+          <button id="start-game" class="primary-button" type="button">Start game</button>
+          <div id="transfer-controls" class="transfer-controls">
+            <label for="transfer-recipient">Transfer Songmaster</label>
+            <div class="inline-actions">
+              <select id="transfer-recipient"><option value="">Choose a connected player</option></select>
+              <button id="transfer-songmaster" class="secondary-button" type="button">Transfer</button>
+            </div>
+          </div>
+          <button id="cancel-game" class="danger-button" type="button">Cancel game</button>
+        </section>
       </section>
 
       <div id="error" class="message error-message" role="alert" hidden></div>
@@ -74,6 +144,68 @@
         <button id="retry-sound" class="text-button" type="button">Try sound again</button>
       </div>
     </main>
+
+    <section id="settings-sheet" class="sheet-backdrop" role="dialog" aria-modal="true" aria-labelledby="settings-sheet-title" hidden>
+      <form id="settings-form" class="sheet">
+        <div class="sheet-handle" aria-hidden="true"></div>
+        <p class="section-kicker">Songmaster settings</p>
+        <h2 id="settings-sheet-title">Game settings</h2>
+        <div class="field-grid">
+          <label>Playback offset <span>seconds</span><input id="settings-offset" inputmode="numeric" type="number" min="0" step="1" required></label>
+          <label>Playback duration <span>seconds</span><input id="settings-duration" inputmode="numeric" type="number" min="1" step="1" required></label>
+          <label>Speed-bonus plateau <span>percent</span><input id="settings-plateau" inputmode="decimal" type="number" min="0" max="100" step="any" required></label>
+        </div>
+        <p id="settings-error" class="inline-error" role="alert" hidden></p>
+        <div class="sheet-actions">
+          <button id="close-settings" class="secondary-button" type="button">Cancel</button>
+          <button id="save-settings" class="primary-button" type="submit">Save settings</button>
+        </div>
+      </form>
+    </section>
+
+    <section id="settings-warning-sheet" class="sheet-backdrop" role="dialog" aria-modal="true" aria-labelledby="settings-warning-title" hidden>
+      <div class="sheet">
+        <div class="sheet-handle" aria-hidden="true"></div>
+        <p class="section-kicker warning-kicker">Please confirm</p>
+        <h2 id="settings-warning-title">These settings may skip music</h2>
+        <div id="warning-proposal" class="proposal-summary"></div>
+        <ul id="warning-conditions" class="warning-list"></ul>
+        <div class="sheet-actions">
+          <button id="cancel-settings-warning" class="secondary-button" type="button">Go back</button>
+          <button id="confirm-settings-warning" class="primary-button" type="button">Apply anyway</button>
+        </div>
+      </div>
+    </section>
+
+    <section id="output-check-sheet" class="sheet-backdrop" role="dialog" aria-modal="true" aria-labelledby="output-check-title" hidden>
+      <div class="sheet output-sheet">
+        <div class="sheet-handle" aria-hidden="true"></div>
+        <div class="output-icon" aria-hidden="true">♪</div>
+        <h2 id="output-check-title">Did you hear the chime?</h2>
+        <p id="output-check-detail">Confirm only if the sound was audible on this device.</p>
+        <button id="heard-output" class="primary-button" type="button">I heard it</button>
+        <div class="inline-actions equal">
+          <button id="replay-output" class="secondary-button" type="button">Play again</button>
+          <button id="cancel-output" class="secondary-button" type="button">Cancel</button>
+        </div>
+      </div>
+    </section>
+
+    <section id="confirm-sheet" class="sheet-backdrop" role="dialog" aria-modal="true" aria-labelledby="confirm-title" hidden>
+      <div class="sheet">
+        <div class="sheet-handle" aria-hidden="true"></div>
+        <p class="section-kicker warning-kicker">Confirm action</p>
+        <h2 id="confirm-title">Are you sure?</h2>
+        <p id="confirm-detail" class="card-detail"></p>
+        <div class="sheet-actions">
+          <button id="confirm-cancel" class="secondary-button" type="button">Go back</button>
+          <button id="confirm-action" class="danger-button" type="button">Confirm</button>
+        </div>
+      </div>
+    </section>
+
+    <audio id="mystery-audio" preload="auto" hidden></audio>
+    <audio id="output-check-audio" preload="auto" hidden></audio>
     <script type="module" src="/static/production.js"></script>
   </body>
 </html>

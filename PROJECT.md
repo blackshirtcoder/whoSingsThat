@@ -2828,8 +2828,12 @@ audioReady  -> /static/sounds/audio-ready.wav
 
 The files are ordinary packaged mono PCM WAV assets. They may be replaced in
 place with other WAV recordings, including spoken announcements; distribution
-does not rely on symlinks. `audioReady` is packaged but deliberately unused
-until the separate D3b music-output enablement workflow.
+does not rely on symlinks. `sound-assets.js` appends the shared, stable
+`SOUND_ASSET_VERSION` query value to every WAV request, including the dedicated
+music-output check. Whenever any packaged WAV content is replaced, increment
+that version so browsers request the new assets; do not change it between asset
+replacements. `audioReady` is packaged but deliberately unused until the
+separate D3b music-output enablement workflow.
 
 Interface sounds default on and have their own local-storage preference and
 header toggle. Every explicit Connect, Create, or Join handler calls the sound
@@ -2932,3 +2936,68 @@ the pending confirmation. A valid confirmation applies the settings and
 immediately executes the ordinary `ROUND_COMPLETE` candidate scan, permanently
 recording newly duration-ineligible entries under the new settings. Previously
 consumed or skipped entries are never revived.
+
+## 57. Phase D3b Production Lobby and Game Setup
+
+Phase D3b extends `GET /` into the complete production lobby and no-round setup
+surface. It remains a phone-first projection client: participant names, roles,
+connection states, selected playlists, game settings, recipient audio facts,
+and allowed Songmaster operations come from the authoritative projection. The
+page does not render browser tokens, connection IDs, the game UUID, protected
+media URLs, deck entries, future answers, or unrevealed song metadata.
+
+The lobby loads the safe `GET /api/playlists` metadata and presents a
+multi-select control only to the Songmaster. Selection and deselection still use
+the existing individual authoritative commands; projected selected IDs remain
+the source of current lobby selection. After Start Game, the locked
+`selected_playlists` snapshots provide the names and song counts displayed to
+all participants. Duplicate local submissions are suppressed, and command
+rejections remain visible without optimistic selection mutation.
+
+All participants see the current configured playback offset, duration, and
+speed-bonus plateau. Only a Songmaster whose projection includes
+`set_game_settings` sees Edit. The form enforces only the documented value
+shapes and positivity/range rules and imposes no offset or duration maximum.
+An unapplied warning opens one confirmation sheet from the server's structured
+conditions and retains the exact proposal plus its opaque token. One action
+confirms either or both warning conditions. Stale confirmation rejection
+returns to the populated settings form for review and retry.
+
+All participants also receive a separate **Play music on this device** control.
+The creator's authoritative audio preference begins selected and other players
+begin off, but every new connection begins incapable. Choosing output plays the
+packaged, full-length `audio-ready.wav` from a dedicated local media element
+that is never used for server-controlled mystery audio. Browser playback
+evidence alone does not enable capability. Only **I heard it** marks the local
+mystery player capable and sends preference then capability; the check WAV is
+allowed to finish. **Play again**, cancellation, playback failure, explicit
+disable, and connection reset remain recoverable. Cancellation/disable clears
+preference first so the device cannot remain a valid target. This workflow is
+independent of the interface-notification sound preference.
+
+For D3b acceptance testing, the four packaged notification WAV files are
+temporary diagnostic tones with an intentionally countable mapping:
+
+```text
+connected.wav    1 beep
+game-created.wav 2 beeps
+welcome.wav      3 beeps
+audio-ready.wav  4 beeps
+```
+
+Each beep is approximately 200 milliseconds of a comfortable midrange tone,
+with gentle attack/release, and adjacent beeps are separated by approximately
+150 milliseconds of silence. The canonical filenames, notification-event
+assignments, WAV packaging, and separate playback architectures remain
+unchanged. These diagnostic assets will later be replaced by more pleasant
+notification sounds or spoken announcements.
+
+Songmaster-only lobby actions include Start Game, confirmed Cancel Game, and
+confirmed transfer to a connected participant through that participant's
+public game-local ID. The setup view uses projected allowed operations and
+still relies on server rejection as final authority. Start readiness requires a
+selected playlist and this default Songmaster device's confirmed output. A
+successful start replaces lobby setup actions with a concise temporary
+"Game started" view while continuing to show authoritative roster, locked
+playlist snapshots, settings, and the recipient's own music-output state.
+Buzz, Reveal, Scoring, Play Next, and other complete gameplay views remain D4.

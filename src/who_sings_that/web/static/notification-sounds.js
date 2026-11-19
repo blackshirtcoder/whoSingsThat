@@ -1,11 +1,8 @@
+import { NOTIFICATION_SOUND_FILES } from "./sound-assets.js";
+
 const SOUND_PREFERENCE_KEY = "wst.uiSoundsEnabled.v1";
 
-export const NOTIFICATION_SOUND_FILES = Object.freeze({
-  connected: "/static/sounds/connected.wav",
-  gameCreated: "/static/sounds/game-created.wav",
-  welcome: "/static/sounds/welcome.wav",
-  audioReady: "/static/sounds/audio-ready.wav",
-});
+export { NOTIFICATION_SOUND_FILES } from "./sound-assets.js";
 
 /** Interface chimes only. It never receives or controls the mystery-song element. */
 export class NotificationSoundManager {
